@@ -383,7 +383,51 @@ function escapeHtml(text) {
 // Initialize
 // ============================================
 
+// Handle bookmarklet fallback - check for #scrape=... hash
+async function handleBookmarkletHash() {
+    const hash = window.location.hash;
+    if (hash.startsWith('#scrape=')) {
+        try {
+            const encodedData = hash.substring(8); // Remove '#scrape='
+            const data = JSON.parse(decodeURIComponent(encodedData));
+
+            showToast('Receiving article from bookmarklet...', 'info');
+
+            const response = await fetch(`${API_BASE}/api/scrape`, {
+                method: 'POST',
+                headers: {
+                    'Content-Type': 'application/json'
+                },
+                body: JSON.stringify(data)
+            });
+
+            const result = await response.json();
+
+            if (response.ok) {
+                showToast('Article scraped successfully!', 'success');
+                // Clear the hash
+                history.replaceState(null, '', window.location.pathname);
+                await fetchArticles();
+                if (result.article && result.article.id) {
+                    expandedArticles.add(result.article.id);
+                    renderArticles();
+                }
+            } else {
+                showToast(result.error || 'Failed to scrape article', 'error');
+            }
+        } catch (error) {
+            console.error('Error processing bookmarklet data:', error);
+            showToast('Failed to process bookmarklet data', 'error');
+        }
+        // Clear the hash even on error
+        history.replaceState(null, '', window.location.pathname);
+    }
+}
+
 document.addEventListener('DOMContentLoaded', () => {
+    // Check for bookmarklet hash data first
+    handleBookmarkletHash();
+
     fetchArticles();
 
     // Auto-refresh every 5 seconds (for status updates)
