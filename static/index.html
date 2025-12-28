@@ -1,0 +1,67 @@
+<!DOCTYPE html>
+<html lang="en">
+
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>Article Scraper | Dashboard</title>
+    <link rel="stylesheet" href="/static/styles.css">
+    <link href="https://fonts.googleapis.com/css2?family=Inter:wght@400;500;600;700&display=swap" rel="stylesheet">
+</head>
+
+<body>
+    <div class="app">
+        <!-- Header -->
+        <header class="header">
+            <div class="header-content">
+                <div class="logo">
+                    <span class="logo-icon">📰</span>
+                    <h1>Article Scraper</h1>
+                </div>
+                <div class="header-stats">
+                    <span class="stat" id="total-count">0 articles</span>
+                    <span class="stat" id="video-count">0 videos</span>
+                </div>
+            </div>
+        </header>
+
+        <!-- Main Content -->
+        <main class="main">
+            <!-- URL Scraper Form -->
+            <div class="url-scraper-form">
+                <h3>📎 Paste Article URL</h3>
+                <p>Scrape any article by pasting its URL below</p>
+                <form id="url-form" onsubmit="scrapeUrl(event)">
+                    <div class="url-input-group">
+                        <input type="url" id="url-input" placeholder="https://example.com/article..." required>
+                        <button type="submit" class="btn btn-primary" id="scrape-btn">
+                            🔍 Scrape
+                        </button>
+                    </div>
+                </form>
+            </div>
+
+            <!-- Empty State -->
+            <div class="empty-state hidden" id="empty-state">
+                <div class="empty-icon">🔍</div>
+                <h2>No articles yet</h2>
+                <p>Paste a URL above or use the bookmarklet to scrape articles</p>
+                <a href="/static/bookmarklet_install.html" class="btn btn-secondary">
+                    Install Bookmarklet
+                </a>
+            </div>
+
+            <!-- Articles List -->
+            <div class="articles-container" id="articles-container">
+                <!-- Articles will be rendered here by JavaScript -->
+            </div>
+        </main>
+
+        <!-- Toast Notifications -->
+        <div class="toast-container" id="toast-container"></div>
+    </div>
+
+    <script src="/static/app.js"></script>
+</body>
+
+</html>

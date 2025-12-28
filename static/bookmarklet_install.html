@@ -1,0 +1,213 @@
+<!DOCTYPE html>
+<html lang="en">
+
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>Install Bookmarklet | Article Scraper</title>
+    <link href="https://fonts.googleapis.com/css2?family=Inter:wght@400;500;600;700&display=swap" rel="stylesheet">
+    <style>
+        :root {
+            --bg-primary: #0a0a0f;
+            --bg-secondary: #12121a;
+            --bg-card: rgba(20, 20, 30, 0.8);
+            --text-primary: #ffffff;
+            --text-secondary: #a0a0b0;
+            --accent-blue: #4f8cff;
+            --accent-purple: #a855f7;
+            --accent-green: #22c55e;
+            --gradient-primary: linear-gradient(135deg, #4f8cff 0%, #a855f7 100%);
+            --glass-border: rgba(255, 255, 255, 0.08);
+        }
+
+        * {
+            box-sizing: border-box;
+            margin: 0;
+            padding: 0;
+        }
+
+        body {
+            font-family: 'Inter', -apple-system, sans-serif;
+            background: var(--bg-primary);
+            color: var(--text-primary);
+            min-height: 100vh;
+            display: flex;
+            justify-content: center;
+            align-items: center;
+            padding: 20px;
+        }
+
+        .container {
+            max-width: 600px;
+            width: 100%;
+        }
+
+        .card {
+            background: var(--bg-card);
+            border: 1px solid var(--glass-border);
+            border-radius: 24px;
+            padding: 48px;
+            text-align: center;
+        }
+
+        h1 {
+            font-size: 2rem;
+            margin-bottom: 8px;
+            background: var(--gradient-primary);
+            -webkit-background-clip: text;
+            -webkit-text-fill-color: transparent;
+        }
+
+        .subtitle {
+            color: var(--text-secondary);
+            margin-bottom: 40px;
+        }
+
+        .bookmarklet-container {
+            margin: 32px 0;
+        }
+
+        .bookmarklet-btn {
+            display: inline-block;
+            padding: 16px 32px;
+            background: var(--gradient-primary);
+            color: white;
+            text-decoration: none;
+            border-radius: 12px;
+            font-weight: 600;
+            font-size: 1.125rem;
+            cursor: grab;
+            transition: transform 0.2s, box-shadow 0.2s;
+        }
+
+        .bookmarklet-btn:hover {
+            transform: translateY(-3px);
+            box-shadow: 0 8px 30px rgba(79, 140, 255, 0.4);
+        }
+
+        .bookmarklet-btn:active {
+            cursor: grabbing;
+        }
+
+        .instructions {
+            text-align: left;
+            margin-top: 40px;
+            padding-top: 40px;
+            border-top: 1px solid var(--glass-border);
+        }
+
+        .instructions h2 {
+            font-size: 1.25rem;
+            margin-bottom: 20px;
+        }
+
+        .steps {
+            list-style: none;
+            counter-reset: step;
+        }
+
+        .steps li {
+            position: relative;
+            padding-left: 48px;
+            margin-bottom: 16px;
+            color: var(--text-secondary);
+            line-height: 1.6;
+        }
+
+        .steps li::before {
+            counter-increment: step;
+            content: counter(step);
+            position: absolute;
+            left: 0;
+            width: 32px;
+            height: 32px;
+            background: var(--bg-secondary);
+            border: 1px solid var(--glass-border);
+            border-radius: 50%;
+            display: flex;
+            align-items: center;
+            justify-content: center;
+            font-weight: 600;
+            font-size: 0.875rem;
+            color: var(--accent-blue);
+        }
+
+        .highlight {
+            color: var(--accent-green);
+            font-weight: 600;
+        }
+
+        .back-link {
+            display: inline-block;
+            margin-top: 32px;
+            color: var(--accent-blue);
+            text-decoration: none;
+        }
+
+        .back-link:hover {
+            text-decoration: underline;
+        }
+
+        .note {
+            margin-top: 32px;
+            padding: 16px;
+            background: rgba(79, 140, 255, 0.1);
+            border: 1px solid rgba(79, 140, 255, 0.3);
+            border-radius: 12px;
+            font-size: 0.875rem;
+            color: var(--text-secondary);
+        }
+
+        .note strong {
+            color: var(--accent-blue);
+        }
+    </style>
+</head>
+
+<body>
+    <div class="container">
+        <div class="card">
+            <h1>📰 Article Scraper</h1>
+            <p class="subtitle">Install the bookmarklet to start scraping articles</p>
+
+            <div class="bookmarklet-container">
+                <a class="bookmarklet-btn"
+                    href="javascript:(function(){const API_URL='http://localhost:5050/api/scrape';function showNotification(message,isError){const existing=document.getElementById('scraper-notification');if(existing)existing.remove();const notification=document.createElement('div');notification.id='scraper-notification';notification.style.cssText=`position:fixed;top:20px;right:20px;padding:16px 24px;background:${isError?'%23ef4444':'%2322c55e'};color:white;font-family:-apple-system,BlinkMacSystemFont,'Segoe UI',sans-serif;font-size:14px;font-weight:600;border-radius:12px;box-shadow:0 4px 20px rgba(0,0,0,0.3);z-index:999999;`;notification.textContent=message;document.body.appendChild(notification);setTimeout(()=>notification.remove(),4000)}function extractContent(){const url=window.location.href;const title=document.querySelector('h1')?.textContent?.trim()||document.querySelector('[class*=%22title%22]')?.textContent?.trim()||document.title;const siteName=document.querySelector('meta[property=%22og:site_name%22]')?.content||window.location.hostname;const heroImage=document.querySelector('meta[property=%22og:image%22]')?.content||document.querySelector('article img')?.src||null;let content='';let articleEl=document.querySelector('article')||document.querySelector('[class*=%22article-body%22],[class*=%22post-content%22],[class*=%22entry-content%22],[itemprop=%22articleBody%22],main');if(!articleEl){const candidates=document.querySelectorAll('div,section');let maxText=0;candidates.forEach(el=>{const text=el.textContent?.trim()||'';if(text.length>maxText&&text.length<50000){maxText=text.length;articleEl=el}})}if(articleEl){const clone=articleEl.cloneNode(true);['script','style','nav','footer','header','aside','[class*=%22comment%22]','[class*=%22sidebar%22]','[class*=%22related%22]','[class*=%22share%22]','iframe'].forEach(s=>clone.querySelectorAll(s).forEach(el=>el.remove()));const paragraphs=clone.querySelectorAll('p,h1,h2,h3,h4,h5,h6,li');content=Array.from(paragraphs).map(p=>p.textContent?.trim()).filter(t=>t&&t.length>20).join('\n\n')}if(!content||content.length<200){content=document.body.textContent.replace(/\s+/g,' ').trim().slice(0,10000)}return{url,title,content,hero_image:heroImage,site_name:siteName}}try{showNotification('📰 Extracting article...',false);const data=extractContent();if(!data.content||data.content.length<100){showNotification('❌ Could not extract content',true);return}fetch(API_URL,{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify(data)}).then(r=>{if(!r.ok)throw new Error('Server error');return r.json()}).then(()=>showNotification('✅ Article scraped!',false)).catch(e=>showNotification('❌ '+e.message,true))}catch(e){showNotification('❌ '+e.message,true)}})();">
+                    📰 Scrape Article
+                </a>
+            </div>
+
+            <div class="instructions">
+                <h2>How to Install</h2>
+                <ol class="steps">
+                    <li>
+                        <strong>Drag the button above</strong> to your bookmarks bar
+                    </li>
+                    <li>
+                        If you don't see your bookmarks bar, press <span class="highlight">Cmd+Shift+B</span> (Mac) or
+                        <span class="highlight">Ctrl+Shift+B</span> (Windows)
+                    </li>
+                    <li>
+                        Navigate to any article page in your browser
+                    </li>
+                    <li>
+                        Click the <strong>"📰 Scrape Article"</strong> bookmark
+                    </li>
+                    <li>
+                        Check the <a href="/" style="color: var(--accent-blue);">dashboard</a> to see your scraped
+                        article!
+                    </li>
+                </ol>
+            </div>
+
+            <div class="note">
+                <strong>Note:</strong> Make sure the Article Scraper server is running at
+                <code>http://localhost:5050</code> before using the bookmarklet.
+            </div>
+
+            <a href="/" class="back-link">← Back to Dashboard</a>
+        </div>
+    </div>
+</body>
+
+</html>
