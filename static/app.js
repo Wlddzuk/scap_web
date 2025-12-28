@@ -170,6 +170,9 @@ function renderArticles() {
     emptyState.classList.add('hidden');
     container.classList.remove('hidden');
 
+    // Only animate if content length changed (avoid re-animating on polling updates)
+    const shouldAnimate = container.childElementCount !== articles.length;
+
     container.innerHTML = articles.map(article => renderArticleCard(article)).join('');
 
     // Add click handlers for expanding cards
@@ -178,9 +181,20 @@ function renderArticles() {
             if (e.target.closest('button') || e.target.closest('a')) return;
             const card = header.closest('.article-card');
             const articleId = parseInt(card.dataset.articleId);
-            toggleExpand(articleId);
+            toggleExpand(articleId, card);
         });
     });
+
+    // Staggered Entry Animation (only on full render)
+    if (shouldAnimate && window.anime) {
+        anime({
+            targets: '.article-card',
+            translateY: [20, 0],
+            opacity: [0, 1],
+            delay: anime.stagger(100),
+            easing: 'spring(1, 80, 10, 0)'
+        });
+    }
 }
 
 function renderArticleCard(article) {
@@ -324,13 +338,44 @@ function renderActions(article) {
     `;
 }
 
-function toggleExpand(articleId) {
+function toggleExpand(articleId, cardElement) {
     if (expandedArticles.has(articleId)) {
         expandedArticles.delete(articleId);
+        if (cardElement) {
+            const content = cardElement.querySelector('.article-content');
+            if (content && window.anime) {
+                // Smooth collapse
+                anime({
+                    targets: content,
+                    height: 0,
+                    opacity: 0,
+                    duration: 300,
+                    easing: 'easeOutQuad',
+                    complete: () => renderArticles()
+                });
+                return;
+            }
+        }
     } else {
         expandedArticles.add(articleId);
     }
+
     renderArticles();
+
+    // Animate expansion if opening
+    if (expandedArticles.has(articleId) && window.anime) {
+        // Find the newly rendered card
+        const newCard = document.querySelector(`.article-card[data-article-id="${articleId}"] .article-content`);
+        if (newCard) {
+            anime({
+                targets: newCard,
+                height: ['0px', newCard.scrollHeight + 'px'],
+                opacity: [0, 1],
+                duration: 600,
+                easing: 'easeOutElastic(1, .8)'
+            });
+        }
+    }
 }
 
 function updateStats() {
