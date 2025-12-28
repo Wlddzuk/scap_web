@@ -1,21 +1,22 @@
 /**
- * Article Scraper Bookmarklet (CSP-Bypass Version)
+ * Article Scraper Bookmarklet (CSP-Proof Version)
  * 
- * This bookmarklet extracts article content from the current page
- * and sends it to the local Article Scraper backend.
+ * This bookmarklet extracts article content and opens the dashboard
+ * with the data embedded in the URL - completely bypassing CSP restrictions.
  * 
- * This version bypasses CSP restrictions by opening a popup window.
+ * How it works:
+ * 1. Extracts content from the current page (DOM access is never blocked)
+ * 2. Encodes the data in a URL hash
+ * 3. Opens the dashboard which automatically submits the data
  * 
  * Usage: Drag the bookmarklet link to your bookmarks bar,
  * then click it when viewing an article to scrape.
  */
 
 (function () {
-    // Configuration
-    var API_URL = 'http://localhost:5050/api/scrape';
     var DASHBOARD_URL = 'http://localhost:5050';
 
-    // Extract article content (all inline, no eval needed)
+    // Extract article content (DOM access works even with strict CSP)
     function extractContent() {
         var url = window.location.href;
 
@@ -76,7 +77,8 @@
                 'script', 'style', 'nav', 'footer', 'header', 'aside',
                 '[class*="comment"]', '[class*="sidebar"]', '[class*="related"]',
                 '[class*="share"]', '[class*="social"]', '[class*="newsletter"]',
-                '[class*="advertisement"]', '[class*="promo"]', 'iframe'
+                '[class*="advertisement"]', '[class*="promo"]', 'iframe',
+                '[class*="paywall"]', '[class*="subscribe"]', '[class*="signup"]'
             ];
 
             for (var j = 0; j < removeSelectors.length; j++) {
@@ -113,65 +115,33 @@
         };
     }
 
-    // Send data via form submission (works around CSP)
-    function sendViaForm(data) {
-        // Create a hidden form that posts to our server
-        var form = document.createElement('form');
-        form.method = 'POST';
-        form.action = API_URL;
-        form.target = '_blank';
-        form.style.display = 'none';
-
-        // We can't POST JSON via form, so we'll use a different approach
-        // Open dashboard with data in URL hash
-        var encodedData = encodeURIComponent(JSON.stringify(data));
-        window.open(DASHBOARD_URL + '#scrape=' + encodedData, '_blank');
-    }
-
-    // Try fetch first, fall back to form-based approach
-    function sendData(data) {
-        // Use XMLHttpRequest which has better CSP compatibility
-        var xhr = new XMLHttpRequest();
-        xhr.open('POST', API_URL, true);
-        xhr.setRequestHeader('Content-Type', 'application/json');
-
-        xhr.onreadystatechange = function () {
-            if (xhr.readyState === 4) {
-                if (xhr.status >= 200 && xhr.status < 300) {
-                    alert('✅ Article scraped successfully!\n\nCheck the dashboard at:\n' + DASHBOARD_URL);
-                } else {
-                    alert('❌ Failed to send article.\n\nError: ' + xhr.status + '\n\nOpening dashboard...');
-                    sendViaForm(data);
-                }
-            }
-        };
-
-        xhr.onerror = function () {
-            alert('❌ Network error. Opening dashboard with data...');
-            sendViaForm(data);
-        };
-
-        try {
-            xhr.send(JSON.stringify(data));
-        } catch (e) {
-            alert('❌ CSP blocked request. Opening dashboard...');
-            sendViaForm(data);
-        }
-    }
-
     // Main execution
     try {
         var data = extractContent();
 
         if (!data.content || data.content.length < 100) {
-            alert('❌ Could not extract article content from this page.');
+            alert('❌ Could not extract article content from this page.\n\nTry selecting the article text manually and copying it.');
             return;
         }
 
-        alert('📰 Extracting article:\n\n"' + data.title.slice(0, 50) + '..."\n\nSending to server...');
-        sendData(data);
+        // Truncate content if too long for URL (max ~32KB to be safe)
+        if (data.content.length > 30000) {
+            data.content = data.content.slice(0, 30000) + '\n\n[Content truncated...]';
+        }
+
+        // Show confirmation with title
+        var titlePreview = data.title.length > 50 ? data.title.slice(0, 50) + '...' : data.title;
+
+        // Encode data and open dashboard
+        var encodedData = encodeURIComponent(JSON.stringify(data));
+        var dashboardUrl = DASHBOARD_URL + '#scrape=' + encodedData;
+
+        // Open dashboard in new tab - this will automatically submit the data
+        window.open(dashboardUrl, '_blank');
+
+        alert('✅ Article extracted!\n\n"' + titlePreview + '"\n\nOpening dashboard to save...');
 
     } catch (error) {
-        alert('❌ Error: ' + error.message);
+        alert('❌ Error extracting article:\n\n' + error.message);
     }
 })();

@@ -16,17 +16,28 @@ def summarize_with_groq(title: str, content: str) -> dict:
     
     client = Groq(api_key=api_key)
     
-    prompt = f"""You are a content summarizer. Given the following article, generate:
+    prompt = f"""You are a content summarizer and short-form video scriptwriter. Given the following article, generate:
 
 1. **TL;DR**: A concise 2-3 sentence summary capturing the main point.
 
 2. **Key Bullets**: 5-8 bullet points with the most important takeaways.
 
-3. **Video Script**: A short-form video script (45-90 seconds when read aloud) that:
-   - Opens with a hook
-   - Covers the main points engagingly
-   - Ends with a takeaway or call-to-action
-   - Uses conversational, punchy language suitable for TikTok/Reels/Shorts
+3. **Video Script**: Write a video script (70-110 seconds when spoken) following these rules:
+
+STYLE RULES:
+- Write in plain adult English (age 15+). Clear and direct, not childish.
+- Use short-to-medium sentences (10-18 words each).
+- Use everyday words. Avoid academic words like "co-opted", "underpin", "nuanced".
+- If a technical word is necessary, define it in 6-10 words right after.
+- No repetition. Each line should add something new.
+- Tone: smart, friendly, confident. Not salesy or clickbaity.
+
+STRUCTURE (follow this exactly):
+[HOOK] - One punchy opening line to grab attention
+[BIG IDEA] - 3-4 sentences explaining the main point
+[EXAMPLE] - 3-4 sentences with one concrete real-world example
+[UNCERTAINTY] - 1-2 sentences on what's still unknown or debated
+[CLOSE] - One memorable takeaway line
 
 ARTICLE TITLE: {title}
 
@@ -43,7 +54,7 @@ Respond in this exact JSON format (no markdown, just raw JSON):
         "Fourth key point",
         "Fifth key point"
     ],
-    "video_script": "Your 45-90 second video script here. Write it as flowing speech, not bullet points."
+    "video_script": "Your structured video script here. Include the section labels in brackets like [HOOK], [BIG IDEA], etc."
 }}
 """
     
@@ -85,17 +96,28 @@ def summarize_with_gemini(title: str, content: str) -> dict:
     genai.configure(api_key=api_key)
     model = genai.GenerativeModel('gemini-2.0-flash')
     
-    prompt = f"""You are a content summarizer. Given the following article, generate:
+    prompt = f"""You are a content summarizer and short-form video scriptwriter. Given the following article, generate:
 
 1. **TL;DR**: A concise 2-3 sentence summary capturing the main point.
 
 2. **Key Bullets**: 5-8 bullet points with the most important takeaways.
 
-3. **Video Script**: A short-form video script (45-90 seconds when read aloud) that:
-   - Opens with a hook
-   - Covers the main points engagingly
-   - Ends with a takeaway or call-to-action
-   - Uses conversational, punchy language suitable for TikTok/Reels/Shorts
+3. **Video Script**: Write a video script (70-110 seconds when spoken) following these rules:
+
+STYLE RULES:
+- Write in plain adult English (age 15+). Clear and direct, not childish.
+- Use short-to-medium sentences (10-18 words each).
+- Use everyday words. Avoid academic words like "co-opted", "underpin", "nuanced".
+- If a technical word is necessary, define it in 6-10 words right after.
+- No repetition. Each line should add something new.
+- Tone: smart, friendly, confident. Not salesy or clickbaity.
+
+STRUCTURE (follow this exactly):
+[HOOK] - One punchy opening line to grab attention
+[BIG IDEA] - 3-4 sentences explaining the main point
+[EXAMPLE] - 3-4 sentences with one concrete real-world example
+[UNCERTAINTY] - 1-2 sentences on what's still unknown or debated
+[CLOSE] - One memorable takeaway line
 
 ARTICLE TITLE: {title}
 
@@ -112,7 +134,7 @@ Respond in this exact JSON format (no markdown, just raw JSON):
         "Fourth key point",
         "Fifth key point"
     ],
-    "video_script": "Your 45-90 second video script here. Write it as flowing speech, not bullet points."
+    "video_script": "Your structured video script here. Include the section labels in brackets like [HOOK], [BIG IDEA], etc."
 }}
 """
     
@@ -141,18 +163,23 @@ def summarize_article(title: str, content: str) -> dict:
     Returns:
         dict with keys: tldr, bullets (list), video_script
     """
+    groq_error = None
+    gemini_error = None
+    
     # Try Groq first (faster, more generous free tier)
     try:
         print("[Summarizer] Trying Groq...")
         return summarize_with_groq(title, content)
-    except Exception as groq_error:
+    except Exception as e:
+        groq_error = e
         print(f"[Summarizer] Groq failed: {groq_error}")
     
     # Fallback to Gemini
     try:
         print("[Summarizer] Falling back to Gemini...")
         return summarize_with_gemini(title, content)
-    except Exception as gemini_error:
+    except Exception as e:
+        gemini_error = e
         print(f"[Summarizer] Gemini also failed: {gemini_error}")
         raise Exception(f"All AI providers failed. Groq: {groq_error}, Gemini: {gemini_error}")
 

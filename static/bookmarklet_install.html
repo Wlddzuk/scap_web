@@ -161,6 +161,16 @@
         .note strong {
             color: var(--accent-blue);
         }
+
+        .success-note {
+            margin-top: 16px;
+            padding: 16px;
+            background: rgba(34, 197, 94, 0.1);
+            border: 1px solid rgba(34, 197, 94, 0.3);
+            border-radius: 12px;
+            font-size: 0.875rem;
+            color: var(--accent-green);
+        }
     </style>
 </head>
 
@@ -172,9 +182,14 @@
 
             <div class="bookmarklet-container">
                 <a class="bookmarklet-btn"
-                    href="javascript:(function(){const API_URL='http://localhost:5050/api/scrape';function showNotification(message,isError){const existing=document.getElementById('scraper-notification');if(existing)existing.remove();const notification=document.createElement('div');notification.id='scraper-notification';notification.style.cssText=`position:fixed;top:20px;right:20px;padding:16px 24px;background:${isError?'%23ef4444':'%2322c55e'};color:white;font-family:-apple-system,BlinkMacSystemFont,'Segoe UI',sans-serif;font-size:14px;font-weight:600;border-radius:12px;box-shadow:0 4px 20px rgba(0,0,0,0.3);z-index:999999;`;notification.textContent=message;document.body.appendChild(notification);setTimeout(()=>notification.remove(),4000)}function extractContent(){const url=window.location.href;const title=document.querySelector('h1')?.textContent?.trim()||document.querySelector('[class*=%22title%22]')?.textContent?.trim()||document.title;const siteName=document.querySelector('meta[property=%22og:site_name%22]')?.content||window.location.hostname;const heroImage=document.querySelector('meta[property=%22og:image%22]')?.content||document.querySelector('article img')?.src||null;let content='';let articleEl=document.querySelector('article')||document.querySelector('[class*=%22article-body%22],[class*=%22post-content%22],[class*=%22entry-content%22],[itemprop=%22articleBody%22],main');if(!articleEl){const candidates=document.querySelectorAll('div,section');let maxText=0;candidates.forEach(el=>{const text=el.textContent?.trim()||'';if(text.length>maxText&&text.length<50000){maxText=text.length;articleEl=el}})}if(articleEl){const clone=articleEl.cloneNode(true);['script','style','nav','footer','header','aside','[class*=%22comment%22]','[class*=%22sidebar%22]','[class*=%22related%22]','[class*=%22share%22]','iframe'].forEach(s=>clone.querySelectorAll(s).forEach(el=>el.remove()));const paragraphs=clone.querySelectorAll('p,h1,h2,h3,h4,h5,h6,li');content=Array.from(paragraphs).map(p=>p.textContent?.trim()).filter(t=>t&&t.length>20).join('\n\n')}if(!content||content.length<200){content=document.body.textContent.replace(/\s+/g,' ').trim().slice(0,10000)}return{url,title,content,hero_image:heroImage,site_name:siteName}}try{showNotification('📰 Extracting article...',false);const data=extractContent();if(!data.content||data.content.length<100){showNotification('❌ Could not extract content',true);return}fetch(API_URL,{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify(data)}).then(r=>{if(!r.ok)throw new Error('Server error');return r.json()}).then(()=>showNotification('✅ Article scraped!',false)).catch(e=>showNotification('❌ '+e.message,true))}catch(e){showNotification('❌ '+e.message,true)}})();">
+                    href="javascript:(function(){var D='http://localhost:5050';function e(){var u=window.location.href;var h=document.querySelector('h1');var t=document.querySelector('[class*=%22title%22]');var a=document.querySelector('article h1,article h2');var T=(h%26%26h.textContent?h.textContent.trim():'')%7C%7C(t%26%26t.textContent?t.textContent.trim():'')%7C%7C(a%26%26a.textContent?a.textContent.trim():'')%7C%7Cdocument.title;var o=document.querySelector('meta[property=%22og:site_name%22]');var n=document.querySelector('meta[name=%22application-name%22]');var S=(o%26%26o.content)%7C%7C(n%26%26n.content)%7C%7Cwindow.location.hostname;var i=document.querySelector('meta[property=%22og:image%22]');var m=document.querySelector('article img');var f=document.querySelector('[class*=%22hero%22] img');var H=(i%26%26i.content)%7C%7C(m%26%26m.src)%7C%7C(f%26%26f.src)%7C%7Cnull;var c='';var A=document.querySelector('article')%7C%7Cdocument.querySelector('[class*=%22article-body%22],[class*=%22post-content%22],[class*=%22entry-content%22],[itemprop=%22articleBody%22],main');if(!A){var d=document.querySelectorAll('div,section');var x=0;for(var j=0;j<d.length;j++){var l=d[j].textContent?d[j].textContent.trim():'';if(l.length>x%26%26l.length<50000){x=l.length;A=d[j];}}}if(A){var C=A.cloneNode(true);var r=['script','style','nav','footer','header','aside','iframe'];for(var k=0;k<r.length;k++){var R=C.querySelectorAll(r[k]);for(var p=0;p<R.length;p++){R[p].remove();}}var P=C.querySelectorAll('p,h1,h2,h3,h4,h5,h6,li');var W=[];for(var q=0;q<P.length;q++){var V=P[q].textContent?P[q].textContent.trim():'';if(V%26%26V.length>20){W.push(V);}}c=W.join('\\n\\n');}if(!c%7C%7Cc.length<200){c=document.body.textContent.replace(/\\s+/g,' ').trim().slice(0,10000);}return{url:u,title:T,content:c,hero_image:H,site_name:S};}try{var data=e();if(!data.content%7C%7Cdata.content.length<100){alert('Could not extract content');return;}if(data.content.length>30000){data.content=data.content.slice(0,30000);}var enc=encodeURIComponent(JSON.stringify(data));window.open(D+'%23scrape='+enc,'_blank');alert('Opening dashboard...');}catch(err){alert('Error: '+err.message);}})();">
                     📰 Scrape Article
                 </a>
+            </div>
+
+            <div class="success-note">
+                <strong>✨ CSP-Proof Version:</strong> This bookmarklet works on all websites, including those with
+                strict security policies. It opens the dashboard automatically with your article data.
             </div>
 
             <div class="instructions">
@@ -188,14 +203,13 @@
                         <span class="highlight">Ctrl+Shift+B</span> (Windows)
                     </li>
                     <li>
-                        Navigate to any article page in your browser
+                        Navigate to any article page (even behind a paywall bypass)
                     </li>
                     <li>
                         Click the <strong>"📰 Scrape Article"</strong> bookmark
                     </li>
                     <li>
-                        Check the <a href="/" style="color: var(--accent-blue);">dashboard</a> to see your scraped
-                        article!
+                        The dashboard will open automatically with your article!
                     </li>
                 </ol>
             </div>
