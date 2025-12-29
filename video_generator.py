@@ -1,362 +1,431 @@
-"""Video Generator using Google TTS and MoviePy with AI-generated images."""
+"""
+TikTok-Style Video Generator with FAL.ai Image Generation and Kokoro TTS.
+
+Features:
+- Fast-paced text (3-4 word chunks)
+- Visual changes every 2-3 seconds  
+- Context-aware B-roll images
+- Dramatic visual hook
+- Kokoro-82M for high-quality TTS
+"""
 
 import os
-import textwrap
+import re
 import time
+import textwrap
 from datetime import datetime
 from pathlib import Path
 from io import BytesIO
 
-from gtts import gTTS
 from moviepy.editor import (
-    TextClip, ColorClip, ImageClip, CompositeVideoClip, AudioFileClip, concatenate_videoclips
+    TextClip, ColorClip, ImageClip, CompositeVideoClip, 
+    AudioFileClip, concatenate_videoclips
 )
-from PIL import Image, ImageDraw, ImageFont
+from PIL import Image, ImageDraw, ImageFont, ImageFilter
 import requests
 from dotenv import load_dotenv
 
 load_dotenv()
 
 
-# Video settings for 9:16 (vertical short-form)
+# Video settings for 9:16 (vertical TikTok/Reels/Shorts)
 VIDEO_WIDTH = 1080
 VIDEO_HEIGHT = 1920
 FPS = 30
-FONT_SIZE = 60
+CHUNK_DURATION = 2.0  # Seconds per visual (image changes every 2-3s)
+HOOK_DURATION = 3.0   # First 3 seconds are the hook
+
+# Text styling
+FONT_SIZE = 72
 FONT_COLOR = 'white'
-BG_COLOR = (15, 15, 25)  # Dark blue-gray
-SUBTITLE_BG_COLOR = (0, 0, 0, 180)  # Semi-transparent black
+STROKE_WIDTH = 4
+BG_COLOR = (10, 10, 20)  # Dark fallback
 
 
-def generate_ai_image(prompt: str, retry_count: int = 3) -> Image.Image:
+# ============================================
+# FAL.ai Image Generation  
+# ============================================
+
+def generate_image_fal(prompt: str, retry_count: int = 2) -> Image.Image:
     """
-    Generate an image using HuggingFace Inference API.
-
-    Args:
-        prompt: Description of the image to generate
-        retry_count: Number of retries if generation fails
-
-    Returns:
-        PIL Image object
+    Generate an image using FAL.ai FLUX.1-dev model.
+    Returns PIL Image or solid background as fallback.
     """
-    api_key = os.getenv('HUGGINGFACE_API_KEY')
-    if not api_key:
-        print("[Image] No HUGGINGFACE_API_KEY found, using solid background")
-        # Return a solid background as fallback
-        img = Image.new('RGB', (VIDEO_WIDTH, VIDEO_HEIGHT), BG_COLOR)
-        return img
-
-    # Use FLUX.1-schnell - very fast and good quality (free on HF)
-    api_url = "https://api-inference.huggingface.co/models/black-forest-labs/FLUX.1-schnell"
-
-    headers = {"Authorization": f"Bearer {api_key}"}
-
-    # Enhanced prompt for better vertical video images
-    enhanced_prompt = f"{prompt}, cinematic, high quality, professional photography, vertical composition, 9:16 aspect ratio"
-
+    import fal_client
+    
+    fal_key = os.getenv('FAL_KEY')
+    if not fal_key:
+        print("[Image] No FAL_KEY found, using gradient background")
+        return create_gradient_background()
+    
+    # Enhance prompt for vertical video B-roll
+    enhanced_prompt = f"{prompt}, cinematic dramatic lighting, dark moody atmosphere, vertical composition 9:16, professional photography, no text no words"
+    
     for attempt in range(retry_count):
         try:
-            print(f"[Image] Generating image (attempt {attempt + 1}/{retry_count}): {prompt[:50]}...")
-
-            response = requests.post(
-                api_url,
-                headers=headers,
-                json={"inputs": enhanced_prompt},
-                timeout=60
+            print(f"[Image] Generating: {prompt[:40]}...")
+            
+            result = fal_client.run(
+                "fal-ai/flux/dev",
+                arguments={
+                    "prompt": enhanced_prompt,
+                    "image_size": "portrait_16_9",
+                    "num_images": 1
+                }
             )
-
-            if response.status_code == 503:
-                # Model is loading, wait and retry
-                print("[Image] Model loading, waiting 10s...")
-                time.sleep(10)
-                continue
-
-            response.raise_for_status()
-
-            # Load image from response
-            img = Image.open(BytesIO(response.content))
-
-            # Resize to video dimensions (1080x1920 for 9:16)
-            img = resize_and_crop_image(img, VIDEO_WIDTH, VIDEO_HEIGHT)
-
-            print(f"[Image] Generated successfully!")
-            return img
-
-        except Exception as e:
-            print(f"[Image] Generation failed (attempt {attempt + 1}): {e}")
-            if attempt < retry_count - 1:
-                time.sleep(5)
-            else:
-                # Final fallback: solid background
-                print("[Image] All attempts failed, using solid background")
-                img = Image.new('RGB', (VIDEO_WIDTH, VIDEO_HEIGHT), BG_COLOR)
+            
+            if result and 'images' in result and len(result['images']) > 0:
+                image_url = result['images'][0]['url']
+                
+                # Download image
+                response = requests.get(image_url, timeout=30)
+                img = Image.open(BytesIO(response.content))
+                
+                # Resize to video dimensions
+                img = resize_and_crop_image(img, VIDEO_WIDTH, VIDEO_HEIGHT)
+                
+                print(f"[Image] ✅ Generated successfully!")
                 return img
+                
+        except Exception as e:
+            print(f"[Image] ⚠️ Attempt {attempt + 1} failed: {e}")
+            time.sleep(2)
+    
+    print("[Image] ❌ All attempts failed, using gradient")
+    return create_gradient_background()
 
-    # Should never reach here, but just in case
-    img = Image.new('RGB', (VIDEO_WIDTH, VIDEO_HEIGHT), BG_COLOR)
+
+def create_gradient_background() -> Image.Image:
+    """Create a stylish gradient background as fallback."""
+    img = Image.new('RGB', (VIDEO_WIDTH, VIDEO_HEIGHT))
+    draw = ImageDraw.Draw(img)
+    
+    # Dark purple to blue gradient
+    for y in range(VIDEO_HEIGHT):
+        ratio = y / VIDEO_HEIGHT
+        r = int(20 + ratio * 10)
+        g = int(10 + ratio * 20)
+        b = int(40 + ratio * 50)
+        draw.line([(0, y), (VIDEO_WIDTH, y)], fill=(r, g, b))
+    
     return img
 
 
 def resize_and_crop_image(img: Image.Image, target_width: int, target_height: int) -> Image.Image:
-    """
-    Resize and crop image to fit target dimensions while maintaining aspect ratio.
-    Uses center crop.
-    """
-    # Get original dimensions
+    """Resize and center-crop image to target dimensions."""
     orig_width, orig_height = img.size
     orig_ratio = orig_width / orig_height
     target_ratio = target_width / target_height
-
-    if orig_ratio > target_ratio:
-        # Image is wider than target, fit height and crop width
-        new_height = target_height
-        new_width = int(orig_width * (target_height / orig_height))
-    else:
-        # Image is taller than target, fit width and crop height
-        new_width = target_width
-        new_height = int(orig_height * (target_width / orig_width))
-
-    # Resize
-    img = img.resize((new_width, new_height), Image.Resampling.LANCZOS)
-
-    # Center crop to target dimensions
-    left = (new_width - target_width) // 2
-    top = (new_height - target_height) // 2
-    right = left + target_width
-    bottom = top + target_height
-
-    img = img.crop((left, top, right, bottom))
-
-    return img
-
-
-def ensure_videos_dir():
-    """Ensure videos directory exists."""
-    videos_dir = Path(__file__).parent / 'videos'
-    videos_dir.mkdir(exist_ok=True)
-    return videos_dir
-
-
-def generate_tts(text: str, output_path: str) -> str:
-    """Generate TTS audio file from text using Google TTS."""
-    tts = gTTS(text=text, lang='en', slow=False)
-    tts.save(output_path)
-    return output_path
-
-
-def create_title_card(title: str, duration: float = 3.0) -> CompositeVideoClip:
-    """Create an intro title card."""
-    # Background
-    bg = ColorClip(size=(VIDEO_WIDTH, VIDEO_HEIGHT), color=BG_COLOR, duration=duration)
     
-    # Title text (wrapped)
-    wrapped_title = "\n".join(textwrap.wrap(title, width=25))
+    if orig_ratio > target_ratio:
+        # Image is wider - crop width
+        new_height = orig_height
+        new_width = int(new_height * target_ratio)
+        left = (orig_width - new_width) // 2
+        img = img.crop((left, 0, left + new_width, new_height))
+    else:
+        # Image is taller - crop height
+        new_width = orig_width
+        new_height = int(new_width / target_ratio)
+        top = (orig_height - new_height) // 2
+        img = img.crop((0, top, new_width, top + new_height))
+    
+    return img.resize((target_width, target_height), Image.LANCZOS)
+
+
+def darken_image(img: Image.Image, factor: float = 0.6) -> Image.Image:
+    """Darken image for better text readability."""
+    from PIL import ImageEnhance
+    enhancer = ImageEnhance.Brightness(img)
+    return enhancer.enhance(factor)
+
+
+# ============================================
+# Kokoro TTS (High-Quality Voice)
+# ============================================
+
+def generate_tts_kokoro(text: str, output_path: str) -> str:
+    """
+    Generate TTS using Kokoro-82M for natural, high-quality voice.
+    Falls back to gTTS if Kokoro fails.
+    """
+    try:
+        from kokoro import KPipeline
+        import soundfile as sf
+        import numpy as np
+        
+        print("[TTS] Using Kokoro-82M for voice...")
+        
+        pipeline = KPipeline(lang_code='a', repo_id='hexgrad/Kokoro-82M')
+        
+        # Generate with natural female voice
+        generator = pipeline(text, voice='af_heart', speed=1.05)
+        
+        all_audio = []
+        for i, (gs, ps, audio) in enumerate(generator):
+            all_audio.extend(audio)
+        
+        audio_array = np.array(all_audio, dtype=np.float32)
+        wav_path = output_path.replace('.mp3', '.wav')
+        sf.write(wav_path, audio_array, 24000)
+        
+        print(f"[TTS] ✅ Audio saved: {wav_path}")
+        return wav_path
+        
+    except Exception as e:
+        print(f"[TTS] ⚠️ Kokoro failed: {e}, using gTTS...")
+        from gtts import gTTS
+        tts = gTTS(text=text, lang='en', slow=False)
+        tts.save(output_path)
+        return output_path
+
+
+# ============================================
+# TikTok-Style Text Chunking
+# ============================================
+
+def chunk_text_for_tiktok(text: str, words_per_chunk: int = 4) -> list:
+    """
+    Break text into small chunks for TikTok-style pacing.
+    Each chunk appears for ~2-3 seconds.
+    """
+    # Clean the text
+    clean_text = re.sub(r'\[.*?\]', '', text)  # Remove [HOOK] etc
+    clean_text = re.sub(r'\s+', ' ', clean_text).strip()
+    
+    words = clean_text.split()
+    chunks = []
+    
+    for i in range(0, len(words), words_per_chunk):
+        chunk = ' '.join(words[i:i + words_per_chunk])
+        if chunk:
+            chunks.append(chunk)
+    
+    return chunks
+
+
+def extract_visual_keywords(text: str) -> list:
+    """
+    Extract keywords for B-roll image generation.
+    Maps common words to visual concepts.
+    """
+    visual_mappings = {
+        # Science/Tech
+        'scientist': 'scientist in modern laboratory with glowing equipment',
+        'scientists': 'scientists working in futuristic lab',
+        'research': 'researcher analyzing data on holographic screens',
+        'study': 'academic study with books and digital displays',
+        'experiment': 'dramatic scientific experiment with light beams',
+        
+        # Space/Universe
+        'universe': 'vast cosmic galaxy with stars and nebulae',
+        'space': 'deep space with galaxies and cosmic dust',
+        'cosmos': 'cosmic nebula with swirling stars',
+        'galaxy': 'spiral galaxy with brilliant stars',
+        'simulation': 'digital matrix code reality simulation',
+        
+        # Technology
+        'computer': 'futuristic computer with holographic display',
+        'ai': 'artificial intelligence neural network visualization',
+        'technology': 'advanced futuristic technology interface',
+        'digital': 'digital world with flowing data streams',
+        'code': 'programming code on glowing screens',
+        
+        # Abstract
+        'reality': 'abstract reality bending visual',
+        'consciousness': 'ethereal consciousness visualization',
+        'future': 'futuristic cityscape with flying vehicles',
+        'mystery': 'mysterious dark atmospheric scene',
+        'question': 'philosophical question mark in cosmic setting',
+    }
+    
+    keywords = []
+    text_lower = text.lower()
+    
+    for keyword, visual in visual_mappings.items():
+        if keyword in text_lower:
+            keywords.append(visual)
+    
+    return keywords
+
+
+def get_broll_prompt_for_chunk(chunk: str, article_title: str) -> str:
+    """
+    Generate a B-roll image prompt based on text chunk content.
+    """
+    # Check for visual keywords in chunk
+    visuals = extract_visual_keywords(chunk)
+    if visuals:
+        return visuals[0]
+    
+    # Check title for theme
+    title_visuals = extract_visual_keywords(article_title)
+    if title_visuals:
+        return title_visuals[0]
+    
+    # Generic dramatic visual
+    return f"dramatic cinematic visualization of: {chunk}"
+
+
+# ============================================
+# Video Clip Creation
+# ============================================
+
+def create_text_overlay(text: str, duration: float, position: str = 'center') -> TextClip:
+    """
+    Create a bold, TikTok-style text overlay.
+    """
+    # Wrap text for mobile viewing
+    wrapped = '\n'.join(textwrap.wrap(text.upper(), width=15))
     
     try:
         txt = TextClip(
-            wrapped_title,
-            fontsize=70,
-            color='white',
+            wrapped,
+            fontsize=FONT_SIZE,
+            color=FONT_COLOR,
             font='Arial-Bold',
-            size=(VIDEO_WIDTH - 100, None),
+            size=(VIDEO_WIDTH - 80, None),
             method='caption',
-            align='center'
-        ).set_duration(duration).set_position('center')
-    except Exception:
-        # Fallback if font not found
+            align='center',
+            stroke_color='black',
+            stroke_width=STROKE_WIDTH
+        ).set_duration(duration)
+    except:
         txt = TextClip(
-            wrapped_title,
-            fontsize=70,
-            color='white',
-            size=(VIDEO_WIDTH - 100, None),
+            wrapped,
+            fontsize=FONT_SIZE,
+            color=FONT_COLOR,
+            size=(VIDEO_WIDTH - 80, None),
             method='caption',
-            align='center'
-        ).set_duration(duration).set_position('center')
+            align='center',
+            stroke_color='black',
+            stroke_width=STROKE_WIDTH
+        ).set_duration(duration)
     
-    return CompositeVideoClip([bg, txt])
+    # Position in lower third
+    if position == 'center':
+        return txt.set_position(('center', VIDEO_HEIGHT - 500))
+    return txt.set_position(('center', 'center'))
 
 
-def create_subtitle_clip_with_image(text: str, image: Image.Image, duration: float) -> CompositeVideoClip:
-    """Create a video clip with AI-generated image background and text overlay."""
-    # Save PIL Image to temporary file for MoviePy
+def create_clip_with_broll(image: Image.Image, duration: float) -> ImageClip:
+    """
+    Create a video clip with B-roll image (no text overlay).
+    Just visuals + voiceover audio.
+    """
     videos_dir = ensure_videos_dir()
     temp_img_path = videos_dir / f'temp_img_{int(time.time() * 1000)}.jpg'
-
-    # Apply slight darkening to image for better text visibility
-    darkened_img = Image.new('RGB', image.size)
-    darkened_img.paste(image)
-    # Add a semi-transparent dark overlay
-    overlay = Image.new('RGBA', image.size, (0, 0, 0, 80))
-    darkened_img = Image.alpha_composite(darkened_img.convert('RGBA'), overlay).convert('RGB')
-
-    darkened_img.save(temp_img_path, quality=95)
-
-    # Create ImageClip
+    
+    # Slight darkening for cinematic look
+    darkened = darken_image(image, factor=0.7)
+    darkened.save(temp_img_path, quality=95)
+    
+    # Create image clip
     bg = ImageClip(str(temp_img_path)).set_duration(duration)
-
-    # Subtitle text (wrapped and positioned at bottom third)
-    wrapped_text = "\n".join(textwrap.wrap(text, width=30))
-
-    try:
-        txt = TextClip(
-            wrapped_text,
-            fontsize=FONT_SIZE,
-            color=FONT_COLOR,
-            font='Arial-Bold',
-            size=(VIDEO_WIDTH - 100, None),
-            method='caption',
-            align='center',
-            stroke_color='black',
-            stroke_width=3
-        ).set_duration(duration).set_position(('center', VIDEO_HEIGHT - 450))
-    except Exception:
-        # Fallback without bold font
-        txt = TextClip(
-            wrapped_text,
-            fontsize=FONT_SIZE,
-            color=FONT_COLOR,
-            size=(VIDEO_WIDTH - 100, None),
-            method='caption',
-            align='center',
-            stroke_color='black',
-            stroke_width=3
-        ).set_duration(duration).set_position(('center', VIDEO_HEIGHT - 450))
-
-    # Clean up temp file after creating clip
+    
+    # Cleanup temp file
     try:
         temp_img_path.unlink()
     except:
         pass
+    
+    return bg
 
-    return CompositeVideoClip([bg, txt])
 
-
-def extract_image_prompts(script: str, num_images: int = 4) -> list:
+def create_hook_clip(title: str, duration: float = 3.0) -> ImageClip:
     """
-    Extract key phrases from script to use as image generation prompts.
-    Returns simplified visual descriptions.
+    Create a dramatic hook for the first 3 seconds.
     """
-    # Remove labels like [HOOK], [BIG IDEA], etc.
-    clean_script = script
-    for label in ['[HOOK]', '[BIG IDEA]', '[WORKS]', '[CAVEAT]', '[CLOSE]']:
-        clean_script = clean_script.replace(label, '')
+    # Generate dramatic hook image
+    hook_prompt = f"dramatic attention-grabbing visual for: {title}, epic cinematic lighting, intense atmosphere"
+    hook_image = generate_image_fal(hook_prompt)
+    
+    return create_clip_with_broll(hook_image, duration)
 
-    # Split into sentences
-    sentences = []
-    current = ""
-    for char in clean_script:
-        current += char
-        if char in '.!?' and len(current) > 20:
-            sentences.append(current.strip())
-            current = ""
-    if current.strip():
-        sentences.append(current.strip())
 
-    # Select evenly distributed sentences for image prompts
-    if len(sentences) <= num_images:
-        selected = sentences
-    else:
-        step = len(sentences) / num_images
-        indices = [int(i * step) for i in range(num_images)]
-        selected = [sentences[i] for i in indices]
+# ============================================
+# Main Video Generation
+# ============================================
 
-    # Create visual prompts from sentences
-    prompts = []
-    for sentence in selected:
-        # Extract first few words as a visual concept
-        words = sentence.split()[:8]
-        prompt = ' '.join(words)
-        # Clean up
-        prompt = prompt.replace('[', '').replace(']', '')
-        prompts.append(prompt)
-
-    return prompts
+def ensure_videos_dir() -> Path:
+    """Ensure videos directory exists."""
+    videos_dir = Path('static/videos')
+    videos_dir.mkdir(parents=True, exist_ok=True)
+    return videos_dir
 
 
 def generate_video(article_id: int, title: str, script: str, hero_image: str = None) -> str:
     """
-    Generate a video from a script with TTS voiceover, AI-generated images, and subtitles.
-
-    Args:
-        article_id: ID of the article
-        title: Article title for intro card
-        script: Video script text
-        hero_image: Optional URL to hero image (not used with AI generation)
-
-    Returns:
-        Path to the generated MP4 file
+    Generate a TikTok-style video from article script.
+    
+    Features:
+    - Dramatic hook in first 3 seconds
+    - Text chunks (3-4 words) for fast pacing
+    - Visual changes every 2-3 seconds
+    - Context-aware B-roll images
+    - High-quality Kokoro TTS voiceover
     """
     videos_dir = ensure_videos_dir()
     timestamp = datetime.now().strftime('%Y%m%d_%H%M%S')
     output_path = videos_dir / f'article_{article_id}_{timestamp}.mp4'
     temp_audio_path = videos_dir / f'temp_audio_{article_id}.mp3'
-
+    
     try:
         # Step 1: Generate TTS audio
-        print(f"[Video] Generating TTS for article {article_id}...")
-        generate_tts(script, str(temp_audio_path))
-
+        print(f"\n{'='*50}")
+        print(f"[Video] 🎬 Generating TikTok-style video for article {article_id}")
+        print(f"{'='*50}")
+        
+        print("[Video] Step 1: Generating voiceover...")
+        actual_audio_path = generate_tts_kokoro(script, str(temp_audio_path))
+        
         # Load audio to get duration
-        audio = AudioFileClip(str(temp_audio_path))
+        audio = AudioFileClip(actual_audio_path)
         audio_duration = audio.duration
-
-        # Step 2: Create title card (3 seconds)
-        print(f"[Video] Creating title card...")
-        title_clip = create_title_card(title, duration=3.0)
-
-        # Step 3: Split script into sentences
-        print(f"[Video] Processing script...")
-        sentences = []
-        current = ""
-        for char in script:
-            current += char
-            if char in '.!?' and len(current) > 20:
-                sentences.append(current.strip())
-                current = ""
-        if current.strip():
-            sentences.append(current.strip())
-
-        if not sentences:
-            sentences = [script]
-
-        # Calculate time per sentence
-        time_per_sentence = audio_duration / len(sentences)
-
-        # Step 4: Generate AI images based on script content
-        print(f"[Video] Generating {len(sentences)} AI images...")
-        image_prompts = extract_image_prompts(script, num_images=len(sentences))
-
-        ai_images = []
-        for i, prompt in enumerate(image_prompts):
-            print(f"[Video] Image {i+1}/{len(image_prompts)}")
-            img = generate_ai_image(prompt)
-            ai_images.append(img)
-
-        # Step 5: Create clips with AI images and text overlays
-        print(f"[Video] Creating video clips with images and text...")
-        subtitle_clips = []
-        for i, sentence in enumerate(sentences):
-            # Use corresponding AI image (or loop if we have fewer images)
-            img_index = i % len(ai_images)
-            clip = create_subtitle_clip_with_image(sentence, ai_images[img_index], time_per_sentence)
-            subtitle_clips.append(clip)
-
-        if subtitle_clips:
-            main_content = concatenate_videoclips(subtitle_clips)
-        else:
-            # Fallback
-            img = generate_ai_image(title)
-            main_content = create_subtitle_clip_with_image(script, img, audio_duration)
-
-        # Add audio to main content
-        main_content = main_content.set_audio(audio)
+        print(f"[Video] Audio duration: {audio_duration:.1f}s")
         
-        # Step 4: Concatenate title + main content
-        print(f"[Video] Rendering final video...")
-        final_video = concatenate_videoclips([title_clip, main_content])
+        # Step 2: Chunk text for TikTok pacing
+        print("[Video] Step 2: Chunking text for TikTok pacing...")
+        chunks = chunk_text_for_tiktok(script, words_per_chunk=4)
+        print(f"[Video] Created {len(chunks)} text chunks")
         
-        # Write output
-        final_video.write_videofile(
+        # Calculate time per chunk
+        time_per_chunk = audio_duration / len(chunks) if chunks else 2.5
+        time_per_chunk = max(1.5, min(3.5, time_per_chunk))  # Clamp between 1.5-3.5s
+        
+        # Step 3: Generate B-roll images for each chunk
+        print(f"[Video] Step 3: Generating {len(chunks)} B-roll images...")
+        
+        clips = []
+        for i, chunk in enumerate(chunks):
+            print(f"[Video] Chunk {i+1}/{len(chunks)}: '{chunk[:30]}...'")
+            
+            # Generate B-roll for this chunk
+            broll_prompt = get_broll_prompt_for_chunk(chunk, title)
+            
+            # Reuse some images to reduce API calls (every 3rd chunk gets new image)
+            if i % 3 == 0 or i < 3:
+                current_image = generate_image_fal(broll_prompt)
+            
+            clip = create_clip_with_broll(current_image, time_per_chunk)
+            clips.append(clip)
+        
+        # Step 4: Concatenate all clips
+        print("[Video] Step 4: Assembling video...")
+        main_video = concatenate_videoclips(clips)
+        
+        # Adjust video to match audio duration
+        if main_video.duration != audio_duration:
+            if main_video.duration > audio_duration:
+                main_video = main_video.subclip(0, audio_duration)
+            # If video is shorter, the last frame will hold
+        
+        # Add audio
+        main_video = main_video.set_audio(audio)
+        
+        # Step 5: Render final video
+        print("[Video] Step 5: Rendering final video...")
+        main_video.write_videofile(
             str(output_path),
             fps=FPS,
             codec='libx264',
@@ -369,23 +438,33 @@ def generate_video(article_id: int, title: str, script: str, hero_image: str = N
         
         # Cleanup
         audio.close()
-        final_video.close()
-        if temp_audio_path.exists():
-            temp_audio_path.unlink()
+        main_video.close()
+        for clip in clips:
+            clip.close()
         
-        print(f"[Video] Generated: {output_path}")
+        try:
+            Path(actual_audio_path).unlink()
+        except:
+            pass
+        
+        print(f"\n{'='*50}")
+        print(f"[Video] ✅ SUCCESS! Video saved to: {output_path}")
+        print(f"{'='*50}\n")
+        
         return str(output_path)
         
     except Exception as e:
-        print(f"[Video] Error generating video: {e}")
-        # Cleanup temp files on error
-        if temp_audio_path.exists():
-            temp_audio_path.unlink()
+        print(f"[Video] ❌ Error generating video: {e}")
+        import traceback
+        traceback.print_exc()
         raise
 
 
+# ============================================
+# Test
+# ============================================
+
 if __name__ == '__main__':
-    # Test video generation
     test_script = """
     Did you know AI is completely transforming how we work?
     In just the last year, we've seen tools that can write code, create art, and even compose music.
@@ -398,4 +477,4 @@ if __name__ == '__main__':
         title="AI is Changing Everything",
         script=test_script
     )
-    print(f"Test video saved to: {output}")
+    print(f"Test video: {output}")
