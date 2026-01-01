@@ -76,11 +76,12 @@ def generate_image_fal(prompt: str, retry_count: int = RETRY_ATTEMPTS) -> Image.
             print(f"[Image] Generating: {prompt[:40]}...")
             
             result = fal_client.run(
-                "fal-ai/flux/dev",
+                "fal-ai/flux/schnell",  # Cheapest option: $0.003/MP vs $0.025/MP for dev
                 arguments={
                     "prompt": enhanced_prompt,
                     "image_size": "portrait_16_9",
-                    "num_images": 1
+                    "num_images": 1,
+                    "num_inference_steps": 4  # schnell is optimized for 1-4 steps
                 }
             )
             
@@ -275,119 +276,136 @@ def extract_visual_keywords(text: str) -> list:
     return keywords
 
 
-def generate_themed_images(title: str, script: str, num_images: int = 6) -> list:
+def generate_image_prompts_with_groq(title: str, script: str, num_prompts: int = 10) -> list:
     """
-    Pre-generate themed images based on the article topic for visual consistency.
-    Analyzes the title and script to create cohesive B-roll images.
+    Use Groq AI to analyze article content and generate contextual image prompts.
+    This understands the MESSAGE and FEELING of the content to create relevant visuals.
+    
+    Args:
+        title: Article title
+        script: Full video script  
+        num_prompts: Number of image prompts to generate
+    
+    Returns:
+        List of image prompt strings
+    """
+    from groq import Groq
+    import json
+    
+    api_key = os.getenv('GROQ_API_KEY')
+    if not api_key:
+        print("[Prompts] ⚠️ No GROQ_API_KEY, using fallback prompts")
+        return None
+    
+    try:
+        print("[Prompts] 🧠 Analyzing content with Groq AI...")
+        client = Groq(api_key=api_key)
+        
+        prompt = f"""You are a visual storyteller. Analyze this video script and generate {num_prompts} cinematic image prompts that visually tell the story.
+
+ARTICLE TITLE: {title}
+
+VIDEO SCRIPT:
+{script}
+
+YOUR TASK:
+1. Understand the CORE MESSAGE and EMOTIONAL JOURNEY of this content
+2. Create {num_prompts} image prompts that visually represent key moments in the narrative
+3. Each image should help viewers FEEL and UNDERSTAND the message being conveyed
+4. Images should flow as a visual story that matches the spoken content
+
+RULES FOR IMAGE PROMPTS:
+- Each prompt should be 15-30 words
+- Focus on VISUAL scenes that represent the IDEAS (not literal text)
+- Include mood, lighting, and atmosphere details
+- Make them cinematic and emotionally evocative
+- NO text or words in images
+- Vertical 9:16 composition for mobile video
+
+Respond with ONLY a JSON array of {num_prompts} prompt strings, no explanation:
+["prompt 1", "prompt 2", ...]"""
+
+        response = client.chat.completions.create(
+            model="llama-3.3-70b-versatile",
+            messages=[
+                {"role": "system", "content": "You are a visual storytelling expert. Respond only with valid JSON arrays."},
+                {"role": "user", "content": prompt}
+            ],
+            temperature=0.8,
+            max_tokens=2000
+        )
+        
+        text = response.choices[0].message.content.strip()
+        
+        # Parse JSON response
+        if text.startswith('```'):
+            text = text.split('```')[1]
+            if text.startswith('json'):
+                text = text[4:]
+        text = text.strip()
+        
+        prompts = json.loads(text)
+        
+        if isinstance(prompts, list) and len(prompts) >= num_prompts:
+            print(f"[Prompts] ✅ Generated {len(prompts)} contextual prompts")
+            return prompts[:num_prompts]
+        else:
+            print(f"[Prompts] ⚠️ Invalid response format, using fallback")
+            return None
+            
+    except Exception as e:
+        print(f"[Prompts] ⚠️ Groq failed: {e}, using fallback")
+        return None
+
+
+def get_fallback_prompts(num_prompts: int = 10) -> list:
+    """Fallback generic prompts if Groq fails."""
+    fallback = [
+        "dramatic cinematic landscape with moody golden hour lighting",
+        "person in contemplation looking at horizon, silhouette",
+        "abstract visualization of connection and energy flowing",
+        "emotional moment between people, warm lighting",
+        "inspiring scene of discovery and realization",
+        "nature scene symbolizing growth and transformation",
+        "close-up of hands reaching toward light",
+        "atmospheric scene with fog and mystery",
+        "powerful sunrise breaking through clouds",
+        "serene moment of peace and understanding"
+    ]
+    return fallback[:num_prompts]
+
+
+def generate_themed_images(title: str, script: str, num_images: int = 10) -> list:
+    """
+    Generate themed images using AI-powered contextual prompts.
+    Uses Groq to understand the content's message, then FAL.ai to generate images.
     
     Args:
         title: Article title
         script: Full video script
-        num_images: Number of images to generate (default 6)
+        num_images: Number of images to generate
     
     Returns:
         List of PIL Image objects
     """
-    print(f"[Video] Analyzing topic and generating {num_images} themed images...")
+    print(f"[Video] Generating {num_images} contextual images...")
     
-    # Extract key themes from title and script
-    combined_text = f"{title} {script}".lower()
+    # Step 1: Get AI-generated prompts based on content understanding
+    prompts = generate_image_prompts_with_groq(title, script, num_images)
     
-    # Define visual themes and their scene descriptions
-    theme_scenes = {
-        'ai': [
-            "glowing neural network with flowing data streams, futuristic blue",
-            "humanoid robot face with glowing eyes in darkness",
-            "holographic AI brain visualization with circuit patterns",
-            "person interacting with floating holographic screens",
-            "futuristic AI laboratory with glowing equipment",
-            "digital consciousness visualization with particles"
-        ],
-        'space': [
-            "astronaut floating in deep space with galaxy behind",
-            "massive spiral galaxy with brilliant stars",
-            "planet Earth from space with aurora",
-            "nebula with vibrant colors and star formation",
-            "space station orbiting Earth at sunrise",
-            "cosmic dust and stardust in deep space"
-        ],
-        'science': [
-            "scientist in modern lab with glowing experiments",
-            "microscope view with glowing particles",
-            "DNA double helix with bioluminescent glow",
-            "chemistry laboratory with colorful reactions",
-            "research facility with advanced equipment",
-            "scientific visualization with data patterns"
-        ],
-        'technology': [
-            "futuristic cityscape with flying vehicles",
-            "person wearing VR headset in digital world",
-            "smartphone projecting holographic display",
-            "server room with glowing network cables",
-            "smart home with connected devices glowing",
-            "electric car charging in futuristic setting"
-        ],
-        'simulation': [
-            "reality glitching with digital artifacts",
-            "person in matrix-style code environment",
-            "virtual reality world dissolving into pixels",
-            "digital simulation of a city with wireframes",
-            "reality bending like broken glass",
-            "computer simulation rendering a world"
-        ],
-        'health': [
-            "healthy heart with pulsing energy visualization",
-            "person meditating with energy aura",
-            "modern hospital with advanced technology",
-            "DNA strand with healing light particles",
-            "brain scan with highlighted activity",
-            "fitness person with energy visualization"
-        ],
-        'default': [
-            "dramatic cinematic landscape with moody lighting",
-            "abstract energy visualization with particles",
-            "mysterious atmospheric scene with fog",
-            "dramatic sky with sun rays through clouds",
-            "ethereal abstract visualization",
-            "dramatic nature scene with epic lighting"
-        ]
-    }
+    # Fallback if Groq fails
+    if not prompts:
+        print("[Video] Using fallback prompts")
+        prompts = get_fallback_prompts(num_images)
     
-    # Detect primary theme
-    detected_themes = []
-    theme_keywords = {
-        'ai': ['ai', 'artificial intelligence', 'machine learning', 'neural', 'robot', 'algorithm'],
-        'space': ['space', 'universe', 'galaxy', 'cosmos', 'planet', 'astronaut', 'stars'],
-        'science': ['scientist', 'research', 'study', 'experiment', 'discovery', 'evidence'],
-        'technology': ['technology', 'digital', 'computer', 'device', 'innovation', 'future'],
-        'simulation': ['simulation', 'reality', 'virtual', 'matrix', 'simulated', 'programmed'],
-        'health': ['health', 'brain', 'body', 'exercise', 'medicine', 'wellness', 'longevity']
-    }
-    
-    for theme, keywords in theme_keywords.items():
-        for keyword in keywords:
-            if keyword in combined_text:
-                detected_themes.append(theme)
-                break
-    
-    # Use detected themes or default
-    if not detected_themes:
-        detected_themes = ['default']
-    
-    primary_theme = detected_themes[0]
-    scenes = theme_scenes.get(primary_theme, theme_scenes['default'])
-    
-    print(f"[Video] Detected theme: {primary_theme}")
-    
-    # Generate images
+    # Step 2: Generate images using FAL.ai with contextual prompts
     images = []
-    for i in range(min(num_images, len(scenes))):
-        prompt = f"{scenes[i]}, cinematic, dramatic lighting, dark moody atmosphere, professional photography, vertical 9:16"
-        print(f"[Video] Image {i+1}/{num_images}: {scenes[i][:40]}...")
+    for i, prompt in enumerate(prompts):
+        print(f"[Video] Image {i+1}/{num_images}: {prompt[:50]}...")
         img = generate_image_fal(prompt)
         images.append(img)
     
-    print(f"[Video] ✅ Generated {len(images)} themed images")
+    print(f"[Video] ✅ Generated {len(images)} contextual images")
     return images
 
 
