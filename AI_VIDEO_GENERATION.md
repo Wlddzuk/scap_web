@@ -1,56 +1,61 @@
-# AI-Powered Video Generation with HuggingFace
+# AI-Powered Video Generation with FAL.ai & Kokoro TTS
 
 ## Overview
 
-Your video generator now creates **professional short-form videos** with:
-- ✅ **AI-generated images** using HuggingFace FLUX.1-schnell model
-- ✅ **Multiple images per video** (one per sentence/scene)
-- ✅ **Text overlays** synchronized with content
-- ✅ **Google TTS voiceover** (gTTS)
-- ✅ **9:16 vertical format** for TikTok/Instagram/YouTube Shorts
+Your video generator creates **TikTok-style short-form videos** with:
+- **FAL.ai FLUX.1-dev** for cinematic AI-generated B-roll images
+- **Kokoro-82M** for natural, high-quality TTS voiceover
+- **Fast-paced text** (3-4 word chunks, TikTok style)
+- **Visual changes every 2-3 seconds** for engagement
+- **9:16 vertical format** for TikTok/Instagram/YouTube Shorts
 
 ## How It Works
 
-### 1. Script Analysis
-The system splits your video script into sentences and extracts key phrases to use as image generation prompts.
+### 1. Text Chunking
+The script is split into 3-4 word chunks for TikTok-style pacing, with each chunk displayed for 2-3 seconds.
 
-### 2. AI Image Generation
-For each sentence, it generates a unique AI image using HuggingFace's FLUX.1-schnell model:
-- Fast generation (~5-10 seconds per image)
-- High quality, cinematic style
-- Automatically formatted to 9:16 (1080x1920)
-- Free tier: very generous limits
+### 2. B-roll Image Generation
+For each chunk, FAL.ai generates context-aware images:
+- Automatic keyword extraction maps text to visual concepts
+- Cinematic dark moody atmosphere
+- Vertical 9:16 composition
+- Images reused every 3rd chunk to reduce API calls
 
-### 3. Video Composition
-Each image is:
-- Slightly darkened for better text visibility
-- Overlaid with the sentence text at the bottom
-- Synchronized with the TTS audio timing
+### 3. Kokoro TTS Voiceover
+High-quality voice synthesis using Kokoro-82M:
+- Natural female voice (`af_heart`)
+- 1.05x speed for engaging pace
+- Falls back to gTTS if Kokoro unavailable
 
 ### 4. Final Output
-All scenes are combined with:
-- Title card intro (3 seconds)
-- Main content with images + text + voiceover
+All clips assembled with:
+- B-roll visuals darkened for text readability
+- Synchronized voiceover audio
 - MP4 output optimized for social media
 
 ## Setup Instructions
 
-### Step 1: Get HuggingFace API Key (Free)
+### Step 1: Get FAL.ai API Key (Free Tier Available)
 
-1. **Create account**: Go to [HuggingFace](https://huggingface.co/join)
-2. **Get API token**: Visit [Settings → Access Tokens](https://huggingface.co/settings/tokens)
-3. **Create new token**: Click "New token"
-   - Name: `scap_web_videos`
-   - Type: `Read` (default)
-4. **Copy the token**: Save it for the next step
+1. **Create account**: Go to [FAL.ai](https://fal.ai)
+2. **Get API key**: Visit [Dashboard → Keys](https://fal.ai/dashboard/keys)
+3. **Create new key**: Copy and save it
 
-### Step 2: Configure Environment
+### Step 2: Install Kokoro TTS
+
+```bash
+pip install kokoro soundfile numpy
+```
+
+The first run will download the Kokoro-82M model (~160MB).
+
+### Step 3: Configure Environment
 
 Create or update your `.env` file:
 
 ```env
-# Required for video image generation
-HUGGINGFACE_API_KEY=hf_your_token_here
+# Required for video B-roll image generation
+FAL_KEY=your_fal_key_here
 
 # At least ONE of these is required for summarization
 OPENROUTER_API_KEY=your_key_here
@@ -59,139 +64,167 @@ MISTRAL_API_KEY=your_key_here
 GEMINI_API_KEY=your_key_here
 ```
 
-### Step 3: Test It
-
-Run the test script:
+### Step 4: Test It
 
 ```bash
 python video_generator.py
 ```
 
-This will generate a test video at `videos/article_999_*.mp4` with AI-generated images.
-
-## What Changed
-
-### Before (Solid Backgrounds)
-- Text on solid color backgrounds
-- Static, boring visuals
-- Limited engagement
-
-### After (AI Images)
-- Dynamic AI-generated imagery
-- Professional cinematic look
-- Each scene has unique visuals
-- Much more engaging content
+This generates a test video at `static/videos/article_999_*.mp4`.
 
 ## Cost & Limits
 
-### HuggingFace Free Tier
-- **Cost**: FREE
-- **Limits**: ~1000 requests/day (plenty for your use case)
-- **Speed**: 5-10 seconds per image
-- **Quality**: High (FLUX.1-schnell is a state-of-the-art model)
+### FAL.ai
+- **Free tier**: ~$0.50 credits to start
+- **Cost**: ~$0.01-0.03 per image
+- **Speed**: 3-5 seconds per image
+- **Quality**: High (FLUX.1-dev is state-of-the-art)
+
+### Kokoro TTS
+- **Cost**: FREE (local model)
+- **Speed**: Fast (runs on CPU)
+- **Quality**: Natural, broadcast-quality voice
 
 ### Expected Usage
-- 5-10 images per video
-- If you generate 10 videos/day = 50-100 images
-- Well within free tier limits
+- 3-5 unique images per video (reused across chunks)
+- If you generate 10 videos/day = 30-50 images
+- Approximately $0.30-1.50/day on FAL.ai
 
 ## Fallback Behavior
 
-If HuggingFace API is unavailable or not configured:
-- System automatically falls back to solid color backgrounds
+### Image Generation
+If FAL.ai API is unavailable or not configured:
+- System falls back to stylish gradient backgrounds
 - Video generation continues without errors
-- You'll see console messages: `[Image] No HUGGINGFACE_API_KEY found, using solid background`
+- Console shows: `[Image] No FAL_KEY found, using gradient background`
+
+### TTS Voice
+If Kokoro fails to load:
+- System falls back to gTTS (Google Text-to-Speech)
+- Console shows: `[TTS] Kokoro failed: ..., using gTTS...`
 
 ## Customization Options
 
 ### Change Image Model
 
-In `video_generator.py`, line 50:
+In `video_generator.py`, line ~69:
 
 ```python
-# Current: Fast and good quality
-api_url = "https://api-inference.huggingface.co/models/black-forest-labs/FLUX.1-schnell"
+# Current: FLUX.1-dev (high quality)
+result = fal_client.run("fal-ai/flux/dev", ...)
 
-# Alternative options:
-# - Stable Diffusion XL: "stabilityai/stable-diffusion-xl-base-1.0"
-# - Realistic Vision: "SG161222/Realistic_Vision_V6.0_B1_noVAE"
+# Alternative: FLUX.1-schnell (faster, lower quality)
+result = fal_client.run("fal-ai/flux/schnell", ...)
 ```
 
-### Adjust Number of Images
+### Adjust Text Pacing
 
-In `video_generator.py`, line 327:
+In `video_generator.py`, line ~389:
 
 ```python
-# Current: One image per sentence
-image_prompts = extract_image_prompts(script, num_images=len(sentences))
+# Current: 4 words per chunk
+chunks = chunk_text_for_tiktok(script, words_per_chunk=4)
 
-# Fixed number (e.g., always 5 images):
-image_prompts = extract_image_prompts(script, num_images=5)
+# Slower pacing: 6 words per chunk
+chunks = chunk_text_for_tiktok(script, words_per_chunk=6)
 ```
 
 ### Modify Image Darkening
 
-In `video_generator.py`, line 189:
+In `video_generator.py`, line ~320:
 
 ```python
-# Current: Semi-transparent dark overlay (0-255, higher = darker)
-overlay = Image.new('RGBA', image.size, (0, 0, 0, 80))
+# Current: 70% brightness (darker for text)
+darkened = darken_image(image, factor=0.7)
 
-# Darker for better text contrast:
-overlay = Image.new('RGBA', image.size, (0, 0, 0, 120))
+# Lighter: 80% brightness
+darkened = darken_image(image, factor=0.8)
 
-# Lighter:
-overlay = Image.new('RGBA', image.size, (0, 0, 0, 50))
+# Darker: 50% brightness
+darkened = darken_image(image, factor=0.5)
+```
+
+### Change TTS Voice
+
+In `video_generator.py`, line ~162:
+
+```python
+# Current: American female heart voice
+generator = pipeline(text, voice='af_heart', speed=1.05)
+
+# Alternative voices:
+# 'af_bella' - American female Bella
+# 'am_adam' - American male Adam
+# 'bf_emma' - British female Emma
 ```
 
 ## Troubleshooting
 
-### "Model is loading" Messages
-- HuggingFace models sometimes need to warm up
-- System automatically waits and retries (up to 3 times)
-- Usually resolves in 10-20 seconds
+### "FAL_KEY not found"
+- Check `.env` file has `FAL_KEY=...` (not `FAL_API_KEY`)
+- Restart your application after adding the key
 
-### Images Look Wrong
-- Check the prompt extraction in console logs
-- Prompts are taken from first 8 words of each sentence
-- You can manually adjust in `extract_image_prompts()` function
+### Images Look Generic
+- The system extracts keywords automatically
+- Check `extract_visual_keywords()` function to add domain-specific mappings
+- Prompts are enhanced with cinematic styling automatically
 
-### Rate Limit Errors
-- Free tier is very generous
-- If you hit limits, wait a few minutes
-- Or switch to a different HuggingFace model
+### Kokoro Fails to Load
+- Ensure `pip install kokoro soundfile numpy` completed
+- First run downloads the model (~160MB)
+- System falls back to gTTS automatically
 
 ### Video Generation Fails
 - Check console output for specific errors
-- Ensure FFmpeg and ImageMagick are installed
-- Verify API key is correct in `.env`
+- Ensure MoviePy is installed: `pip install moviepy`
+- Verify FAL.ai API key is valid
 
-## Example Output
+## Console Output
 
-With the test script about AI, you'll get:
-- **Title card**: "AI is Changing Everything" (3 seconds)
-- **Scene 1**: AI-generated image of "AI transforming work" + text overlay
-- **Scene 2**: AI-generated image of "tools writing code creating art" + text overlay
-- **Scene 3**: AI-generated image of "learn to work with AI" + text overlay
-- **Scene 4**: AI-generated image of "start experimenting today" + text overlay
+When generating videos, you'll see:
 
-All synchronized with natural-sounding TTS voiceover!
+```
+==================================================
+[Video] Generating TikTok-style video for article 4
+==================================================
+[Video] Step 1: Generating voiceover...
+[TTS] Using Kokoro-82M for voice...
+[TTS] Audio saved: static/videos/temp_audio_4.wav
+[Video] Audio duration: 15.2s
+[Video] Step 2: Chunking text for TikTok pacing...
+[Video] Created 12 text chunks
+[Video] Step 3: Generating 12 B-roll images...
+[Video] Chunk 1/12: 'Did you know AI...'
+[Image] Generating: artificial intelligence neural...
+[Image] Generated successfully!
+...
+[Video] Step 4: Assembling video...
+[Video] Step 5: Rendering final video...
+==================================================
+[Video] SUCCESS! Video saved to: static/videos/article_4_20251229_211411.mp4
+==================================================
+```
 
-## Next Steps
+## Architecture
 
-1. ✅ Get your HuggingFace API key
-2. ✅ Add it to `.env`
-3. ✅ Test with `python video_generator.py`
-4. ✅ Use the dashboard to generate videos for real articles
-5. 🎉 Share your AI-powered videos!
-
-## Questions?
-
-Check the console output when generating videos - it shows detailed progress:
-- `[Video] Generating TTS...`
-- `[Video] Generating 4 AI images...`
-- `[Image] Generating image: ...`
-- `[Video] Creating video clips...`
-- `[Video] Rendering final video...`
-
-This helps you understand what's happening and debug any issues.
+```
+Script Input
+    ↓
+┌───────────────────────┐
+│  Text Chunking        │  → 3-4 words per chunk
+└───────────────────────┘
+    ↓
+┌───────────────────────┐
+│  Kokoro TTS           │  → High-quality voiceover
+└───────────────────────┘
+    ↓
+┌───────────────────────┐
+│  FAL.ai FLUX.1-dev    │  → B-roll images (every 3rd chunk)
+└───────────────────────┘
+    ↓
+┌───────────────────────┐
+│  MoviePy Composition  │  → Assemble clips + audio
+└───────────────────────┘
+    ↓
+MP4 Output (1080x1920, 30fps)
+```

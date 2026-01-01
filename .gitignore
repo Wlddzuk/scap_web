@@ -31,6 +31,23 @@ Thumbs.db
 
 # Generated content
 static/videos/
+videos/
+
+# Test files
+test_*.mp4
+test_*.wav
+test_*.png
+*TEMP*
+.pytest_cache/
+.tox/
+.coverage
+.coverage.*
+htmlcov/
+.hypothesis/
 
 # Logs
 *.log
+
+# Deployment
+*.pem
+*.key

@@ -41,12 +41,22 @@ FONT_COLOR = 'white'
 STROKE_WIDTH = 4
 BG_COLOR = (10, 10, 20)  # Dark fallback
 
+# Video timing constraints
+MIN_CHUNK_DURATION = 1.5  # Minimum seconds per chunk
+MAX_CHUNK_DURATION = 3.5  # Maximum seconds per chunk
+DEFAULT_CHUNK_DURATION = 2.5  # Fallback if no chunks
+
+# Image generation settings
+IMAGE_DARKEN_FACTOR = 0.7  # How much to darken images (0.0-1.0)
+DEFAULT_WORDS_PER_CHUNK = 4  # Words per text chunk for TikTok pacing
+RETRY_ATTEMPTS = 2  # Number of retry attempts for image generation
+
 
 # ============================================
 # FAL.ai Image Generation  
 # ============================================
 
-def generate_image_fal(prompt: str, retry_count: int = 2) -> Image.Image:
+def generate_image_fal(prompt: str, retry_count: int = RETRY_ATTEMPTS) -> Image.Image:
     """
     Generate an image using FAL.ai FLUX.1-dev model.
     Returns PIL Image or solid background as fallback.
@@ -133,7 +143,7 @@ def resize_and_crop_image(img: Image.Image, target_width: int, target_height: in
     return img.resize((target_width, target_height), Image.LANCZOS)
 
 
-def darken_image(img: Image.Image, factor: float = 0.6) -> Image.Image:
+def darken_image(img: Image.Image, factor: float = IMAGE_DARKEN_FACTOR) -> Image.Image:
     """Darken image for better text readability."""
     from PIL import ImageEnhance
     enhancer = ImageEnhance.Brightness(img)
@@ -181,10 +191,26 @@ def generate_tts_kokoro(text: str, output_path: str) -> str:
 
 
 # ============================================
+# Script Cleaning
+# ============================================
+
+def clean_script_for_tts(script: str) -> str:
+    """
+    Remove structural tags like [HOOK], [BIG IDEA], [WORKS], [CAVEAT], [CLOSE] 
+    from the script before TTS generation so they aren't spoken.
+    """
+    # Remove all bracketed tags
+    clean_text = re.sub(r'\[.*?\]', '', script)
+    # Clean up extra whitespace
+    clean_text = re.sub(r'\s+', ' ', clean_text).strip()
+    return clean_text
+
+
+# ============================================
 # TikTok-Style Text Chunking
 # ============================================
 
-def chunk_text_for_tiktok(text: str, words_per_chunk: int = 4) -> list:
+def chunk_text_for_tiktok(text: str, words_per_chunk: int = DEFAULT_WORDS_PER_CHUNK) -> list:
     """
     Break text into small chunks for TikTok-style pacing.
     Each chunk appears for ~2-3 seconds.
@@ -249,22 +275,120 @@ def extract_visual_keywords(text: str) -> list:
     return keywords
 
 
-def get_broll_prompt_for_chunk(chunk: str, article_title: str) -> str:
+def generate_themed_images(title: str, script: str, num_images: int = 6) -> list:
     """
-    Generate a B-roll image prompt based on text chunk content.
+    Pre-generate themed images based on the article topic for visual consistency.
+    Analyzes the title and script to create cohesive B-roll images.
+    
+    Args:
+        title: Article title
+        script: Full video script
+        num_images: Number of images to generate (default 6)
+    
+    Returns:
+        List of PIL Image objects
     """
-    # Check for visual keywords in chunk
-    visuals = extract_visual_keywords(chunk)
-    if visuals:
-        return visuals[0]
+    print(f"[Video] Analyzing topic and generating {num_images} themed images...")
     
-    # Check title for theme
-    title_visuals = extract_visual_keywords(article_title)
-    if title_visuals:
-        return title_visuals[0]
+    # Extract key themes from title and script
+    combined_text = f"{title} {script}".lower()
     
-    # Generic dramatic visual
-    return f"dramatic cinematic visualization of: {chunk}"
+    # Define visual themes and their scene descriptions
+    theme_scenes = {
+        'ai': [
+            "glowing neural network with flowing data streams, futuristic blue",
+            "humanoid robot face with glowing eyes in darkness",
+            "holographic AI brain visualization with circuit patterns",
+            "person interacting with floating holographic screens",
+            "futuristic AI laboratory with glowing equipment",
+            "digital consciousness visualization with particles"
+        ],
+        'space': [
+            "astronaut floating in deep space with galaxy behind",
+            "massive spiral galaxy with brilliant stars",
+            "planet Earth from space with aurora",
+            "nebula with vibrant colors and star formation",
+            "space station orbiting Earth at sunrise",
+            "cosmic dust and stardust in deep space"
+        ],
+        'science': [
+            "scientist in modern lab with glowing experiments",
+            "microscope view with glowing particles",
+            "DNA double helix with bioluminescent glow",
+            "chemistry laboratory with colorful reactions",
+            "research facility with advanced equipment",
+            "scientific visualization with data patterns"
+        ],
+        'technology': [
+            "futuristic cityscape with flying vehicles",
+            "person wearing VR headset in digital world",
+            "smartphone projecting holographic display",
+            "server room with glowing network cables",
+            "smart home with connected devices glowing",
+            "electric car charging in futuristic setting"
+        ],
+        'simulation': [
+            "reality glitching with digital artifacts",
+            "person in matrix-style code environment",
+            "virtual reality world dissolving into pixels",
+            "digital simulation of a city with wireframes",
+            "reality bending like broken glass",
+            "computer simulation rendering a world"
+        ],
+        'health': [
+            "healthy heart with pulsing energy visualization",
+            "person meditating with energy aura",
+            "modern hospital with advanced technology",
+            "DNA strand with healing light particles",
+            "brain scan with highlighted activity",
+            "fitness person with energy visualization"
+        ],
+        'default': [
+            "dramatic cinematic landscape with moody lighting",
+            "abstract energy visualization with particles",
+            "mysterious atmospheric scene with fog",
+            "dramatic sky with sun rays through clouds",
+            "ethereal abstract visualization",
+            "dramatic nature scene with epic lighting"
+        ]
+    }
+    
+    # Detect primary theme
+    detected_themes = []
+    theme_keywords = {
+        'ai': ['ai', 'artificial intelligence', 'machine learning', 'neural', 'robot', 'algorithm'],
+        'space': ['space', 'universe', 'galaxy', 'cosmos', 'planet', 'astronaut', 'stars'],
+        'science': ['scientist', 'research', 'study', 'experiment', 'discovery', 'evidence'],
+        'technology': ['technology', 'digital', 'computer', 'device', 'innovation', 'future'],
+        'simulation': ['simulation', 'reality', 'virtual', 'matrix', 'simulated', 'programmed'],
+        'health': ['health', 'brain', 'body', 'exercise', 'medicine', 'wellness', 'longevity']
+    }
+    
+    for theme, keywords in theme_keywords.items():
+        for keyword in keywords:
+            if keyword in combined_text:
+                detected_themes.append(theme)
+                break
+    
+    # Use detected themes or default
+    if not detected_themes:
+        detected_themes = ['default']
+    
+    primary_theme = detected_themes[0]
+    scenes = theme_scenes.get(primary_theme, theme_scenes['default'])
+    
+    print(f"[Video] Detected theme: {primary_theme}")
+    
+    # Generate images
+    images = []
+    for i in range(min(num_images, len(scenes))):
+        prompt = f"{scenes[i]}, cinematic, dramatic lighting, dark moody atmosphere, professional photography, vertical 9:16"
+        print(f"[Video] Image {i+1}/{num_images}: {scenes[i][:40]}...")
+        img = generate_image_fal(prompt)
+        images.append(img)
+    
+    print(f"[Video] ✅ Generated {len(images)} themed images")
+    return images
 
 
 # ============================================
@@ -317,7 +441,7 @@ def create_clip_with_broll(image: Image.Image, duration: float) -> ImageClip:
     temp_img_path = videos_dir / f'temp_img_{int(time.time() * 1000)}.jpg'
     
     # Slight darkening for cinematic look
-    darkened = darken_image(image, factor=0.7)
+    darkened = darken_image(image, factor=IMAGE_DARKEN_FACTOR)
     darkened.save(temp_img_path, quality=95)
     
     # Create image clip
@@ -376,42 +500,45 @@ def generate_video(article_id: int, title: str, script: str, hero_image: str = N
         print(f"[Video] 🎬 Generating TikTok-style video for article {article_id}")
         print(f"{'='*50}")
         
+        # Clean script to remove [HOOK], [BIG IDEA], etc. tags before TTS
+        clean_script = clean_script_for_tts(script)
+        print(f"[Video] Script cleaned: removed structural tags")
+        
         print("[Video] Step 1: Generating voiceover...")
-        actual_audio_path = generate_tts_kokoro(script, str(temp_audio_path))
+        actual_audio_path = generate_tts_kokoro(clean_script, str(temp_audio_path))
         
         # Load audio to get duration
         audio = AudioFileClip(actual_audio_path)
         audio_duration = audio.duration
         print(f"[Video] Audio duration: {audio_duration:.1f}s")
         
-        # Step 2: Chunk text for TikTok pacing
-        print("[Video] Step 2: Chunking text for TikTok pacing...")
-        chunks = chunk_text_for_tiktok(script, words_per_chunk=4)
-        print(f"[Video] Created {len(chunks)} text chunks")
+        # Step 2: Pre-generate themed images based on article topic
+        print("[Video] Step 2: Pre-generating themed images...")
+        themed_images = generate_themed_images(title, script, num_images=6)
+        
+        # Step 3: Chunk text for TikTok pacing
+        print("[Video] Step 3: Chunking text for visual pacing...")
+        chunks = chunk_text_for_tiktok(script, words_per_chunk=DEFAULT_WORDS_PER_CHUNK)
+        print(f"[Video] Created {len(chunks)} visual segments")
         
         # Calculate time per chunk
-        time_per_chunk = audio_duration / len(chunks) if chunks else 2.5
-        time_per_chunk = max(1.5, min(3.5, time_per_chunk))  # Clamp between 1.5-3.5s
+        time_per_chunk = audio_duration / len(chunks) if chunks else DEFAULT_CHUNK_DURATION
+        time_per_chunk = max(MIN_CHUNK_DURATION, min(MAX_CHUNK_DURATION, time_per_chunk))
         
-        # Step 3: Generate B-roll images for each chunk
-        print(f"[Video] Step 3: Generating {len(chunks)} B-roll images...")
+        # Step 4: Create video clips using themed images
+        print(f"[Video] Step 4: Creating {len(chunks)} clips with themed images...")
         
         clips = []
-        for i, chunk in enumerate(chunks):
-            print(f"[Video] Chunk {i+1}/{len(chunks)}: '{chunk[:30]}...'")
-            
-            # Generate B-roll for this chunk
-            broll_prompt = get_broll_prompt_for_chunk(chunk, title)
-            
-            # Reuse some images to reduce API calls (every 3rd chunk gets new image)
-            if i % 3 == 0 or i < 3:
-                current_image = generate_image_fal(broll_prompt)
+        for i in range(len(chunks)):
+            # Cycle through themed images evenly
+            image_index = i % len(themed_images)
+            current_image = themed_images[image_index]
             
             clip = create_clip_with_broll(current_image, time_per_chunk)
             clips.append(clip)
         
-        # Step 4: Concatenate all clips
-        print("[Video] Step 4: Assembling video...")
+        # Step 5: Concatenate all clips
+        print("[Video] Step 5: Assembling video...")
         main_video = concatenate_videoclips(clips)
         
         # Adjust video to match audio duration
@@ -423,35 +550,49 @@ def generate_video(article_id: int, title: str, script: str, hero_image: str = N
         # Add audio
         main_video = main_video.set_audio(audio)
         
-        # Step 5: Render final video
-        print("[Video] Step 5: Rendering final video...")
-        main_video.write_videofile(
-            str(output_path),
-            fps=FPS,
-            codec='libx264',
-            audio_codec='aac',
-            threads=4,
-            preset='medium',
-            verbose=False,
-            logger=None
-        )
-        
-        # Cleanup
-        audio.close()
-        main_video.close()
-        for clip in clips:
-            clip.close()
-        
+        # Step 6: Render final video
+        print("[Video] Step 6: Rendering final video...")
         try:
-            Path(actual_audio_path).unlink()
-        except:
-            pass
-        
-        print(f"\n{'='*50}")
-        print(f"[Video] ✅ SUCCESS! Video saved to: {output_path}")
-        print(f"{'='*50}\n")
-        
-        return str(output_path)
+            main_video.write_videofile(
+                str(output_path),
+                fps=FPS,
+                codec='libx264',
+                audio_codec='aac',
+                threads=4,
+                preset='medium',
+                verbose=False,
+                logger=None
+            )
+
+            print(f"\n{'='*50}")
+            print(f"[Video] ✅ SUCCESS! Video saved to: {output_path}")
+            print(f"{'='*50}\n")
+
+            return str(output_path)
+
+        finally:
+            # Always cleanup resources, even if rendering fails
+            try:
+                audio.close()
+            except Exception as e:
+                print(f"[Video] Warning: Failed to close audio: {e}")
+
+            try:
+                main_video.close()
+            except Exception as e:
+                print(f"[Video] Warning: Failed to close main video: {e}")
+
+            for clip in clips:
+                try:
+                    clip.close()
+                except Exception as e:
+                    print(f"[Video] Warning: Failed to close clip: {e}")
+
+            # Cleanup temp audio file
+            try:
+                Path(actual_audio_path).unlink()
+            except Exception as e:
+                print(f"[Video] Warning: Failed to delete temp audio: {e}")
         
     except Exception as e:
         print(f"[Video] ❌ Error generating video: {e}")
