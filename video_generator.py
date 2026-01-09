@@ -276,7 +276,176 @@ def extract_visual_keywords(text: str) -> list:
     return keywords
 
 
-def generate_image_prompts_with_groq(title: str, script: str, num_prompts: int = 10) -> list:
+# ============================================
+# AI-Powered Style Selection
+# ============================================
+
+# Comprehensive list of visual styles for Groq to choose from
+AVAILABLE_STYLES = """
+REALISTIC & PHOTOGRAPHIC:
+- Photorealistic / hyperrealistic
+- DSLR / professional photography
+- Cinematic still / movie frame
+- Vintage / film / Polaroid
+- Black-and-white photography
+- Macro photography
+- Street photography
+- Documentary style
+
+CARTOON, ANIME & COMICS:
+- Generic cartoon
+- 2D Disney-style cartoon
+- Anime
+- Manga
+- Chibi / kawaii
+- Western comic book
+- Graphic novel style
+- Saturday-morning cartoon
+- Rubber-hose cartoon (1930s style)
+- Pixel art / 8-bit / 16-bit game style
+- Vector cartoon / flat illustration
+
+3D, GAMES & TOYS:
+- 3D render (CGI)
+- Pixar/DreamWorks-style 3D
+- Video-game realism (AAA game)
+- Low-poly 3D
+- Isometric game style
+- Lego style
+- Funko Pop style
+- Claymation / stop-motion
+- Toy figure / miniature / diorama
+
+TRADITIONAL ART STYLES:
+- Oil painting
+- Watercolor
+- Gouache
+- Acrylic painting
+- Ink drawing
+- Pencil sketch
+- Charcoal sketch
+- Pastel drawing
+- Etching / engraving
+- Woodcut / linocut print
+
+HISTORICAL ART MOVEMENTS:
+- Renaissance
+- Baroque
+- Romanticism
+- Impressionism
+- Post-Impressionism
+- Expressionism
+- Cubism
+- Surrealism
+- Abstract art
+- Pop art
+- Minimalism
+
+DESIGN & ILLUSTRATION:
+- Flat design
+- Minimalist illustration
+- Line art
+- Outline / stroke illustration
+- Isometric illustration
+- Infographic style
+- UI icon / app icon style
+- Children's book illustration
+- Editorial illustration
+
+STYLIZED, AESTHETIC & NICHE:
+- Cyberpunk
+- Steampunk
+- Dieselpunk
+- Synthwave / vaporwave
+- Y2K aesthetic
+- Retro / 80s / 90s
+- Noir
+- Fantasy concept art
+- Dark fantasy / grimdark
+- Sci-fi concept art
+- Lo-fi aesthetic
+
+TEXTURE & MATERIAL FOCUSED:
+- Photobash / collage
+- Paper-cut / papercraft
+- Origami style
+- Pixel-sorted / glitch art
+- Neon sign style
+- Graffiti / street art
+- Stencil art
+- Mosaic
+- Stained glass
+- Embroidery / knitted / crochet
+- Clay / plasticine
+- Metal / chrome / mech
+"""
+
+
+def select_style_with_groq(title: str, script: str) -> str:
+    """
+    Use Groq AI to analyze the article content and select the best visual style.
+    Returns the chosen style string.
+    """
+    from groq import Groq
+    
+    api_key = os.getenv('GROQ_API_KEY')
+    if not api_key:
+        print("[Style] ⚠️ No GROQ_API_KEY, using default style")
+        return "cinematic, photorealistic, professional photography"
+    
+    try:
+        print("[Style] 🎨 Analyzing content to select best visual style...")
+        client = Groq(api_key=api_key)
+        
+        prompt = f"""You are a visual director. Analyze this article and select the SINGLE BEST visual style for the video.
+
+ARTICLE TITLE: {title}
+
+ARTICLE CONTENT:
+{script[:3000]}
+
+AVAILABLE STYLES:
+{AVAILABLE_STYLES}
+
+YOUR TASK:
+1. Understand the TOPIC, MOOD, and TARGET AUDIENCE of this content
+2. Select the ONE visual style that will best represent this content
+3. Consider: What style will make viewers FEEL the message? What style matches the subject matter?
+
+EXAMPLES:
+- Tech/AI article → "Cyberpunk" or "Sci-fi concept art" or "Synthwave / vaporwave"
+- Finance/Business → "Flat design" or "Infographic style" or "Minimalist illustration"
+- History article → "Documentary style" or "Oil painting" or "Vintage / film"
+- Kids/Education → "Children's book illustration" or "2D Disney-style cartoon"
+- Fitness/Health → "DSLR / professional photography" or "Cinematic still / movie frame"
+- Gaming article → "Video-game realism (AAA game)" or "Pixel art / 8-bit"
+
+Respond with ONLY the style name, nothing else. Example: "Cyberpunk" or "Watercolor"
+"""
+
+        response = client.chat.completions.create(
+            model="llama-3.3-70b-versatile",
+            messages=[
+                {"role": "system", "content": "You are a visual director who selects the perfect art style for videos. Respond with only the style name."},
+                {"role": "user", "content": prompt}
+            ],
+            temperature=0.5,
+            max_tokens=100
+        )
+        
+        chosen_style = response.choices[0].message.content.strip()
+        chosen_style = chosen_style.strip('"\'')
+        
+        print(f"[Style] ✅ Selected style: {chosen_style}")
+        return chosen_style
+        
+    except Exception as e:
+        print(f"[Style] ⚠️ Style selection failed: {e}, using default")
+        return "cinematic, photorealistic, professional photography"
+
+
+
+def generate_image_prompts_with_groq(title: str, script: str, num_prompts: int = 10, style: str = None) -> list:
     """
     Use Groq AI to analyze article content and generate contextual image prompts.
     This understands the MESSAGE and FEELING of the content to create relevant visuals.
@@ -285,6 +454,7 @@ def generate_image_prompts_with_groq(title: str, script: str, num_prompts: int =
         title: Article title
         script: Full video script  
         num_prompts: Number of image prompts to generate
+        style: Visual style to apply (e.g., 'cinematic, photorealistic, cyberpunk')
     
     Returns:
         List of image prompt strings
@@ -297,28 +467,37 @@ def generate_image_prompts_with_groq(title: str, script: str, num_prompts: int =
         print("[Prompts] ⚠️ No GROQ_API_KEY, using fallback prompts")
         return None
     
+    # Use default style if not provided
+    if not style:
+        style = "cinematic, photorealistic, professional photography"
+    
     try:
         print("[Prompts] 🧠 Analyzing content with Groq AI...")
+        print(f"[Prompts] 🎨 Using style: {style}")
         client = Groq(api_key=api_key)
         
-        prompt = f"""You are a visual storyteller. Analyze this video script and generate {num_prompts} cinematic image prompts that visually tell the story.
+        prompt = f"""You are a visual storyteller. Analyze this video script and generate {num_prompts} image prompts that visually tell the story.
 
 ARTICLE TITLE: {title}
 
 VIDEO SCRIPT:
 {script}
 
+VISUAL STYLE TO USE:
+{style}
+
 YOUR TASK:
 1. Understand the CORE MESSAGE and EMOTIONAL JOURNEY of this content
 2. Create {num_prompts} image prompts that visually represent key moments in the narrative
 3. Each image should help viewers FEEL and UNDERSTAND the message being conveyed
 4. Images should flow as a visual story that matches the spoken content
+5. APPLY THE VISUAL STYLE above to every single image prompt
 
 RULES FOR IMAGE PROMPTS:
 - Each prompt should be 15-30 words
 - Focus on VISUAL scenes that represent the IDEAS (not literal text)
-- Include mood, lighting, and atmosphere details
-- Make them cinematic and emotionally evocative
+- ALWAYS include the style descriptors: "{style}"
+- Make them emotionally evocative
 - NO text or words in images
 - Vertical 9:16 composition for mobile video
 
@@ -379,6 +558,7 @@ def generate_themed_images(title: str, script: str, num_images: int = 10) -> lis
     """
     Generate themed images using AI-powered contextual prompts.
     Uses Groq to understand the content's message, then FAL.ai to generate images.
+    Automatically detects article type and applies appropriate visual style.
     
     Args:
         title: Article title
@@ -390,13 +570,18 @@ def generate_themed_images(title: str, script: str, num_images: int = 10) -> lis
     """
     print(f"[Video] Generating {num_images} contextual images...")
     
-    # Step 1: Get AI-generated prompts based on content understanding
-    prompts = generate_image_prompts_with_groq(title, script, num_images)
+    # Step 0: AI selects the best visual style for this content
+    style = select_style_with_groq(title, script)
+    
+    # Step 1: Get AI-generated prompts based on content + chosen style
+    prompts = generate_image_prompts_with_groq(title, script, num_images, style=style)
     
     # Fallback if Groq fails
     if not prompts:
         print("[Video] Using fallback prompts")
         prompts = get_fallback_prompts(num_images)
+        # Apply style to fallback prompts
+        prompts = [f"{p}, {style}" for p in prompts]
     
     # Step 2: Generate images using FAL.ai with contextual prompts
     images = []
@@ -532,7 +717,7 @@ def generate_video(article_id: int, title: str, script: str, hero_image: str = N
         
         # Step 2: Pre-generate themed images based on article topic
         print("[Video] Step 2: Pre-generating themed images...")
-        themed_images = generate_themed_images(title, script, num_images=6)
+        themed_images = generate_themed_images(title, script, num_images=10)
         
         # Step 3: Chunk text for TikTok pacing
         print("[Video] Step 3: Chunking text for visual pacing...")
