@@ -444,74 +444,60 @@ Respond with ONLY the style name, nothing else. Example: "Cyberpunk" or "Waterco
         return "cinematic, photorealistic, professional photography"
 
 
-
-def generate_image_prompts_with_groq(title: str, script: str, num_prompts: int = 10, style: str = None) -> list:
+def extract_story_subjects(title: str, script: str) -> dict:
     """
-    Use Groq AI to analyze article content and generate contextual image prompts.
-    This understands the MESSAGE and FEELING of the content to create relevant visuals.
-    
-    Args:
-        title: Article title
-        script: Full video script  
-        num_prompts: Number of image prompts to generate
-        style: Visual style to apply (e.g., 'cinematic, photorealistic, cyberpunk')
+    Step 1 of image generation: Extract core subjects from the story.
+    This ensures images are anchored to what the article is ACTUALLY about.
     
     Returns:
-        List of image prompt strings
+        dict with keys: main_subject, visual_keywords, setting
     """
     from groq import Groq
     import json
     
     api_key = os.getenv('GROQ_API_KEY')
     if not api_key:
-        print("[Prompts] ⚠️ No GROQ_API_KEY, using fallback prompts")
-        return None
-    
-    # Use default style if not provided
-    if not style:
-        style = "cinematic, photorealistic, professional photography"
+        print("[Subjects] ⚠️ No GROQ_API_KEY, using title as subject")
+        return {
+            "main_subject": title,
+            "visual_keywords": [title.split()[0] if title else "scene"],
+            "setting": "general environment"
+        }
     
     try:
-        print("[Prompts] 🧠 Analyzing content with Groq AI...")
-        print(f"[Prompts] 🎨 Using style: {style}")
+        print("[Subjects] 🔍 Extracting core subjects from story...")
         client = Groq(api_key=api_key)
         
-        prompt = f"""You are a visual storyteller. Analyze this video script and generate {num_prompts} image prompts that visually tell the story.
+        prompt = f"""Analyze this article and identify what it is LITERALLY about.
 
 ARTICLE TITLE: {title}
 
-VIDEO SCRIPT:
-{script}
-
-VISUAL STYLE TO USE:
-{style}
+ARTICLE CONTENT:
+{script[:3000]}
 
 YOUR TASK:
-1. Understand the CORE MESSAGE and EMOTIONAL JOURNEY of this content
-2. Create {num_prompts} image prompts that visually represent key moments in the narrative
-3. Each image should help viewers FEEL and UNDERSTAND the message being conveyed
-4. Images should flow as a visual story that matches the spoken content
-5. APPLY THE VISUAL STYLE above to every single image prompt
+Identify the CONCRETE, VISUAL subjects that images should show.
 
-RULES FOR IMAGE PROMPTS:
-- Each prompt should be 15-30 words
-- Focus on VISUAL scenes that represent the IDEAS (not literal text)
-- ALWAYS include the style descriptors: "{style}"
-- Make them emotionally evocative
-- NO text or words in images
-- Vertical 9:16 composition for mobile video
+EXAMPLES:
+- Article about Greenland melting → main_subject: "Greenland ice sheet", visual_keywords: ["glaciers", "ice", "arctic ocean", "polar landscape", "melting ice"]
+- Article about bacteria → main_subject: "bacteria and microbes", visual_keywords: ["microscope", "petri dish", "cells", "laboratory", "scientists"]
+- Article about SpaceX → main_subject: "SpaceX rockets", visual_keywords: ["rocket launch", "spacecraft", "Elon Musk", "space", "launchpad"]
 
-Respond with ONLY a JSON array of {num_prompts} prompt strings, no explanation:
-["prompt 1", "prompt 2", ...]"""
+Respond with ONLY valid JSON:
+{{
+    "main_subject": "what this article is literally about in 3-5 words",
+    "visual_keywords": ["5 concrete things that should appear in images"],
+    "setting": "where this story takes place (location/environment)"
+}}"""
 
         response = client.chat.completions.create(
             model="llama-3.3-70b-versatile",
             messages=[
-                {"role": "system", "content": "You are a visual storytelling expert. Respond only with valid JSON arrays."},
+                {"role": "system", "content": "You extract visual subjects from articles. Respond only with valid JSON."},
                 {"role": "user", "content": prompt}
             ],
-            temperature=0.8,
-            max_tokens=2000
+            temperature=0.3,
+            max_tokens=300
         )
         
         text = response.choices[0].message.content.strip()
@@ -523,13 +509,257 @@ Respond with ONLY a JSON array of {num_prompts} prompt strings, no explanation:
                 text = text[4:]
         text = text.strip()
         
-        prompts = json.loads(text)
+        subjects = json.loads(text)
         
-        if isinstance(prompts, list) and len(prompts) >= num_prompts:
-            print(f"[Prompts] ✅ Generated {len(prompts)} contextual prompts")
-            return prompts[:num_prompts]
+        print(f"[Subjects] ✅ Main subject: {subjects.get('main_subject', 'unknown')}")
+        print(f"[Subjects] 📷 Visual keywords: {subjects.get('visual_keywords', [])}")
+        print(f"[Subjects] 🌍 Setting: {subjects.get('setting', 'unknown')}")
+        
+        return subjects
+        
+    except Exception as e:
+        print(f"[Subjects] ⚠️ Extraction failed: {e}, using title")
+        return {
+            "main_subject": title,
+            "visual_keywords": [title],
+            "setting": "general"
+        }
+
+
+def generate_image_prompts_with_groq(title: str, script: str, num_prompts: int = 10, style: str = None, subjects: dict = None) -> list:
+    """
+    Use Groq AI to generate image prompts ANCHORED to the story's core subjects.
+    
+    The script is now included so Groq understands the narrative flow and can
+    generate prompts that match specific story beats.
+    
+    Args:
+        title: Article title
+        script: Full video script (used to understand narrative beats)
+        num_prompts: Number of image prompts to generate
+        style: Visual style to apply
+        subjects: Dict with main_subject, visual_keywords, setting (from extract_story_subjects)
+    
+    Returns:
+        List of image prompt strings, or None if generation fails
+    """
+    from groq import Groq
+    import json
+    import re as regex_module
+    
+    api_key = os.getenv('GROQ_API_KEY')
+    if not api_key:
+        print("[Prompts] ⚠️ No GROQ_API_KEY, using fallback prompts")
+        return None
+    
+    # Use default style if not provided
+    if not style:
+        style = "cinematic, photorealistic, professional photography"
+    
+    # Build subject constraints
+    if subjects:
+        main_subject = subjects.get('main_subject', title)
+        visual_keywords = subjects.get('visual_keywords', [])
+        setting = subjects.get('setting', 'general environment')
+        keywords_str = ', '.join(visual_keywords) if visual_keywords else title
+    else:
+        main_subject = title
+        visual_keywords = [title]
+        keywords_str = title
+        setting = "relevant environment"
+    
+    def parse_json_response(text: str) -> list:
+        """Robustly parse JSON from LLM response, handling common issues."""
+        text = text.strip()
+        
+        # Remove markdown code fences (```json ... ``` or ``` ... ```)
+        if '```' in text:
+            # Find content between fences
+            fence_match = regex_module.search(r'```(?:json)?\s*([\s\S]*?)\s*```', text)
+            if fence_match:
+                text = fence_match.group(1).strip()
+            else:
+                # Fallback: just remove the fences
+                text = regex_module.sub(r'```(?:json)?', '', text).strip()
+        
+        # Try to find JSON array in the text (handles leading/trailing text)
+        array_match = regex_module.search(r'\[[\s\S]*\]', text)
+        if array_match:
+            text = array_match.group(0)
+        
+        # Clean up common issues
+        text = text.strip()
+        
+        return json.loads(text)
+    
+    def validate_prompts(prompts: list, visual_keywords: list, setting: str) -> tuple:
+        """
+        Validate that prompts include required keywords and relate to setting.
+        Returns (is_valid, list of invalid prompt indices).
+        """
+        if not isinstance(prompts, list):
+            return False, []
+        
+        invalid_indices = []
+        keywords_lower = [kw.lower() for kw in visual_keywords] if visual_keywords else []
+        setting_lower = setting.lower() if setting else ""
+        
+        for i, prompt in enumerate(prompts):
+            if not isinstance(prompt, str):
+                invalid_indices.append(i)
+                continue
+            
+            prompt_lower = prompt.lower()
+            
+            # Check if at least one visual keyword is present
+            has_keyword = any(kw in prompt_lower for kw in keywords_lower) if keywords_lower else True
+            
+            # Check if setting or related terms are present (more lenient check)
+            setting_words = setting_lower.split() if setting_lower else []
+            has_setting = any(word in prompt_lower for word in setting_words if len(word) > 3) if setting_words else True
+            
+            if not has_keyword:
+                invalid_indices.append(i)
+        
+        return len(invalid_indices) == 0, invalid_indices
+    
+    def build_prompt(script_content: str, main_subject: str, setting: str, keywords_str: str, style: str, num_prompts: int, is_retry: bool = False) -> str:
+        """Build the Groq prompt, optionally with stricter instructions for retry."""
+        
+        # Truncate script if too long but keep enough context
+        script_excerpt = script_content[:4000] if len(script_content) > 4000 else script_content
+        
+        strictness_prefix = ""
+        if is_retry:
+            strictness_prefix = """⚠️ CRITICAL: Your previous response was invalid. This time you MUST:
+- Include AT LEAST ONE of the required visual keywords in EVERY prompt
+- Make EVERY image directly about the main subject
+- DO NOT generate any generic or abstract images
+
+"""
+        
+        return f"""{strictness_prefix}Generate {num_prompts} image prompts for a TikTok-style video.
+
+=== ARTICLE INFORMATION ===
+TITLE: {title}
+MAIN SUBJECT: {main_subject}
+SETTING/LOCATION: {setting}
+
+=== FULL SCRIPT (understand the narrative flow) ===
+{script_excerpt}
+
+=== REQUIRED VISUAL KEYWORDS ===
+At least ONE of these MUST appear in EVERY image prompt:
+{keywords_str}
+
+=== VISUAL STYLE ===
+Apply this style to ALL images: {style}
+
+=== YOUR TASK ===
+Generate {num_prompts} image prompts that:
+1. FOLLOW THE SCRIPT'S NARRATIVE - each prompt should match a story beat/section
+2. Include at least ONE required visual keyword in EVERY prompt
+3. Are set in/related to: {setting}
+4. Apply the visual style: {style}
+5. Are 15-30 words each
+6. Have NO text/words in images
+7. Use vertical 9:16 composition
+8. Are SPECIFIC and CONCRETE, not abstract
+
+=== BAD EXAMPLES (NEVER generate these) ===
+- "dramatic landscape with moody lighting" (too generic)
+- "person in contemplation" (not about the subject)
+- "abstract energy flowing" (too vague)
+- "inspiring scene" (meaningless)
+
+=== GOOD EXAMPLES ===
+For an article about "Greenland ice melting":
+- "massive glacier calving into arctic ocean, huge ice chunks crashing into water, {style}"
+- "aerial drone view of Greenland ice sheet with bright blue melt pools and crevasses, {style}"
+- "scientist in red parka taking ice core samples on vast white glacier, {style}"
+
+Respond with ONLY a valid JSON array of exactly {num_prompts} string prompts:
+["prompt 1", "prompt 2", ...]"""
+
+    try:
+        print("[Prompts] 🧠 Generating story-aware image prompts...")
+        print(f"[Prompts] 🎨 Style: {style}")
+        print(f"[Prompts] 📌 Must include: {keywords_str}")
+        print(f"[Prompts] 📖 Using script ({len(script)} chars) for narrative context")
+        
+        client = Groq(api_key=api_key)
+        
+        # First attempt
+        prompt = build_prompt(script, main_subject, setting, keywords_str, style, num_prompts, is_retry=False)
+        
+        response = client.chat.completions.create(
+            model="llama-3.3-70b-versatile",
+            messages=[
+                {"role": "system", "content": f"You are a visual director generating image prompts for a video about '{main_subject}'. Read the full script to understand the story, then generate prompts that match the narrative beats. Every prompt MUST include something from: {keywords_str}. Respond ONLY with a valid JSON array."},
+                {"role": "user", "content": prompt}
+            ],
+            temperature=0.7,
+            max_tokens=2000
+        )
+        
+        text = response.choices[0].message.content.strip()
+        
+        try:
+            prompts = parse_json_response(text)
+        except json.JSONDecodeError as e:
+            print(f"[Prompts] ⚠️ JSON parse failed: {e}")
+            return None
+        
+        if not isinstance(prompts, list) or len(prompts) < num_prompts:
+            print(f"[Prompts] ⚠️ Invalid response format (got {len(prompts) if isinstance(prompts, list) else 'non-list'})")
+            return None
+        
+        prompts = prompts[:num_prompts]
+        
+        # Validate prompts
+        is_valid, invalid_indices = validate_prompts(prompts, visual_keywords, setting)
+        
+        if is_valid:
+            print(f"[Prompts] ✅ Generated {len(prompts)} validated story-aware prompts")
+            return prompts
+        
+        # Retry with stricter instructions
+        print(f"[Prompts] ⚠️ {len(invalid_indices)} prompts failed validation, retrying with stricter instructions...")
+        
+        retry_prompt = build_prompt(script, main_subject, setting, keywords_str, style, num_prompts, is_retry=True)
+        
+        retry_response = client.chat.completions.create(
+            model="llama-3.3-70b-versatile",
+            messages=[
+                {"role": "system", "content": f"CRITICAL: You MUST generate image prompts where EVERY single prompt contains at least one of these keywords: {keywords_str}. The prompts must be about '{main_subject}' set in '{setting}'. Respond ONLY with a valid JSON array."},
+                {"role": "user", "content": retry_prompt}
+            ],
+            temperature=0.5,  # Lower temperature for more focused output
+            max_tokens=2000
+        )
+        
+        retry_text = retry_response.choices[0].message.content.strip()
+        
+        try:
+            retry_prompts = parse_json_response(retry_text)
+        except json.JSONDecodeError:
+            print("[Prompts] ⚠️ Retry JSON parse failed, returning None for fallback")
+            return None
+        
+        if not isinstance(retry_prompts, list) or len(retry_prompts) < num_prompts:
+            print("[Prompts] ⚠️ Retry response invalid, returning None for fallback")
+            return None
+        
+        retry_prompts = retry_prompts[:num_prompts]
+        
+        # Validate retry
+        is_valid_retry, _ = validate_prompts(retry_prompts, visual_keywords, setting)
+        
+        if is_valid_retry:
+            print(f"[Prompts] ✅ Retry succeeded! Generated {len(retry_prompts)} validated prompts")
+            return retry_prompts
         else:
-            print(f"[Prompts] ⚠️ Invalid response format, using fallback")
+            print("[Prompts] ⚠️ Retry still invalid, returning None to trigger fallback")
             return None
             
     except Exception as e:
@@ -556,41 +786,40 @@ def get_fallback_prompts(num_prompts: int = 10) -> list:
 
 def generate_themed_images(title: str, script: str, num_images: int = 10) -> list:
     """
-    Generate themed images using AI-powered contextual prompts.
-    Uses Groq to understand the content's message, then FAL.ai to generate images.
-    Automatically detects article type and applies appropriate visual style.
+    Generate themed images anchored to the story's core subjects.
     
-    Args:
-        title: Article title
-        script: Full video script
-        num_images: Number of images to generate
-    
-    Returns:
-        List of PIL Image objects
+    Flow:
+    1. Extract core subjects (what the story is LITERALLY about)
+    2. Select visual style
+    3. Generate image prompts anchored to subjects
+    4. Generate images with FAL.ai
     """
     print(f"[Video] Generating {num_images} contextual images...")
     
-    # Step 0: AI selects the best visual style for this content
+    # Step 0: Extract what the story is LITERALLY about
+    subjects = extract_story_subjects(title, script)
+    
+    # Step 1: AI selects the best visual style for this content
     style = select_style_with_groq(title, script)
     
-    # Step 1: Get AI-generated prompts based on content + chosen style
-    prompts = generate_image_prompts_with_groq(title, script, num_images, style=style)
+    # Step 2: Get AI-generated prompts anchored to subjects + style
+    prompts = generate_image_prompts_with_groq(title, script, num_images, style=style, subjects=subjects)
     
-    # Fallback if Groq fails
+    # Fallback if Groq fails - use subject keywords
     if not prompts:
-        print("[Video] Using fallback prompts")
-        prompts = get_fallback_prompts(num_images)
-        # Apply style to fallback prompts
-        prompts = [f"{p}, {style}" for p in prompts]
+        print("[Video] Using fallback prompts with subject anchoring")
+        keywords = subjects.get('visual_keywords', [title])
+        setting = subjects.get('setting', '')
+        prompts = [f"{kw}, {setting}, {style}" for kw in (keywords * 3)[:num_images]]
     
-    # Step 2: Generate images using FAL.ai with contextual prompts
+    # Step 3: Generate images using FAL.ai with contextual prompts
     images = []
     for i, prompt in enumerate(prompts):
         print(f"[Video] Image {i+1}/{num_images}: {prompt[:50]}...")
         img = generate_image_fal(prompt)
         images.append(img)
     
-    print(f"[Video] ✅ Generated {len(images)} contextual images")
+    print(f"[Video] ✅ Generated {len(images)} images about '{subjects.get('main_subject', title)}'")
     return images
 
 
