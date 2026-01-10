@@ -1,0 +1,17 @@
+# Development and Testing Dependencies
+-r requirements.txt
+
+# Testing Framework
+pytest>=7.4.0
+pytest-cov>=4.1.0
+pytest-flask>=1.2.0
+pytest-mock>=3.11.1
+
+# Code Quality
+pylint>=3.0.0
+black>=23.7.0
+flake8>=6.1.0
+bandit>=1.7.5  # Security linter
+
+# Type Checking
+mypy>=1.5.0
