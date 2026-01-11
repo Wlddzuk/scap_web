@@ -4,38 +4,38 @@
 <head>
     <meta charset="UTF-8">
     <meta name="viewport" content="width=device-width, initial-scale=1.0">
-    <title>Article Scraper | Dashboard</title>
+    <title>SCAP | Broadcast Control</title>
     <link rel="stylesheet" href="/static/styles.css">
-    <link href="https://fonts.googleapis.com/css2?family=Inter:wght@400;500;600;700&display=swap" rel="stylesheet">
+    <link rel="icon" href="data:image/svg+xml,<svg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 100 100'><text y='.9em' font-size='90'>📡</text></svg>">
 </head>
 
 <body>
     <div class="app">
-        <!-- Header -->
+        <!-- Header – Command Bar -->
         <header class="header">
             <div class="header-content">
                 <div class="logo">
-                    <span class="logo-icon">📰</span>
-                    <h1>Article Scraper</h1>
+                    <span class="logo-icon">📡</span>
+                    <h1>SCAP</h1>
                 </div>
                 <div class="header-stats">
-                    <span class="stat" id="total-count">0 articles</span>
-                    <span class="stat" id="video-count">0 videos</span>
+                    <span class="stat" id="total-count" data-label="0">articles</span>
+                    <span class="stat" id="video-count" data-label="0">videos</span>
                 </div>
             </div>
         </header>
 
         <!-- Main Content -->
         <main class="main">
-            <!-- URL Scraper Form -->
+            <!-- URL Input Strip -->
             <div class="url-scraper-form">
-                <h3>📎 Paste Article URL</h3>
-                <p>Scrape any article by pasting its URL below</p>
+                <h3>Capture Article</h3>
+                <p>Drop a URL to scrape, summarize, and transform into video</p>
                 <form id="url-form" onsubmit="scrapeUrl(event)">
                     <div class="url-input-group">
                         <input type="url" id="url-input" placeholder="https://example.com/article..." required>
                         <button type="submit" class="btn btn-primary" id="scrape-btn">
-                            🔍 Scrape
+                            Capture
                         </button>
                     </div>
                 </form>
@@ -43,17 +43,17 @@
 
             <!-- Empty State -->
             <div class="empty-state hidden" id="empty-state">
-                <div class="empty-icon">🔍</div>
-                <h2>No articles yet</h2>
-                <p>Paste a URL above or use the bookmarklet to scrape articles</p>
+                <div class="empty-icon">📡</div>
+                <h2>No signal detected</h2>
+                <p>Paste an article URL above or use the bookmarklet to start capturing content</p>
                 <a href="/static/bookmarklet_install.html" class="btn btn-secondary">
                     Install Bookmarklet
                 </a>
             </div>
 
-            <!-- Articles List -->
+            <!-- Articles Feed -->
             <div class="articles-container" id="articles-container">
-                <!-- Articles will be rendered here by JavaScript -->
+                <!-- Articles rendered by JavaScript -->
             </div>
         </main>
 
@@ -61,7 +61,7 @@
         <div class="toast-container" id="toast-container"></div>
     </div>
 
-    <!-- Background Glows -->
+    <!-- Ambient Glows -->
     <div class="glow-bg glow-1"></div>
     <div class="glow-bg glow-2"></div>
 

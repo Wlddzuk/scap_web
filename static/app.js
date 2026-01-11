@@ -24,7 +24,7 @@ async function fetchArticles() {
         updateStats();
     } catch (error) {
         console.error('Error fetching articles:', error);
-        showToast('Failed to load articles', 'error');
+        showToast('Feed unavailable', 'error');
     }
 }
 
@@ -38,8 +38,8 @@ async function scrapeUrl(event) {
     if (!url) return;
 
     scrapeBtn.disabled = true;
-    scrapeBtn.textContent = '⏳ Scraping...';
-    showToast('Fetching article...', 'info');
+    scrapeBtn.textContent = 'Capturing...';
+    showToast('Acquiring signal...', 'info');
 
     try {
         const response = await fetch(`${API_BASE}/api/scrape-url`, {
@@ -53,7 +53,7 @@ async function scrapeUrl(event) {
         const data = await response.json();
 
         if (response.ok) {
-            showToast('Article scraped successfully!', 'success');
+            showToast('Signal captured successfully', 'success');
             urlInput.value = '';
             await fetchArticles();
             // Expand the new article
@@ -62,14 +62,14 @@ async function scrapeUrl(event) {
                 renderArticles();
             }
         } else {
-            showToast(data.error || 'Failed to scrape article', 'error');
+            showToast(data.error || 'Signal acquisition failed', 'error');
         }
     } catch (error) {
         console.error('Error scraping URL:', error);
-        showToast('Failed to scrape article', 'error');
+        showToast('Signal acquisition failed', 'error');
     } finally {
         scrapeBtn.disabled = false;
-        scrapeBtn.textContent = '🔍 Scrape';
+        scrapeBtn.textContent = 'Capture';
     }
 }
 
@@ -78,7 +78,7 @@ async function summarizeArticle(articleId) {
     const btn = document.querySelector(`[data-summarize="${articleId}"]`);
     if (btn) btn.disabled = true;
 
-    showToast('Generating AI summary...', 'info');
+    showToast('Processing content...', 'info');
 
     try {
         const response = await fetch(`${API_BASE}/api/articles/${articleId}/summarize`, {
@@ -88,17 +88,17 @@ async function summarizeArticle(articleId) {
         const data = await response.json();
 
         if (response.ok) {
-            showToast('Summary generated successfully!', 'success');
+            showToast('Analysis complete', 'success');
             await fetchArticles();
             // Expand the card to show the summary
             expandedArticles.add(articleId);
             renderArticles();
         } else {
-            showToast(data.error || 'Failed to summarize', 'error');
+            showToast(data.error || 'Analysis failed', 'error');
         }
     } catch (error) {
         console.error('Error summarizing article:', error);
-        showToast('Failed to summarize article', 'error');
+        showToast('Analysis failed', 'error');
     } finally {
         if (btn) btn.disabled = false;
     }
@@ -108,7 +108,7 @@ async function generateVideo(articleId) {
     const btn = document.querySelector(`[data-video="${articleId}"]`);
     if (btn) btn.disabled = true;
 
-    showToast('Generating video... This may take a minute.', 'info');
+    showToast('Rendering broadcast...', 'info');
 
     try {
         const response = await fetch(`${API_BASE}/api/articles/${articleId}/video`, {
@@ -118,23 +118,23 @@ async function generateVideo(articleId) {
         const data = await response.json();
 
         if (response.ok) {
-            showToast('Video generated successfully!', 'success');
+            showToast('Broadcast ready', 'success');
             await fetchArticles();
             expandedArticles.add(articleId);
             renderArticles();
         } else {
-            showToast(data.error || 'Failed to generate video', 'error');
+            showToast(data.error || 'Render failed', 'error');
         }
     } catch (error) {
         console.error('Error generating video:', error);
-        showToast('Failed to generate video', 'error');
+        showToast('Render failed', 'error');
     } finally {
         if (btn) btn.disabled = false;
     }
 }
 
 async function deleteArticle(articleId) {
-    if (!confirm('Are you sure you want to delete this article?')) return;
+    if (!confirm('Remove this broadcast from the feed?')) return;
 
     try {
         const response = await fetch(`${API_BASE}/api/articles/${articleId}`, {
@@ -142,14 +142,14 @@ async function deleteArticle(articleId) {
         });
 
         if (response.ok) {
-            showToast('Article deleted', 'success');
+            showToast('Broadcast removed', 'success');
             await fetchArticles();
         } else {
-            showToast('Failed to delete article', 'error');
+            showToast('Removal failed', 'error');
         }
     } catch (error) {
         console.error('Error deleting article:', error);
-        showToast('Failed to delete article', 'error');
+        showToast('Removal failed', 'error');
     }
 }
 
@@ -234,26 +234,26 @@ function renderArticleCard(article) {
 function getStatusBadges(article) {
     const badges = [];
 
-    // Always show scraped
-    badges.push('<span class="badge badge-scraped">✓ Scraped</span>');
+    // Always show captured
+    badges.push('<span class="badge badge-scraped">Captured</span>');
 
-    // Show summarized or processing
+    // Show analyzed or processing
     if (article.status === 'summarizing') {
-        badges.push('<span class="badge badge-processing">⏳ Summarizing</span>');
+        badges.push('<span class="badge badge-processing">Analyzing</span>');
     } else if (article.tldr) {
-        badges.push('<span class="badge badge-summarized">✓ Summarized</span>');
+        badges.push('<span class="badge badge-summarized">Analyzed</span>');
     }
 
     // Show video status
     if (article.status === 'generating_video') {
-        badges.push('<span class="badge badge-processing">⏳ Generating Video</span>');
+        badges.push('<span class="badge badge-processing">Rendering</span>');
     } else if (article.video_path) {
-        badges.push('<span class="badge badge-video">✓ Video</span>');
+        badges.push('<span class="badge badge-video">Broadcast</span>');
     }
 
     // Show failed
     if (article.status === 'failed') {
-        badges.push('<span class="badge badge-failed">✗ Failed</span>');
+        badges.push('<span class="badge badge-failed">Error</span>');
     }
 
     return badges.join('');
@@ -263,8 +263,8 @@ function renderSummary(article) {
     if (!article.tldr) {
         return `
             <div class="summary-section">
-                <p class="summary-text" style="color: var(--text-muted);">
-                    Click "Summarize" to generate AI summary, key bullets, and video script.
+                <p class="summary-text" style="color: var(--text-dim);">
+                    Click Analyze to extract key insights and generate a video script.
                 </p>
             </div>
         `;
@@ -310,29 +310,29 @@ function renderActions(article) {
 
     return `
         <div class="article-actions">
-            <button 
-                class="btn btn-primary" 
+            <button
+                class="btn btn-primary"
                 data-summarize="${article.id}"
                 onclick="summarizeArticle(${article.id})"
                 ${!canSummarize || isProcessing ? 'disabled' : ''}
             >
-                ${article.tldr ? '🔄 Re-Summarize' : '✨ Summarize'}
+                ${article.tldr ? 'Re-Analyze' : 'Analyze'}
             </button>
-            
-            <button 
-                class="btn btn-success" 
+
+            <button
+                class="btn btn-success"
                 data-video="${article.id}"
                 onclick="generateVideo(${article.id})"
                 ${!canGenerateVideo && !article.video_path || isProcessing ? 'disabled' : ''}
             >
-                ${article.video_path ? '🔄 Regenerate Video' : '🎬 Generate Video'}
+                ${article.video_path ? 'Re-Render' : 'Render Video'}
             </button>
-            
-            <button 
-                class="btn btn-danger" 
+
+            <button
+                class="btn btn-danger"
                 onclick="deleteArticle(${article.id})"
             >
-                🗑️ Delete
+                Remove
             </button>
         </div>
     `;
@@ -379,9 +379,12 @@ function toggleExpand(articleId, cardElement) {
 }
 
 function updateStats() {
-    document.getElementById('total-count').textContent = `${articles.length} articles`;
+    const totalEl = document.getElementById('total-count');
+    const videoEl = document.getElementById('video-count');
     const videoCount = articles.filter(a => a.video_path).length;
-    document.getElementById('video-count').textContent = `${videoCount} videos`;
+
+    totalEl.setAttribute('data-label', articles.length);
+    videoEl.setAttribute('data-label', videoCount);
 }
 
 // ============================================
@@ -436,7 +439,7 @@ async function handleBookmarkletHash() {
             const encodedData = hash.substring(8); // Remove '#scrape='
             const data = JSON.parse(decodeURIComponent(encodedData));
 
-            showToast('Receiving article from bookmarklet...', 'info');
+            showToast('Incoming transmission...', 'info');
 
             const response = await fetch(`${API_BASE}/api/scrape`, {
                 method: 'POST',
@@ -449,7 +452,7 @@ async function handleBookmarkletHash() {
             const result = await response.json();
 
             if (response.ok) {
-                showToast('Article scraped successfully!', 'success');
+                showToast('Signal captured', 'success');
                 // Clear the hash
                 history.replaceState(null, '', window.location.pathname);
                 await fetchArticles();
@@ -458,11 +461,11 @@ async function handleBookmarkletHash() {
                     renderArticles();
                 }
             } else {
-                showToast(result.error || 'Failed to scrape article', 'error');
+                showToast(result.error || 'Transmission failed', 'error');
             }
         } catch (error) {
             console.error('Error processing bookmarklet data:', error);
-            showToast('Failed to process bookmarklet data', 'error');
+            showToast('Transmission error', 'error');
         }
         // Clear the hash even on error
         history.replaceState(null, '', window.location.pathname);
