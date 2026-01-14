@@ -30,6 +30,7 @@ class Article(db.Model):
     tldr = db.Column(db.Text, nullable=True)
     bullets = db.Column(db.Text, nullable=True)  # JSON array stored as text
     video_script = db.Column(db.Text, nullable=True)
+    hashtags = db.Column(db.Text, nullable=True)  # JSON array of 5 hashtags for social media
     
     # Video output
     video_path = db.Column(db.String(512), nullable=True)
@@ -52,5 +53,6 @@ class Article(db.Model):
             'tldr': self.tldr,
             'bullets': json.loads(self.bullets) if self.bullets else None,
             'video_script': self.video_script,
+            'hashtags': json.loads(self.hashtags) if self.hashtags else None,
             'video_path': self.video_path,
         }

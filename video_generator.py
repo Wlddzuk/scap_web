@@ -47,7 +47,7 @@ MAX_CHUNK_DURATION = 3.5  # Maximum seconds per chunk
 DEFAULT_CHUNK_DURATION = 2.5  # Fallback if no chunks
 
 # Image generation settings
-IMAGE_DARKEN_FACTOR = 0.7  # How much to darken images (0.0-1.0)
+IMAGE_DARKEN_FACTOR = 0.85  # Slightly darken for text readability (0.0-1.0, higher = brighter)
 DEFAULT_WORDS_PER_CHUNK = 4  # Words per text chunk for TikTok pacing
 RETRY_ATTEMPTS = 2  # Number of retry attempts for image generation
 
@@ -68,8 +68,8 @@ def generate_image_fal(prompt: str, retry_count: int = RETRY_ATTEMPTS) -> Image.
         print("[Image] No FAL_KEY found, using gradient background")
         return create_gradient_background()
     
-    # Enhance prompt for vertical video B-roll
-    enhanced_prompt = f"{prompt}, cinematic dramatic lighting, dark moody atmosphere, vertical composition 9:16, professional photography, no text no words"
+    # Enhance prompt for vertical video B-roll - BRIGHT and eye-catching for TikTok
+    enhanced_prompt = f"{prompt}, vibrant bright colors, high contrast, eye-catching, clean composition, vertical 9:16, professional quality, no text no words"
     
     for attempt in range(retry_count):
         try:
@@ -277,156 +277,78 @@ def extract_visual_keywords(text: str) -> list:
 
 
 # ============================================
-# AI-Powered Style Selection
+# AI-Powered Style Selection (TikTok-Optimized)
 # ============================================
 
-# Comprehensive list of visual styles for Groq to choose from
-AVAILABLE_STYLES = """
-REALISTIC & PHOTOGRAPHIC:
-- Photorealistic / hyperrealistic
-- DSLR / professional photography
-- Cinematic still / movie frame
-- Vintage / film / Polaroid
-- Black-and-white photography
-- Macro photography
-- Street photography
-- Documentary style
+# Three TikTok-friendly style categories - all bright and eye-catching
+TIKTOK_STYLES = """
+STYLE A - 3D PIXAR/CGI:
+Best for: Educational, explainer, science, technology, business content
+Look: Clean, colorful, professional 3D renders like Pixar/DreamWorks movies
+Keywords: 3D render, CGI, Pixar-style, bright colors, clean, professional, vibrant
 
-CARTOON, ANIME & COMICS:
-- Generic cartoon
-- 2D Disney-style cartoon
-- Anime
-- Manga
-- Chibi / kawaii
-- Western comic book
-- Graphic novel style
-- Saturday-morning cartoon
-- Rubber-hose cartoon (1930s style)
-- Pixel art / 8-bit / 16-bit game style
-- Vector cartoon / flat illustration
+STYLE B - VIBRANT PHOTOGRAPHY:
+Best for: News, lifestyle, health, fitness, nature, real-world topics
+Look: Bright professional photography with saturated colors, high contrast
+Keywords: Professional photography, bright natural lighting, saturated colors, high contrast, vivid
 
-3D, GAMES & TOYS:
-- 3D render (CGI)
-- Pixar/DreamWorks-style 3D
-- Video-game realism (AAA game)
-- Low-poly 3D
-- Isometric game style
-- Lego style
-- Funko Pop style
-- Claymation / stop-motion
-- Toy figure / miniature / diorama
-
-TRADITIONAL ART STYLES:
-- Oil painting
-- Watercolor
-- Gouache
-- Acrylic painting
-- Ink drawing
-- Pencil sketch
-- Charcoal sketch
-- Pastel drawing
-- Etching / engraving
-- Woodcut / linocut print
-
-HISTORICAL ART MOVEMENTS:
-- Renaissance
-- Baroque
-- Romanticism
-- Impressionism
-- Post-Impressionism
-- Expressionism
-- Cubism
-- Surrealism
-- Abstract art
-- Pop art
-- Minimalism
-
-DESIGN & ILLUSTRATION:
-- Flat design
-- Minimalist illustration
-- Line art
-- Outline / stroke illustration
-- Isometric illustration
-- Infographic style
-- UI icon / app icon style
-- Children's book illustration
-- Editorial illustration
-
-STYLIZED, AESTHETIC & NICHE:
-- Cyberpunk
-- Steampunk
-- Dieselpunk
-- Synthwave / vaporwave
-- Y2K aesthetic
-- Retro / 80s / 90s
-- Noir
-- Fantasy concept art
-- Dark fantasy / grimdark
-- Sci-fi concept art
-- Lo-fi aesthetic
-
-TEXTURE & MATERIAL FOCUSED:
-- Photobash / collage
-- Paper-cut / papercraft
-- Origami style
-- Pixel-sorted / glitch art
-- Neon sign style
-- Graffiti / street art
-- Stencil art
-- Mosaic
-- Stained glass
-- Embroidery / knitted / crochet
-- Clay / plasticine
-- Metal / chrome / mech
+STYLE C - BOLD FLAT ILLUSTRATION:
+Best for: Tech, business, trending topics, infographics, modern content
+Look: Modern flat design with bold colors, clean lines, minimalist but eye-catching
+Keywords: Flat illustration, bold colors, modern design, clean lines, vibrant, graphic
 """
 
 
 def select_style_with_groq(title: str, script: str) -> str:
     """
-    Use Groq AI to analyze the article content and select the best visual style.
-    Returns the chosen style string.
+    Use Groq AI to analyze the article and select the best TikTok-friendly visual style.
+    Chooses between 3 bright, eye-catching styles based on story mood.
     """
     from groq import Groq
     
     api_key = os.getenv('GROQ_API_KEY')
     if not api_key:
-        print("[Style] ⚠️ No GROQ_API_KEY, using default style")
-        return "cinematic, photorealistic, professional photography"
+        print("[Style] ⚠️ No GROQ_API_KEY, using default bright 3D style")
+        return "3D render, CGI, Pixar-style, bright colors, clean, professional, vibrant"
     
     try:
-        print("[Style] 🎨 Analyzing content to select best visual style...")
+        print("[Style] 🎨 Analyzing content for TikTok-friendly style...")
         client = Groq(api_key=api_key)
         
-        prompt = f"""You are a visual director. Analyze this article and select the SINGLE BEST visual style for the video.
+        prompt = f"""You are a TikTok/Instagram visual director. Pick the BEST style for maximum engagement.
 
 ARTICLE TITLE: {title}
 
-ARTICLE CONTENT:
-{script[:3000]}
+ARTICLE CONTENT (excerpt):
+{script[:2000]}
 
-AVAILABLE STYLES:
-{AVAILABLE_STYLES}
+AVAILABLE STYLES (pick ONE):
 
-YOUR TASK:
-1. Understand the TOPIC, MOOD, and TARGET AUDIENCE of this content
-2. Select the ONE visual style that will best represent this content
-3. Consider: What style will make viewers FEEL the message? What style matches the subject matter?
+{TIKTOK_STYLES}
+
+DECISION PROCESS:
+1. What is the TOPIC? (tech, science, news, lifestyle, business, etc.)
+2. What is the MOOD? (inspiring, educational, exciting, serious, fun)
+3. Who is the AUDIENCE? (Gen-Z, professionals, general public)
 
 EXAMPLES:
-- Tech/AI article → "Cyberpunk" or "Sci-fi concept art" or "Synthwave / vaporwave"
-- Finance/Business → "Flat design" or "Infographic style" or "Minimalist illustration"
-- History article → "Documentary style" or "Oil painting" or "Vintage / film"
-- Kids/Education → "Children's book illustration" or "2D Disney-style cartoon"
-- Fitness/Health → "DSLR / professional photography" or "Cinematic still / movie frame"
-- Gaming article → "Video-game realism (AAA game)" or "Pixel art / 8-bit"
+- AI/Tech article → STYLE A (3D Pixar) or STYLE C (Flat Illustration)
+- Health/Fitness → STYLE B (Vibrant Photography)
+- Business/Finance → STYLE C (Bold Flat Illustration)
+- Science discovery → STYLE A (3D Pixar/CGI)
+- News/Current events → STYLE B (Vibrant Photography)
+- Trending/Viral topic → STYLE C (Bold Flat Illustration)
 
-Respond with ONLY the style name, nothing else. Example: "Cyberpunk" or "Watercolor"
+Respond with ONLY the style keywords. Example responses:
+- "3D render, CGI, Pixar-style, bright colors, clean, professional, vibrant"
+- "Professional photography, bright natural lighting, saturated colors, high contrast, vivid"
+- "Flat illustration, bold colors, modern design, clean lines, vibrant, graphic"
 """
 
         response = client.chat.completions.create(
             model="llama-3.3-70b-versatile",
             messages=[
-                {"role": "system", "content": "You are a visual director who selects the perfect art style for videos. Respond with only the style name."},
+                {"role": "system", "content": "You select visual styles for TikTok videos. Always choose BRIGHT, VIBRANT, eye-catching styles. Respond with only the style keywords."},
                 {"role": "user", "content": prompt}
             ],
             temperature=0.5,
@@ -436,12 +358,16 @@ Respond with ONLY the style name, nothing else. Example: "Cyberpunk" or "Waterco
         chosen_style = response.choices[0].message.content.strip()
         chosen_style = chosen_style.strip('"\'')
         
+        # Ensure we always add brightness keywords
+        if "bright" not in chosen_style.lower() and "vibrant" not in chosen_style.lower():
+            chosen_style += ", bright, vibrant, eye-catching"
+        
         print(f"[Style] ✅ Selected style: {chosen_style}")
         return chosen_style
         
     except Exception as e:
-        print(f"[Style] ⚠️ Style selection failed: {e}, using default")
-        return "cinematic, photorealistic, professional photography"
+        print(f"[Style] ⚠️ Style selection failed: {e}, using default bright 3D style")
+        return "3D render, CGI, Pixar-style, bright colors, clean, professional, vibrant"
 
 
 def extract_story_subjects(title: str, script: str) -> dict:

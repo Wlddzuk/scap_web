@@ -531,6 +531,73 @@ body {
 }
 
 /* ============================================
+   Hashtags Section
+   ============================================ */
+
+.hashtags-section {
+    margin-top: var(--space-lg);
+}
+
+.hashtags-section .summary-label {
+    display: flex;
+    justify-content: space-between;
+    align-items: center;
+}
+
+.copy-hashtags-btn {
+    background: rgba(0, 212, 255, 0.1);
+    border: 1px solid rgba(0, 212, 255, 0.3);
+    color: var(--signal-cyan);
+    padding: 4px 12px;
+    border-radius: 6px;
+    font-size: 0.7rem;
+    font-weight: 600;
+    cursor: pointer;
+    transition: all 0.15s ease;
+    text-transform: uppercase;
+    letter-spacing: 0.05em;
+}
+
+.copy-hashtags-btn:hover {
+    background: rgba(0, 212, 255, 0.2);
+    border-color: var(--signal-cyan);
+    transform: translateY(-1px);
+}
+
+.copy-hashtags-btn:active {
+    transform: translateY(0);
+}
+
+.hashtags-container {
+    display: flex;
+    flex-wrap: wrap;
+    gap: var(--space-sm);
+    margin-top: var(--space-sm);
+}
+
+.hashtag-tag {
+    display: inline-flex;
+    align-items: center;
+    padding: 6px 14px;
+    background: linear-gradient(135deg, rgba(255, 61, 138, 0.1), rgba(163, 230, 53, 0.1));
+    border: 1px solid rgba(255, 61, 138, 0.3);
+    border-radius: 20px;
+    font-size: 0.85rem;
+    font-weight: 500;
+    color: var(--signal-lime);
+    cursor: pointer;
+    transition: all 0.15s ease;
+    user-select: all;
+}
+
+.hashtag-tag:hover {
+    background: linear-gradient(135deg, rgba(255, 61, 138, 0.2), rgba(163, 230, 53, 0.2));
+    border-color: var(--signal-magenta);
+    transform: translateY(-2px);
+    box-shadow: 0 4px 12px rgba(255, 61, 138, 0.2);
+}
+
+/* ============================================
    Toast Notifications
    ============================================ */
 

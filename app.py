@@ -347,6 +347,7 @@ def summarize_article_endpoint(article_id):
         article.tldr = result['tldr']
         article.bullets = json.dumps(result['bullets'])
         article.video_script = result['video_script']
+        article.hashtags = json.dumps(result.get('hashtags', []))
         article.status = 'summarized'
         article.summarized_at = datetime.utcnow()
         

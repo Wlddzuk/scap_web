@@ -12,7 +12,7 @@ load_dotenv()
 def get_prompt(title: str, content: str) -> str:
     return f"""You are a scriptwriter. Write a COMPLETE 60-90 second video script in plain adult English (15+), based ONLY on the article text.
 
-Also generate a TL;DR and key bullets.
+Also generate a TL;DR, key bullets, and 5 hashtags for social media.
 
 === TIME + LENGTH ===
 - Target length: 75 seconds (acceptable 60-90 seconds).
@@ -38,6 +38,11 @@ Also generate a TL;DR and key bullets.
 === DELIVERY ===
 - No jargon. If you must use a technical term, define it in 6-10 words immediately.
 
+=== HASHTAGS ===
+- Generate exactly 5 hashtags relevant to the article topic.
+- Each hashtag must start with # and be a single word or CamelCase compound (e.g., #ArtificialIntelligence).
+- Make them relevant for social media engagement (TikTok, Instagram, Twitter).
+
 ARTICLE TITLE: {title}
 
 ARTICLE CONTENT:
@@ -54,6 +59,13 @@ Respond in this exact JSON format (no markdown, just raw JSON):
         "Fifth key point"
     ],
     "video_script": "Your script with [HOOK] [BIG IDEA] [WORKS] [CAVEAT] [CLOSE] labels",
+    "hashtags": [
+        "#Hashtag1",
+        "#Hashtag2",
+        "#Hashtag3",
+        "#Hashtag4",
+        "#Hashtag5"
+    ],
     "coverage_checklist": [
         "Point 1 covered",
         "Point 2 covered",
@@ -76,7 +88,8 @@ def parse_response(text: str) -> dict:
     return {
         'tldr': result.get('tldr', ''),
         'bullets': result.get('bullets', []),
-        'video_script': result.get('video_script', '')
+        'video_script': result.get('video_script', ''),
+        'hashtags': result.get('hashtags', [])
     }
 
 

@@ -271,6 +271,7 @@ function renderSummary(article) {
     }
 
     const bullets = article.bullets || [];
+    const hashtags = article.hashtags || [];
 
     return `
         <div class="summary-section">
@@ -298,6 +299,20 @@ function renderSummary(article) {
                     <source src="/videos/${article.video_path}" type="video/mp4">
                     Your browser does not support the video tag.
                 </video>
+            </div>
+        ` : ''}
+        
+        ${hashtags.length > 0 ? `
+            <div class="summary-section hashtags-section">
+                <div class="summary-label">
+                    Hashtags
+                    <button class="copy-hashtags-btn" onclick="copyHashtags(event, ${article.id})" title="Copy all hashtags">
+                        📋 Copy All
+                    </button>
+                </div>
+                <div class="hashtags-container" data-hashtags-id="${article.id}">
+                    ${hashtags.map(tag => `<span class="hashtag-tag">${escapeHtml(tag)}</span>`).join('')}
+                </div>
             </div>
         ` : ''}
     `;
@@ -416,6 +431,32 @@ function showToast(message, type = 'info') {
 // ============================================
 // Utility Functions
 // ============================================
+
+function copyHashtags(event, articleId) {
+    event.stopPropagation();
+
+    const article = articles.find(a => a.id === articleId);
+    if (!article || !article.hashtags) return;
+
+    const hashtagsText = article.hashtags.join(' ');
+
+    navigator.clipboard.writeText(hashtagsText).then(() => {
+        showToast('Hashtags copied to clipboard!', 'success');
+
+        // Visual feedback on button
+        const btn = event.target.closest('.copy-hashtags-btn');
+        if (btn) {
+            const originalText = btn.textContent;
+            btn.textContent = '✓ Copied!';
+            setTimeout(() => {
+                btn.textContent = originalText;
+            }, 2000);
+        }
+    }).catch(err => {
+        console.error('Failed to copy hashtags:', err);
+        showToast('Failed to copy hashtags', 'error');
+    });
+}
 
 function escapeHtml(text) {
     if (!text) return '';
