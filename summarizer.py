@@ -10,38 +10,39 @@ load_dotenv()
 
 # Shared prompt template
 def get_prompt(title: str, content: str) -> str:
-    return f"""You are a scriptwriter. Write a COMPLETE 60-90 second video script in plain adult English (15+), based ONLY on the article text.
+    return f"""You are a VIRAL TikTok scriptwriter. Write a HIGH-ENERGY 60-second video script based ONLY on the article text.
 
-Also generate a TL;DR, key bullets, and 5 hashtags for social media.
+Target Audience: Gen-Z / Millennials.
+Tone: Exciting, Punchy, Fast-paced.
+Reading Level: 7th-8th Grade (Simple, powerful words).
+
+Also generate a TL;DR, key bullets, and 5 hashtags.
 
 === TIME + LENGTH ===
-- Target length: 75 seconds (acceptable 60-90 seconds).
-- Word count: 160-210 words.
-- Short sentences. No filler.
+- Target length: 60 SECONDS (approx 130-150 words).
+- PACE IS EVERYTHING. Short sentences. No fluff.
+
+=== VISUAL VISUALIZATION (Mental Check) ===
+Write so that images of the subject can easily match the words. Use visual language.
 
 === STRUCTURE (exact) ===
-1) [HOOK] (1 sentence) - Punchy opener
-2) [BIG IDEA] (2-3 sentences) - Main concept
-3) [WORKS] (3-5 fast bullet-like lines) - The "what works" list
-4) [CAVEAT] (1-2 sentences) - One uncertainty or limitation
-5) [CLOSE] (1 sentence) - Memorable takeaway
+1) [HOOK] (1 sentence) - A shocking fact, question, or bold statement. Grab attention INSTANTLY.
+2) [BIG IDEA] (2-3 sentences) - What's the core story? Why does it matter right now?
+3) [WORKS] (3-4 fast bullet-like lines) - The key details/evidence. Rapid fire delivery.
+4) [CAVEAT] (1 sentence) - The twist, risk, or valid counterpoint (if any).
+5) [CLOSE] (1 sentence) - A powerful mic-drop statement or unexpected insight.
 
-=== COMPLETENESS RULE (must follow) ===
-- Identify the article's "must-include" major points (max 8).
-- Your script MUST mention ALL of them, even if briefly.
-- If you can't fit all 8 into 210 words, compress, don't delete.
-
-=== EVIDENCE DISCIPLINE ===
-- If something is correlation/observational, say "linked to" or "associated with."
-- If it's speculation, label it "still speculative."
+=== COMPLETENESS RULE ===
+- Identify the article's "must-know" points (max 5).
+- Include them all, but keep it moving FAST.
 
 === DELIVERY ===
-- No jargon. If you must use a technical term, define it in 6-10 words immediately.
+- Speak like a top YouTuber/TikToker (e.g., MrBeast style pacing).
+- NO jargon. If complex, simplify it instantly.
 
 === HASHTAGS ===
-- Generate exactly 5 hashtags relevant to the article topic.
-- Each hashtag must start with # and be a single word or CamelCase compound (e.g., #ArtificialIntelligence).
-- Make them relevant for social media engagement (TikTok, Instagram, Twitter).
+- Generate exactly 5 viral-ready hashtags.
+- CamelCase format (e.g., #ArtificialIntelligence).
 
 ARTICLE TITLE: {title}
 
@@ -68,8 +69,7 @@ Respond in this exact JSON format (no markdown, just raw JSON):
     ],
     "coverage_checklist": [
         "Point 1 covered",
-        "Point 2 covered",
-        "Point 3 covered"
+        "Point 2 covered"
     ]
 }}
 """

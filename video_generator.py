@@ -588,21 +588,23 @@ Generate {num_prompts} image prompts that:
 3. Are set in/related to: {setting}
 4. Apply the visual style: {style}
 5. Are 15-30 words each
-6. Have NO text/words in images
+6. Have NO text/words in images. NO SIGNS. NO LABELS.
 7. Use vertical 9:16 composition
-8. Are SPECIFIC and CONCRETE, not abstract
+8. Are SPECIFIC and CONCRETE, not abstract.
+9. **QUALITY BOOSTERS**: Append "4k, cinematic lighting, trending on artstation, masterpiece" to every prompt.
 
 === BAD EXAMPLES (NEVER generate these) ===
 - "dramatic landscape with moody lighting" (too generic)
 - "person in contemplation" (not about the subject)
 - "abstract energy flowing" (too vague)
 - "inspiring scene" (meaningless)
+- "text showing statistics" (NO TEXT allowed)
 
 === GOOD EXAMPLES ===
 For an article about "Greenland ice melting":
-- "massive glacier calving into arctic ocean, huge ice chunks crashing into water, {style}"
-- "aerial drone view of Greenland ice sheet with bright blue melt pools and crevasses, {style}"
-- "scientist in red parka taking ice core samples on vast white glacier, {style}"
+- "massive glacier calving into arctic ocean, huge ice chunks crashing into water, {style}, 4k, cinematic lighting"
+- "aerial drone view of Greenland ice sheet with bright blue melt pools and crevasses, {style}, hyperrealistic"
+- "scientist in red parka taking ice core samples on vast white glacier, {style}, sharp focus"
 
 Respond with ONLY a valid JSON array of exactly {num_prompts} string prompts:
 ["prompt 1", "prompt 2", ...]"""
