@@ -382,8 +382,7 @@ def generate_video_endpoint(article_id):
         video_path = generate_video(
             article_id=article.id,
             title=article.title,
-            script=article.video_script,
-            hero_image=article.hero_image
+            script=article.video_script
         )
         
         # Store relative path for serving
