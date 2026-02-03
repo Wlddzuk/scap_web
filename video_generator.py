@@ -111,15 +111,36 @@ def resize_and_crop_image(img: Image.Image, target_width: int, target_height: in
     return img.resize((target_width, target_height), Image.LANCZOS)
 
 
-def generate_tts_kokoro(text: str, output_path: str) -> str:
-    """Generate TTS using Kokoro-82M, fallback to gTTS."""
+import random
+
+# High-quality Kokoro voices (Grade B- or better)
+KOKORO_VOICES = [
+    "af_heart",   # Grade A - warm female
+    "af_bella",   # Grade A- - expressive female
+    "af_nicole",  # Grade B- - clear female
+    "bf_emma",    # Grade B- - British female
+    "am_fenrir",  # Grade C+ - best male
+    "am_michael", # Grade C+ - professional male
+]
+
+
+def generate_tts_kokoro(text: str, output_path: str, voice: str = None) -> str:
+    """Generate TTS using Kokoro-82M, fallback to gTTS.
+
+    Args:
+        text: Text to convert to speech
+        output_path: Path for output audio file
+        voice: Specific voice to use, or None for random selection
+    """
     try:
         from kokoro import KPipeline
         import soundfile as sf
 
-        print("[TTS] Using Kokoro-82M...")
+        # Pick a random voice if none specified
+        selected_voice = voice or random.choice(KOKORO_VOICES)
+        print(f"[TTS] Using Kokoro-82M with voice: {selected_voice}")
         pipeline = KPipeline(lang_code="a", repo_id="hexgrad/Kokoro-82M")
-        generator = pipeline(text, voice="af_heart", speed=1.05)
+        generator = pipeline(text, voice=selected_voice, speed=1.05)
 
         all_audio = []
         for _, (_, _, audio) in enumerate(generator):

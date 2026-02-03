@@ -9,8 +9,12 @@ flask-sqlalchemy==3.1.1
 google-generativeai==0.8.3
 groq>=0.4.0
 
-# TTS - Google
+# TTS - Google & Kokoro
 gTTS==2.5.3
+kokoro>=0.9.4
+soundfile>=0.13.0
+torch>=2.0.0,<2.5.0
+transformers>=4.40.0,<4.44.0
 
 # Video Generation
 moviepy==1.0.3
