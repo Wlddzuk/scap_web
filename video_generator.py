@@ -125,39 +125,34 @@ KOKORO_VOICES = [
 
 
 def generate_tts_kokoro(text: str, output_path: str, voice: str = None) -> str:
-    """Generate TTS using Kokoro-82M, fallback to gTTS.
+    """Generate TTS using Kokoro-82M only (no fallback).
 
     Args:
         text: Text to convert to speech
         output_path: Path for output audio file
         voice: Specific voice to use, or None for random selection
+
+    Raises:
+        Exception: If Kokoro TTS fails (no fallback to Google TTS)
     """
-    try:
-        from kokoro import KPipeline
-        import soundfile as sf
+    from kokoro import KPipeline
+    import soundfile as sf
 
-        # Pick a random voice if none specified
-        selected_voice = voice or random.choice(KOKORO_VOICES)
-        print(f"[TTS] Using Kokoro-82M with voice: {selected_voice}")
-        pipeline = KPipeline(lang_code="a", repo_id="hexgrad/Kokoro-82M")
-        generator = pipeline(text, voice=selected_voice, speed=1.05)
+    # Pick a random voice if none specified
+    selected_voice = voice or random.choice(KOKORO_VOICES)
+    print(f"[TTS] Using Kokoro-82M with voice: {selected_voice}")
+    pipeline = KPipeline(lang_code="a", repo_id="hexgrad/Kokoro-82M")
+    generator = pipeline(text, voice=selected_voice, speed=1.05)
 
-        all_audio = []
-        for _, (_, _, audio) in enumerate(generator):
-            all_audio.extend(audio)
+    all_audio = []
+    for _, (_, _, audio) in enumerate(generator):
+        all_audio.extend(audio)
 
-        audio_array = np.array(all_audio, dtype=np.float32)
-        wav_path = output_path.replace(".mp3", ".wav")
-        sf.write(wav_path, audio_array, 24000)
-        print(f"[TTS] ✅ Saved: {wav_path}")
-        return wav_path
-
-    except Exception as e:
-        print(f"[TTS] ⚠️ Kokoro failed: {e}, using gTTS...")
-        from gtts import gTTS
-        tts = gTTS(text=text, lang="en", slow=False)
-        tts.save(output_path)
-        return output_path
+    audio_array = np.array(all_audio, dtype=np.float32)
+    wav_path = output_path.replace(".mp3", ".wav")
+    sf.write(wav_path, audio_array, 24000)
+    print(f"[TTS] ✅ Saved: {wav_path} (voice: {selected_voice})")
+    return wav_path
 
 
 def clean_text(text: str) -> str:
