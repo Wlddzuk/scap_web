@@ -152,7 +152,7 @@ body {
     align-items: center;
     justify-content: center;
     text-align: center;
-    padding: var(--spacing-xl) * 3;
+    padding: calc(var(--spacing-xl) * 3);
     min-height: 400px;
 }
 
@@ -526,8 +526,9 @@ body {
 
 .video-container video {
     width: 100%;
-    max-height: 400px;
+    max-height: 680px;
     object-fit: contain;
+    border-radius: var(--radius-sm);
 }
 
 /* ============================================
@@ -535,7 +536,7 @@ body {
    ============================================ */
 
 .hashtags-section {
-    margin-top: var(--space-lg);
+    margin-top: var(--spacing-lg);
 }
 
 .hashtags-section .summary-label {
@@ -545,9 +546,9 @@ body {
 }
 
 .copy-hashtags-btn {
-    background: rgba(0, 212, 255, 0.1);
-    border: 1px solid rgba(0, 212, 255, 0.3);
-    color: var(--signal-cyan);
+    background: rgba(79, 140, 255, 0.1);
+    border: 1px solid rgba(79, 140, 255, 0.3);
+    color: var(--accent-blue);
     padding: 4px 12px;
     border-radius: 6px;
     font-size: 0.7rem;
@@ -559,8 +560,8 @@ body {
 }
 
 .copy-hashtags-btn:hover {
-    background: rgba(0, 212, 255, 0.2);
-    border-color: var(--signal-cyan);
+    background: rgba(79, 140, 255, 0.2);
+    border-color: var(--accent-blue);
     transform: translateY(-1px);
 }
 
@@ -571,30 +572,30 @@ body {
 .hashtags-container {
     display: flex;
     flex-wrap: wrap;
-    gap: var(--space-sm);
-    margin-top: var(--space-sm);
+    gap: var(--spacing-sm);
+    margin-top: var(--spacing-sm);
 }
 
 .hashtag-tag {
     display: inline-flex;
     align-items: center;
     padding: 6px 14px;
-    background: linear-gradient(135deg, rgba(255, 61, 138, 0.1), rgba(163, 230, 53, 0.1));
-    border: 1px solid rgba(255, 61, 138, 0.3);
+    background: linear-gradient(135deg, rgba(168, 85, 247, 0.15), rgba(79, 140, 255, 0.15));
+    border: 1px solid rgba(168, 85, 247, 0.3);
     border-radius: 20px;
     font-size: 0.85rem;
     font-weight: 500;
-    color: var(--signal-lime);
+    color: var(--accent-purple);
     cursor: pointer;
     transition: all 0.15s ease;
     user-select: all;
 }
 
 .hashtag-tag:hover {
-    background: linear-gradient(135deg, rgba(255, 61, 138, 0.2), rgba(163, 230, 53, 0.2));
-    border-color: var(--signal-magenta);
+    background: linear-gradient(135deg, rgba(168, 85, 247, 0.25), rgba(79, 140, 255, 0.25));
+    border-color: var(--accent-purple);
     transform: translateY(-2px);
-    box-shadow: 0 4px 12px rgba(255, 61, 138, 0.2);
+    box-shadow: 0 4px 12px rgba(168, 85, 247, 0.2);
 }
 
 /* ============================================
@@ -736,6 +737,174 @@ body {
 }
 
 /* ============================================
+   Search / Filter
+   ============================================ */
+
+.search-bar {
+    position: relative;
+    margin-bottom: var(--spacing-lg);
+}
+
+.search-bar input {
+    width: 100%;
+    padding: var(--spacing-md) var(--spacing-md) var(--spacing-md) 44px;
+    background: var(--bg-secondary);
+    border: 1px solid var(--glass-border);
+    border-radius: var(--radius-md);
+    color: var(--text-primary);
+    font-size: 0.9375rem;
+    font-family: inherit;
+    transition: border-color var(--transition-fast);
+}
+
+.search-bar input::placeholder {
+    color: var(--text-muted);
+}
+
+.search-bar input:focus {
+    outline: none;
+    border-color: var(--accent-blue);
+}
+
+.search-icon {
+    position: absolute;
+    left: 14px;
+    top: 50%;
+    transform: translateY(-50%);
+    color: var(--text-muted);
+    font-size: 1rem;
+    pointer-events: none;
+}
+
+/* ============================================
+   Loading Skeleton
+   ============================================ */
+
+.skeleton-container {
+    display: flex;
+    flex-direction: column;
+    gap: var(--spacing-lg);
+}
+
+.skeleton-card {
+    background: var(--bg-card);
+    border: 1px solid var(--glass-border);
+    border-radius: var(--radius-lg);
+    padding: var(--spacing-lg);
+    animation: shimmer 1.5s ease-in-out infinite;
+}
+
+.skeleton-line {
+    height: 14px;
+    background: rgba(255, 255, 255, 0.06);
+    border-radius: 6px;
+    margin-bottom: var(--spacing-sm);
+}
+
+.skeleton-line.title {
+    width: 60%;
+    height: 20px;
+    margin-bottom: var(--spacing-md);
+}
+
+.skeleton-line.meta {
+    width: 40%;
+    height: 12px;
+}
+
+.skeleton-badges {
+    display: flex;
+    gap: var(--spacing-sm);
+    margin-top: var(--spacing-md);
+}
+
+.skeleton-badge {
+    width: 80px;
+    height: 24px;
+    background: rgba(255, 255, 255, 0.04);
+    border-radius: 100px;
+}
+
+@keyframes shimmer {
+    0%, 100% { opacity: 1; }
+    50% { opacity: 0.5; }
+}
+
+/* ============================================
+   Progress Indicator
+   ============================================ */
+
+.progress-banner {
+    background: linear-gradient(135deg, rgba(234, 179, 8, 0.1), rgba(168, 85, 247, 0.1));
+    border: 1px solid rgba(234, 179, 8, 0.2);
+    border-radius: var(--radius-md);
+    padding: var(--spacing-md) var(--spacing-lg);
+    margin-bottom: var(--spacing-lg);
+    display: flex;
+    align-items: center;
+    gap: var(--spacing-md);
+    animation: pulse 2s ease-in-out infinite;
+}
+
+.progress-banner.hidden {
+    display: none;
+}
+
+.progress-spinner {
+    width: 20px;
+    height: 20px;
+    border: 2px solid rgba(234, 179, 8, 0.3);
+    border-top-color: var(--accent-yellow);
+    border-radius: 50%;
+    animation: spin 0.8s linear infinite;
+}
+
+@keyframes spin {
+    to { transform: rotate(360deg); }
+}
+
+.progress-text {
+    color: var(--accent-yellow);
+    font-size: 0.875rem;
+    font-weight: 500;
+}
+
+/* ============================================
+   Article Count Label
+   ============================================ */
+
+.section-header {
+    display: flex;
+    justify-content: space-between;
+    align-items: center;
+    margin-bottom: var(--spacing-md);
+}
+
+.section-title {
+    font-size: 0.8125rem;
+    font-weight: 600;
+    text-transform: uppercase;
+    letter-spacing: 1px;
+    color: var(--text-muted);
+}
+
+/* ============================================
+   Expand Chevron
+   ============================================ */
+
+.expand-chevron {
+    color: var(--text-muted);
+    font-size: 0.75rem;
+    transition: transform var(--transition-normal);
+    flex-shrink: 0;
+    margin-left: var(--spacing-sm);
+}
+
+.article-card.expanded .expand-chevron {
+    transform: rotate(180deg);
+}
+
+/* ============================================
    Responsive
    ============================================ */
 
@@ -755,5 +924,10 @@ body {
 
     .article-actions {
         flex-wrap: wrap;
+    }
+
+    .article-actions .btn {
+        flex: 1;
+        min-width: 120px;
     }
 }

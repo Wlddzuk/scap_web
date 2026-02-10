@@ -4,7 +4,7 @@
 <head>
     <meta charset="UTF-8">
     <meta name="viewport" content="width=device-width, initial-scale=1.0">
-    <title>Article Scraper | Dashboard</title>
+    <title>Clipper | Article to TikTok Video</title>
     <link rel="stylesheet" href="/static/styles.css">
     <link href="https://fonts.googleapis.com/css2?family=Inter:wght@400;500;600;700&display=swap" rel="stylesheet">
 </head>
@@ -15,8 +15,8 @@
         <header class="header">
             <div class="header-content">
                 <div class="logo">
-                    <span class="logo-icon">📰</span>
-                    <h1>Article Scraper</h1>
+                    <span class="logo-icon">🎬</span>
+                    <h1>Clipper</h1>
                 </div>
                 <div class="header-stats">
                     <span class="stat" id="total-count">0 articles</span>
@@ -29,30 +29,66 @@
         <main class="main">
             <!-- URL Scraper Form -->
             <div class="url-scraper-form">
-                <h3>📎 Paste Article URL</h3>
-                <p>Scrape any article by pasting its URL below</p>
+                <h3>Paste an article URL</h3>
+                <p>Turn any article into a TikTok-ready video with AI</p>
                 <form id="url-form" onsubmit="scrapeUrl(event)">
                     <div class="url-input-group">
                         <input type="url" id="url-input" placeholder="https://example.com/article..." required>
                         <button type="submit" class="btn btn-primary" id="scrape-btn">
-                            🔍 Scrape
+                            Scrape
                         </button>
                     </div>
                 </form>
             </div>
 
+            <!-- Progress Banner (shows during processing) -->
+            <div class="progress-banner hidden" id="progress-banner">
+                <div class="progress-spinner"></div>
+                <span class="progress-text" id="progress-text">Processing...</span>
+            </div>
+
+            <!-- Search Bar (hidden when no articles) -->
+            <div class="search-bar hidden" id="search-bar">
+                <span class="search-icon">&#x1F50D;</span>
+                <input type="text" id="search-input" placeholder="Search articles..." oninput="filterArticles()">
+            </div>
+
+            <!-- Section header -->
+            <div class="section-header hidden" id="section-header">
+                <span class="section-title" id="section-title">All articles</span>
+            </div>
+
             <!-- Empty State -->
-            <div class="empty-state hidden" id="empty-state">
-                <div class="empty-icon">🔍</div>
+            <div class="empty-state" id="empty-state">
+                <div class="empty-icon">&#x1F4F0;</div>
                 <h2>No articles yet</h2>
-                <p>Paste a URL above or use the bookmarklet to scrape articles</p>
+                <p>Paste a URL above to scrape your first article</p>
                 <a href="/static/bookmarklet_install.html" class="btn btn-secondary">
                     Install Bookmarklet
                 </a>
             </div>
 
+            <!-- Loading Skeleton -->
+            <div class="skeleton-container" id="loading-skeleton">
+                <div class="skeleton-card">
+                    <div class="skeleton-line title"></div>
+                    <div class="skeleton-line meta"></div>
+                    <div class="skeleton-badges">
+                        <div class="skeleton-badge"></div>
+                        <div class="skeleton-badge"></div>
+                    </div>
+                </div>
+                <div class="skeleton-card">
+                    <div class="skeleton-line title"></div>
+                    <div class="skeleton-line meta"></div>
+                    <div class="skeleton-badges">
+                        <div class="skeleton-badge"></div>
+                    </div>
+                </div>
+            </div>
+
             <!-- Articles List -->
-            <div class="articles-container" id="articles-container">
+            <div class="articles-container hidden" id="articles-container">
                 <!-- Articles will be rendered here by JavaScript -->
             </div>
         </main>

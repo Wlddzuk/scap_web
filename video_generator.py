@@ -145,8 +145,8 @@ def generate_tts_kokoro(text: str, output_path: str, voice: str = None) -> str:
     generator = pipeline(text, voice=selected_voice, speed=1.05)
 
     all_audio = []
-    for _, (_, _, audio) in enumerate(generator):
-        all_audio.extend(audio)
+    for _gs, _ps, audio_chunk in generator:
+        all_audio.extend(audio_chunk)
 
     audio_array = np.array(all_audio, dtype=np.float32)
     wav_path = output_path.replace(".mp3", ".wav")
@@ -445,17 +445,17 @@ def generate_video(article_id: int, title: str, script: str) -> str:
             try:
                 if resource:
                     resource.close()
-            except:
+            except Exception:
                 pass
         for c in clips:
             try:
                 c.close()
-            except:
+            except Exception:
                 pass
         try:
             if actual_audio_path:
-                Path(actual_audio_path).unlink()
-        except:
+                Path(actual_audio_path).unlink(missing_ok=True)
+        except OSError:
             pass
 
 

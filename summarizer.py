@@ -77,13 +77,35 @@ Respond in this exact JSON format (no markdown, just raw JSON):
 
 def parse_response(text: str) -> dict:
     """Parse and clean up AI response to extract JSON."""
-    # Clean up response text (remove markdown code blocks if present)
-    if text.startswith('```'):
-        text = text.split('```')[1]
-        if text.startswith('json'):
-            text = text[4:]
+    import re as _re
+
+    # Strip markdown code fences
     text = text.strip()
-    
+    fence_match = _re.search(r'```(?:json)?\s*([\s\S]*?)\s*```', text)
+    if fence_match:
+        text = fence_match.group(1)
+
+    # Try to find a JSON object in the text
+    text = text.strip()
+    if not text.startswith('{'):
+        brace_start = text.find('{')
+        if brace_start != -1:
+            text = text[brace_start:]
+
+    # Find the matching closing brace
+    depth = 0
+    end = 0
+    for i, ch in enumerate(text):
+        if ch == '{':
+            depth += 1
+        elif ch == '}':
+            depth -= 1
+            if depth == 0:
+                end = i + 1
+                break
+    if end > 0:
+        text = text[:end]
+
     result = json.loads(text)
     return {
         'tldr': result.get('tldr', ''),

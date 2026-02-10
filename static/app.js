@@ -1,5 +1,5 @@
 /**
- * Article Scraper Dashboard - Frontend JavaScript
+ * Clipper Dashboard - Frontend JavaScript
  */
 
 const API_BASE = '';
@@ -10,6 +10,8 @@ const API_BASE = '';
 
 let articles = [];
 let expandedArticles = new Set();
+let searchQuery = '';
+let initialLoadDone = false;
 
 // ============================================
 // API Functions
@@ -19,13 +21,43 @@ async function fetchArticles() {
     try {
         const response = await fetch(`${API_BASE}/api/articles`);
         const data = await response.json();
+        const prevArticles = articles;
         articles = data.articles;
-        renderArticles();
+
+        // Hide loading skeleton after first load
+        if (!initialLoadDone) {
+            initialLoadDone = true;
+            document.getElementById('loading-skeleton').style.display = 'none';
+        }
+
+        // Smart render: only full re-render when data actually changed
+        if (articlesChanged(prevArticles, articles)) {
+            renderArticles();
+        }
+
         updateStats();
+        updateProgressBanner();
     } catch (error) {
         console.error('Error fetching articles:', error);
+        if (!initialLoadDone) {
+            initialLoadDone = true;
+            document.getElementById('loading-skeleton').style.display = 'none';
+        }
         showToast('Failed to load articles', 'error');
     }
+}
+
+function articlesChanged(prev, next) {
+    if (prev.length !== next.length) return true;
+    for (let i = 0; i < prev.length; i++) {
+        if (prev[i].id !== next[i].id ||
+            prev[i].status !== next[i].status ||
+            prev[i].video_path !== next[i].video_path ||
+            prev[i].tldr !== next[i].tldr) {
+            return true;
+        }
+    }
+    return false;
 }
 
 async function scrapeUrl(event) {
@@ -38,15 +70,13 @@ async function scrapeUrl(event) {
     if (!url) return;
 
     scrapeBtn.disabled = true;
-    scrapeBtn.textContent = '⏳ Scraping...';
+    scrapeBtn.textContent = 'Scraping...';
     showToast('Fetching article...', 'info');
 
     try {
         const response = await fetch(`${API_BASE}/api/scrape-url`, {
             method: 'POST',
-            headers: {
-                'Content-Type': 'application/json'
-            },
+            headers: { 'Content-Type': 'application/json' },
             body: JSON.stringify({ url })
         });
 
@@ -56,7 +86,6 @@ async function scrapeUrl(event) {
             showToast('Article scraped successfully!', 'success');
             urlInput.value = '';
             await fetchArticles();
-            // Expand the new article
             if (data.article && data.article.id) {
                 expandedArticles.add(data.article.id);
                 renderArticles();
@@ -69,14 +98,16 @@ async function scrapeUrl(event) {
         showToast('Failed to scrape article', 'error');
     } finally {
         scrapeBtn.disabled = false;
-        scrapeBtn.textContent = '🔍 Scrape';
+        scrapeBtn.textContent = 'Scrape';
     }
 }
 
-
 async function summarizeArticle(articleId) {
     const btn = document.querySelector(`[data-summarize="${articleId}"]`);
-    if (btn) btn.disabled = true;
+    if (btn) {
+        btn.disabled = true;
+        btn.textContent = 'Summarizing...';
+    }
 
     showToast('Generating AI summary...', 'info');
 
@@ -88,27 +119,35 @@ async function summarizeArticle(articleId) {
         const data = await response.json();
 
         if (response.ok) {
-            showToast('Summary generated successfully!', 'success');
+            showToast('Summary generated!', 'success');
             await fetchArticles();
-            // Expand the card to show the summary
             expandedArticles.add(articleId);
             renderArticles();
         } else {
             showToast(data.error || 'Failed to summarize', 'error');
+            if (btn) {
+                btn.disabled = false;
+                btn.textContent = 'Summarize';
+            }
         }
     } catch (error) {
         console.error('Error summarizing article:', error);
         showToast('Failed to summarize article', 'error');
-    } finally {
-        if (btn) btn.disabled = false;
+        if (btn) {
+            btn.disabled = false;
+            btn.textContent = 'Summarize';
+        }
     }
 }
 
 async function generateVideo(articleId) {
     const btn = document.querySelector(`[data-video="${articleId}"]`);
-    if (btn) btn.disabled = true;
+    if (btn) {
+        btn.disabled = true;
+        btn.textContent = 'Generating...';
+    }
 
-    showToast('Generating video... This may take a minute.', 'info');
+    showToast('Generating video - this may take a few minutes', 'info');
 
     try {
         const response = await fetch(`${API_BASE}/api/articles/${articleId}/video`, {
@@ -118,23 +157,29 @@ async function generateVideo(articleId) {
         const data = await response.json();
 
         if (response.ok) {
-            showToast('Video generated successfully!', 'success');
+            showToast('Video generated!', 'success');
             await fetchArticles();
             expandedArticles.add(articleId);
             renderArticles();
         } else {
             showToast(data.error || 'Failed to generate video', 'error');
+            if (btn) {
+                btn.disabled = false;
+                btn.textContent = 'Generate Video';
+            }
         }
     } catch (error) {
         console.error('Error generating video:', error);
         showToast('Failed to generate video', 'error');
-    } finally {
-        if (btn) btn.disabled = false;
+        if (btn) {
+            btn.disabled = false;
+            btn.textContent = 'Generate Video';
+        }
     }
 }
 
 async function deleteArticle(articleId) {
-    if (!confirm('Are you sure you want to delete this article?')) return;
+    if (!confirm('Delete this article and its generated content?')) return;
 
     try {
         const response = await fetch(`${API_BASE}/api/articles/${articleId}`, {
@@ -142,6 +187,7 @@ async function deleteArticle(articleId) {
         });
 
         if (response.ok) {
+            expandedArticles.delete(articleId);
             showToast('Article deleted', 'success');
             await fetchArticles();
         } else {
@@ -154,15 +200,60 @@ async function deleteArticle(articleId) {
 }
 
 // ============================================
+// Search / Filter
+// ============================================
+
+function filterArticles() {
+    searchQuery = document.getElementById('search-input').value.trim().toLowerCase();
+    renderArticles();
+}
+
+function getFilteredArticles() {
+    if (!searchQuery) return articles;
+    return articles.filter(a =>
+        a.title.toLowerCase().includes(searchQuery) ||
+        (a.site_name && a.site_name.toLowerCase().includes(searchQuery)) ||
+        (a.tldr && a.tldr.toLowerCase().includes(searchQuery))
+    );
+}
+
+// ============================================
+// Progress Banner
+// ============================================
+
+function updateProgressBanner() {
+    const banner = document.getElementById('progress-banner');
+    const text = document.getElementById('progress-text');
+    const processing = articles.filter(a => ['summarizing', 'generating_video'].includes(a.status));
+
+    if (processing.length > 0) {
+        const names = processing.map(a => {
+            const label = a.status === 'summarizing' ? 'Summarizing' : 'Generating video for';
+            const short = a.title.length > 40 ? a.title.slice(0, 40) + '...' : a.title;
+            return `${label}: ${short}`;
+        });
+        text.textContent = names.join(' | ');
+        banner.classList.remove('hidden');
+    } else {
+        banner.classList.add('hidden');
+    }
+}
+
+// ============================================
 // Render Functions
 // ============================================
 
 function renderArticles() {
     const container = document.getElementById('articles-container');
     const emptyState = document.getElementById('empty-state');
+    const searchBar = document.getElementById('search-bar');
+    const sectionHeader = document.getElementById('section-header');
+    const sectionTitle = document.getElementById('section-title');
 
     if (articles.length === 0) {
         container.classList.add('hidden');
+        searchBar.classList.add('hidden');
+        sectionHeader.classList.add('hidden');
         emptyState.classList.remove('hidden');
         return;
     }
@@ -170,13 +261,29 @@ function renderArticles() {
     emptyState.classList.add('hidden');
     container.classList.remove('hidden');
 
-    // Only animate if content length changed (avoid re-animating on polling updates)
-    const shouldAnimate = container.childElementCount !== articles.length;
+    // Show search bar when 3+ articles
+    if (articles.length >= 3) {
+        searchBar.classList.remove('hidden');
+    } else {
+        searchBar.classList.add('hidden');
+    }
 
-    container.innerHTML = articles.map(article => renderArticleCard(article)).join('');
+    const filtered = getFilteredArticles();
+
+    // Update section header
+    sectionHeader.classList.remove('hidden');
+    if (searchQuery && filtered.length !== articles.length) {
+        sectionTitle.textContent = `${filtered.length} of ${articles.length} articles`;
+    } else {
+        sectionTitle.textContent = `${articles.length} article${articles.length !== 1 ? 's' : ''}`;
+    }
+
+    const shouldAnimate = container.childElementCount !== filtered.length;
+
+    container.innerHTML = filtered.map(article => renderArticleCard(article)).join('');
 
     // Add click handlers for expanding cards
-    document.querySelectorAll('.article-header').forEach(header => {
+    container.querySelectorAll('.article-header').forEach(header => {
         header.addEventListener('click', (e) => {
             if (e.target.closest('button') || e.target.closest('a')) return;
             const card = header.closest('.article-card');
@@ -185,13 +292,13 @@ function renderArticles() {
         });
     });
 
-    // Staggered Entry Animation (only on full render)
+    // Staggered entry animation (only on content change)
     if (shouldAnimate && window.anime) {
         anime({
             targets: '.article-card',
             translateY: [20, 0],
             opacity: [0, 1],
-            delay: anime.stagger(100),
+            delay: anime.stagger(80),
             easing: 'spring(1, 80, 10, 0)'
         });
     }
@@ -215,14 +322,15 @@ function renderArticleCard(article) {
                     <div class="article-meta">
                         <span>${formattedDate}</span>
                         ${article.site_name ? `<span>${escapeHtml(article.site_name)}</span>` : ''}
-                        <a href="${escapeHtml(article.url)}" target="_blank">View Original →</a>
+                        <a href="${escapeHtml(article.url)}" target="_blank" rel="noopener">View Original</a>
                     </div>
                 </div>
                 <div class="article-status">
                     ${statusBadges}
+                    <span class="expand-chevron">${isExpanded ? '&#9650;' : '&#9660;'}</span>
                 </div>
             </div>
-            
+
             <div class="article-content">
                 ${renderSummary(article)}
                 ${renderActions(article)}
@@ -234,26 +342,22 @@ function renderArticleCard(article) {
 function getStatusBadges(article) {
     const badges = [];
 
-    // Always show scraped
-    badges.push('<span class="badge badge-scraped">✓ Scraped</span>');
+    badges.push('<span class="badge badge-scraped">Scraped</span>');
 
-    // Show summarized or processing
     if (article.status === 'summarizing') {
-        badges.push('<span class="badge badge-processing">⏳ Summarizing</span>');
+        badges.push('<span class="badge badge-processing">Summarizing</span>');
     } else if (article.tldr) {
-        badges.push('<span class="badge badge-summarized">✓ Summarized</span>');
+        badges.push('<span class="badge badge-summarized">Summarized</span>');
     }
 
-    // Show video status
     if (article.status === 'generating_video') {
-        badges.push('<span class="badge badge-processing">⏳ Generating Video</span>');
+        badges.push('<span class="badge badge-processing">Generating Video</span>');
     } else if (article.video_path) {
-        badges.push('<span class="badge badge-video">✓ Video</span>');
+        badges.push('<span class="badge badge-video">Video Ready</span>');
     }
 
-    // Show failed
     if (article.status === 'failed') {
-        badges.push('<span class="badge badge-failed">✗ Failed</span>');
+        badges.push('<span class="badge badge-failed">Failed</span>');
     }
 
     return badges.join('');
@@ -264,7 +368,7 @@ function renderSummary(article) {
         return `
             <div class="summary-section">
                 <p class="summary-text" style="color: var(--text-muted);">
-                    Click "Summarize" to generate AI summary, key bullets, and video script.
+                    Click "Summarize" to generate an AI summary, key bullets, and a video script.
                 </p>
             </div>
         `;
@@ -278,36 +382,36 @@ function renderSummary(article) {
             <div class="summary-label">TL;DR</div>
             <p class="summary-text">${escapeHtml(article.tldr)}</p>
         </div>
-        
+
         <div class="summary-section">
             <div class="summary-label">Key Points</div>
             <ul class="summary-bullets">
                 ${bullets.map(b => `<li>${escapeHtml(b)}</li>`).join('')}
             </ul>
         </div>
-        
+
         ${article.video_script ? `
             <div class="summary-section">
                 <div class="summary-label">Video Script</div>
                 <div class="video-script">${escapeHtml(article.video_script)}</div>
             </div>
         ` : ''}
-        
+
         ${article.video_path ? `
             <div class="video-container">
-                <video controls>
-                    <source src="/videos/${article.video_path}" type="video/mp4">
+                <video controls preload="metadata">
+                    <source src="/videos/${encodeURIComponent(article.video_path)}" type="video/mp4">
                     Your browser does not support the video tag.
                 </video>
             </div>
         ` : ''}
-        
+
         ${hashtags.length > 0 ? `
             <div class="summary-section hashtags-section">
                 <div class="summary-label">
                     Hashtags
                     <button class="copy-hashtags-btn" onclick="copyHashtags(event, ${article.id})" title="Copy all hashtags">
-                        📋 Copy All
+                        Copy All
                     </button>
                 </div>
                 <div class="hashtags-container" data-hashtags-id="${article.id}">
@@ -319,35 +423,36 @@ function renderSummary(article) {
 }
 
 function renderActions(article) {
-    const canSummarize = !article.tldr && article.status !== 'summarizing';
-    const canGenerateVideo = article.video_script && !article.video_path && article.status !== 'generating_video';
+    const canSummarize = article.status !== 'summarizing';
+    const canGenerateVideo = article.video_script && article.status !== 'generating_video';
     const isProcessing = ['summarizing', 'generating_video'].includes(article.status);
 
     return `
         <div class="article-actions">
-            <button 
-                class="btn btn-primary" 
+            <button
+                class="btn btn-primary"
                 data-summarize="${article.id}"
                 onclick="summarizeArticle(${article.id})"
                 ${!canSummarize || isProcessing ? 'disabled' : ''}
             >
-                ${article.tldr ? '🔄 Re-Summarize' : '✨ Summarize'}
+                ${article.tldr ? 'Re-Summarize' : 'Summarize'}
             </button>
-            
-            <button 
-                class="btn btn-success" 
+
+            <button
+                class="btn btn-success"
                 data-video="${article.id}"
                 onclick="generateVideo(${article.id})"
-                ${!canGenerateVideo && !article.video_path || isProcessing ? 'disabled' : ''}
+                ${!canGenerateVideo || isProcessing ? 'disabled' : ''}
             >
-                ${article.video_path ? '🔄 Regenerate Video' : '🎬 Generate Video'}
+                ${article.video_path ? 'Regenerate Video' : 'Generate Video'}
             </button>
-            
-            <button 
-                class="btn btn-danger" 
+
+            <button
+                class="btn btn-danger"
                 onclick="deleteArticle(${article.id})"
+                ${isProcessing ? 'disabled' : ''}
             >
-                🗑️ Delete
+                Delete
             </button>
         </div>
     `;
@@ -359,7 +464,6 @@ function toggleExpand(articleId, cardElement) {
         if (cardElement) {
             const content = cardElement.querySelector('.article-content');
             if (content && window.anime) {
-                // Smooth collapse
                 anime({
                     targets: content,
                     height: 0,
@@ -377,9 +481,7 @@ function toggleExpand(articleId, cardElement) {
 
     renderArticles();
 
-    // Animate expansion if opening
     if (expandedArticles.has(articleId) && window.anime) {
-        // Find the newly rendered card
         const newCard = document.querySelector(`.article-card[data-article-id="${articleId}"] .article-content`);
         if (newCard) {
             anime({
@@ -394,9 +496,9 @@ function toggleExpand(articleId, cardElement) {
 }
 
 function updateStats() {
-    document.getElementById('total-count').textContent = `${articles.length} articles`;
+    document.getElementById('total-count').textContent = `${articles.length} article${articles.length !== 1 ? 's' : ''}`;
     const videoCount = articles.filter(a => a.video_path).length;
-    document.getElementById('video-count').textContent = `${videoCount} videos`;
+    document.getElementById('video-count').textContent = `${videoCount} video${videoCount !== 1 ? 's' : ''}`;
 }
 
 // ============================================
@@ -407,9 +509,9 @@ function showToast(message, type = 'info') {
     const container = document.getElementById('toast-container');
 
     const icons = {
-        success: '✅',
-        error: '❌',
-        info: 'ℹ️'
+        success: '\u2705',
+        error: '\u274C',
+        info: '\u2139\uFE0F'
     };
 
     const toast = document.createElement('div');
@@ -421,7 +523,6 @@ function showToast(message, type = 'info') {
 
     container.appendChild(toast);
 
-    // Auto-remove after 4 seconds
     setTimeout(() => {
         toast.style.animation = 'slideIn 0.3s ease reverse';
         setTimeout(() => toast.remove(), 300);
@@ -443,11 +544,10 @@ function copyHashtags(event, articleId) {
     navigator.clipboard.writeText(hashtagsText).then(() => {
         showToast('Hashtags copied to clipboard!', 'success');
 
-        // Visual feedback on button
         const btn = event.target.closest('.copy-hashtags-btn');
         if (btn) {
             const originalText = btn.textContent;
-            btn.textContent = '✓ Copied!';
+            btn.textContent = 'Copied!';
             setTimeout(() => {
                 btn.textContent = originalText;
             }, 2000);
@@ -469,21 +569,18 @@ function escapeHtml(text) {
 // Initialize
 // ============================================
 
-// Handle bookmarklet fallback - check for #scrape=... hash
 async function handleBookmarkletHash() {
     const hash = window.location.hash;
     if (hash.startsWith('#scrape=')) {
         try {
-            const encodedData = hash.substring(8); // Remove '#scrape='
+            const encodedData = hash.substring(8);
             const data = JSON.parse(decodeURIComponent(encodedData));
 
             showToast('Receiving article from bookmarklet...', 'info');
 
             const response = await fetch(`${API_BASE}/api/scrape`, {
                 method: 'POST',
-                headers: {
-                    'Content-Type': 'application/json'
-                },
+                headers: { 'Content-Type': 'application/json' },
                 body: JSON.stringify(data)
             });
 
@@ -491,7 +588,6 @@ async function handleBookmarkletHash() {
 
             if (response.ok) {
                 showToast('Article scraped successfully!', 'success');
-                // Clear the hash
                 history.replaceState(null, '', window.location.pathname);
                 await fetchArticles();
                 if (result.article && result.article.id) {
@@ -505,23 +601,23 @@ async function handleBookmarkletHash() {
             console.error('Error processing bookmarklet data:', error);
             showToast('Failed to process bookmarklet data', 'error');
         }
-        // Clear the hash even on error
         history.replaceState(null, '', window.location.pathname);
     }
 }
 
 document.addEventListener('DOMContentLoaded', () => {
-    // Check for bookmarklet hash data first
-    handleBookmarkletHash();
+    // Hide empty state initially (show skeleton instead)
+    document.getElementById('empty-state').classList.add('hidden');
 
+    handleBookmarkletHash();
     fetchArticles();
 
-    // Auto-refresh every 5 seconds (for status updates)
+    // Poll for status updates when articles are processing
     setInterval(() => {
-        const processingArticles = articles.some(a =>
+        const hasProcessing = articles.some(a =>
             ['summarizing', 'generating_video'].includes(a.status)
         );
-        if (processingArticles) {
+        if (hasProcessing) {
             fetchArticles();
         }
     }, 5000);
