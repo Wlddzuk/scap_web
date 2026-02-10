@@ -210,6 +210,11 @@ def validate_api_keys():
     else:
         logger.info("FAL_KEY not set - will use gradient backgrounds for videos")
 
+    if os.getenv('SOGNI_USERNAME') and os.getenv('SOGNI_PASSWORD'):
+        logger.info("Sogni AI video hook generation enabled")
+    else:
+        logger.info("SOGNI credentials not set - will use static image hooks for videos")
+
 
 validate_api_keys()
 

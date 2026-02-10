@@ -1,17 +1,23 @@
 """
-TikTok-Style Video Generator - Visuals only + voiceover, no on-screen text.
+TikTok-Style Video Generator - Sogni AI video hook + parallel image generation.
 """
 
 import os
 import re
 import time
 import json
+import subprocess
+import random
 from datetime import datetime
 from pathlib import Path
 from io import BytesIO
+from concurrent.futures import ThreadPoolExecutor, as_completed
 
 import numpy as np
-from moviepy.editor import ImageClip, AudioFileClip, concatenate_videoclips, vfx
+from moviepy.editor import (
+    ImageClip, AudioFileClip, VideoFileClip,
+    concatenate_videoclips, vfx
+)
 from PIL import Image, ImageDraw
 import requests
 from dotenv import load_dotenv
@@ -25,7 +31,12 @@ FPS = 30
 
 # Hook settings
 HOOK_DURATION = 5.0
-NUM_HOOK_IMAGES = 4
+
+# Body image count (reduced from 20 for speed)
+NUM_BODY_IMAGES = 14
+
+# Parallel image generation workers
+MAX_IMAGE_WORKERS = 6
 
 # Timing constraints
 MIN_CHUNK_DURATION = 1.2
@@ -71,14 +82,14 @@ def generate_image_fal(prompt: str, retry_count: int = RETRY_ATTEMPTS) -> Image.
                 response = requests.get(image_url, timeout=30)
                 img = Image.open(BytesIO(response.content)).convert("RGB")
                 img = resize_and_crop_image(img, VIDEO_WIDTH, VIDEO_HEIGHT)
-                print("[Image] ✅ Generated")
+                print("[Image] Generated")
                 return img
 
         except Exception as e:
-            print(f"[Image] ⚠️ Attempt {attempt + 1} failed: {e}")
+            print(f"[Image] Attempt {attempt + 1} failed: {e}")
             time.sleep(2)
 
-    print("[Image] ❌ Failed, using gradient")
+    print("[Image] Failed, using gradient")
     return create_gradient_background()
 
 
@@ -111,8 +122,6 @@ def resize_and_crop_image(img: Image.Image, target_width: int, target_height: in
     return img.resize((target_width, target_height), Image.LANCZOS)
 
 
-import random
-
 # High-quality Kokoro voices (Grade B- or better)
 KOKORO_VOICES = [
     "af_heart",   # Grade A - warm female
@@ -125,20 +134,10 @@ KOKORO_VOICES = [
 
 
 def generate_tts_kokoro(text: str, output_path: str, voice: str = None) -> str:
-    """Generate TTS using Kokoro-82M only (no fallback).
-
-    Args:
-        text: Text to convert to speech
-        output_path: Path for output audio file
-        voice: Specific voice to use, or None for random selection
-
-    Raises:
-        Exception: If Kokoro TTS fails (no fallback to Google TTS)
-    """
+    """Generate TTS using Kokoro-82M only (no fallback)."""
     from kokoro import KPipeline
     import soundfile as sf
 
-    # Pick a random voice if none specified
     selected_voice = voice or random.choice(KOKORO_VOICES)
     print(f"[TTS] Using Kokoro-82M with voice: {selected_voice}")
     pipeline = KPipeline(lang_code="a", repo_id="hexgrad/Kokoro-82M")
@@ -151,7 +150,7 @@ def generate_tts_kokoro(text: str, output_path: str, voice: str = None) -> str:
     audio_array = np.array(all_audio, dtype=np.float32)
     wav_path = output_path.replace(".mp3", ".wav")
     sf.write(wav_path, audio_array, 24000)
-    print(f"[TTS] ✅ Saved: {wav_path} (voice: {selected_voice})")
+    print(f"[TTS] Saved: {wav_path} (voice: {selected_voice})")
     return wav_path
 
 
@@ -193,7 +192,7 @@ def select_style_with_groq(title: str, script: str) -> str:
         return "3D render, CGI, Pixar-style, bright colors, clean, professional, vibrant"
 
     try:
-        print("[Style] 🎨 Selecting style...")
+        print("[Style] Selecting style...")
         response = client.chat.completions.create(
             model="llama-3.3-70b-versatile",
             messages=[
@@ -206,10 +205,10 @@ def select_style_with_groq(title: str, script: str) -> str:
         style = response.choices[0].message.content.strip().strip('"\'')
         if "bright" not in style.lower() and "vibrant" not in style.lower():
             style += ", bright, vibrant, eye-catching"
-        print(f"[Style] ✅ {style[:50]}...")
+        print(f"[Style] {style[:50]}...")
         return style
     except Exception as e:
-        print(f"[Style] ⚠️ Failed: {e}")
+        print(f"[Style] Failed: {e}")
         return "3D render, CGI, Pixar-style, bright colors, clean, professional, vibrant"
 
 
@@ -222,7 +221,7 @@ def extract_story_subjects(title: str, script: str) -> dict:
         return default
 
     try:
-        print("[Subjects] 🔍 Extracting subjects...")
+        print("[Subjects] Extracting subjects...")
         response = client.chat.completions.create(
             model="llama-3.3-70b-versatile",
             messages=[
@@ -237,10 +236,10 @@ def extract_story_subjects(title: str, script: str) -> dict:
             text = re.search(r"```(?:json)?\s*([\s\S]*?)\s*```", text)
             text = text.group(1) if text else "{}"
         subjects = json.loads(text)
-        print(f"[Subjects] ✅ {subjects.get('main_subject', 'unknown')}")
+        print(f"[Subjects] {subjects.get('main_subject', 'unknown')}")
         return subjects
     except Exception as e:
-        print(f"[Subjects] ⚠️ Failed: {e}")
+        print(f"[Subjects] Failed: {e}")
         return default
 
 
@@ -256,7 +255,7 @@ def generate_image_prompts(title: str, script: str, num_prompts: int, style: str
     keywords_str = ", ".join(visual_keywords) if visual_keywords else title
 
     try:
-        print("[Prompts] 🧠 Generating prompts...")
+        print("[Prompts] Generating prompts...")
         response = client.chat.completions.create(
             model="llama-3.3-70b-versatile",
             messages=[
@@ -271,17 +270,17 @@ def generate_image_prompts(title: str, script: str, num_prompts: int, style: str
         if match:
             prompts = json.loads(match.group(0))
             if isinstance(prompts, list) and len(prompts) >= num_prompts:
-                print(f"[Prompts] ✅ Generated {len(prompts)} prompts")
+                print(f"[Prompts] Generated {len(prompts)} prompts")
                 return prompts[:num_prompts]
         return None
     except Exception as e:
-        print(f"[Prompts] ⚠️ Failed: {e}")
+        print(f"[Prompts] Failed: {e}")
         return None
 
 
-def generate_themed_images(title: str, script: str, num_images: int = 20) -> list:
-    """Generate themed images for video body."""
-    print(f"[Video] Generating {num_images} images...")
+def generate_themed_images(title: str, script: str, num_images: int = NUM_BODY_IMAGES) -> list:
+    """Generate themed images for video body using parallel workers."""
+    print(f"[Video] Generating {num_images} images in parallel (max {MAX_IMAGE_WORKERS} workers)...")
 
     subjects = extract_story_subjects(title, script)
     style = select_style_with_groq(title, script)
@@ -293,13 +292,171 @@ def generate_themed_images(title: str, script: str, num_images: int = 20) -> lis
         setting = subjects.get("setting", "")
         prompts = [f"{kw}, {setting}, {style}" for kw in (keywords * 5)[:num_images]]
 
-    images = []
-    for i, prompt in enumerate(prompts):
-        print(f"[Video] Image {i+1}/{num_images}")
-        images.append(generate_image_fal(prompt))
+    # Parallel image generation
+    images = [None] * len(prompts)
+    with ThreadPoolExecutor(max_workers=MAX_IMAGE_WORKERS) as executor:
+        future_to_idx = {
+            executor.submit(generate_image_fal, prompt): i
+            for i, prompt in enumerate(prompts)
+        }
+        for future in as_completed(future_to_idx):
+            idx = future_to_idx[future]
+            try:
+                images[idx] = future.result()
+            except Exception as e:
+                print(f"[Video] Image {idx+1} failed: {e}")
+                images[idx] = create_gradient_background()
 
-    print(f"[Video] ✅ Generated {len(images)} images")
+    print(f"[Video] Generated {len(images)} images")
     return images
+
+
+# ============================================================
+# Sogni AI Video Hook Generation
+# ============================================================
+
+def generate_sogni_hook(title: str, output_path: str) -> str:
+    """Generate a short video hook using Sogni AI (Node.js subprocess).
+
+    Returns the path to the downloaded MP4, or None if Sogni is unavailable.
+    """
+    username = os.getenv("SOGNI_USERNAME")
+    password = os.getenv("SOGNI_PASSWORD")
+    if not username or not password:
+        print("[Sogni] No credentials set, skipping video hook")
+        return None
+
+    # Build a drawing-style hook prompt from the article title
+    hook_prompt = (
+        f"animated drawing style, colorful sketch art, hand-drawn illustration coming to life, "
+        f"{title}, dynamic motion, vivid colors, artistic brushstrokes, "
+        f"whimsical animation, eye-catching, TikTok viral hook"
+    )
+
+    script_path = Path(__file__).parent / "sogni_generate.js"
+    if not script_path.exists():
+        print("[Sogni] sogni_generate.js not found, skipping video hook")
+        return None
+
+    # Check node_modules
+    node_modules = Path(__file__).parent / "node_modules" / "@sogni-ai"
+    if not node_modules.exists():
+        print("[Sogni] node_modules not installed, run 'npm install'. Skipping video hook")
+        return None
+
+    try:
+        print(f"[Sogni] Generating video hook (this may take 1-3 minutes)...")
+        result = subprocess.run(
+            [
+                "node", str(script_path),
+                hook_prompt,
+                output_path,
+                "480",   # width
+                "480",   # height
+                "81",    # frames (~5s at 16fps)
+                "16",    # fps
+            ],
+            capture_output=True,
+            text=True,
+            timeout=360,
+            cwd=str(Path(__file__).parent),
+        )
+
+        if result.returncode != 0:
+            print(f"[Sogni] Generation failed (exit {result.returncode})")
+            if result.stderr:
+                for line in result.stderr.strip().split('\n')[-5:]:
+                    print(f"  {line}")
+            return None
+
+        # Parse JSON from stdout
+        try:
+            data = json.loads(result.stdout.strip())
+            saved_path = data.get("output_path", output_path)
+            if Path(saved_path).exists():
+                print(f"[Sogni] Video hook saved: {saved_path}")
+                return saved_path
+        except json.JSONDecodeError:
+            pass
+
+        # Fallback: check if file was written anyway
+        if Path(output_path).exists():
+            print(f"[Sogni] Video hook saved: {output_path}")
+            return output_path
+
+        print("[Sogni] No output file produced")
+        return None
+
+    except subprocess.TimeoutExpired:
+        print("[Sogni] Timed out after 6 minutes")
+        return None
+    except Exception as e:
+        print(f"[Sogni] Error: {e}")
+        return None
+
+
+def create_sogni_hook_clip(hook_video_path: str, target_duration: float) -> VideoFileClip:
+    """Import a Sogni-generated video as a MoviePy clip, scaled to 1080x1920."""
+    clip = VideoFileClip(hook_video_path)
+
+    # Trim or loop to target duration
+    if clip.duration > target_duration:
+        clip = clip.subclip(0, target_duration)
+    elif clip.duration < target_duration:
+        # Speed-ramp to fill duration
+        speed_factor = clip.duration / target_duration
+        clip = clip.fx(vfx.speedx, speed_factor)
+
+    # Scale to 1080x1920 (letterbox/pillarbox)
+    clip = clip.resize(height=VIDEO_HEIGHT)
+    if clip.w < VIDEO_WIDTH:
+        clip = clip.on_color(
+            size=(VIDEO_WIDTH, VIDEO_HEIGHT),
+            color=(0, 0, 0),
+            pos='center'
+        )
+    elif clip.w > VIDEO_WIDTH:
+        # Center-crop width
+        x_offset = (clip.w - VIDEO_WIDTH) // 2
+        clip = clip.crop(x1=x_offset, x2=x_offset + VIDEO_WIDTH)
+
+    return clip
+
+
+# ============================================================
+# Fallback: Static Image Hook (when Sogni unavailable)
+# ============================================================
+
+def create_hook_clips(title: str, duration: float = HOOK_DURATION) -> list:
+    """Create rapid-fire hook sequence using static images (fallback)."""
+    hook_prompts = [
+        f"extreme macro close-up shot, {title}, ultra sharp detail, dramatic rim lighting, shallow depth of field, cinematic 9:16, hyper-realistic",
+        f"impossible camera angle, {title}, bird's eye view mixed with dutch angle, dramatic shadows, high contrast neon accents, surreal perspective",
+        f"frozen action moment, {title}, motion blur trails, dynamic energy, explosive composition, vibrant saturated colors, dramatic backlighting",
+        f"bold graphic composition, {title}, stark contrast, complementary color explosion, minimalist but striking, professional advertising quality"
+    ]
+
+    num_hook_images = 4
+    clip_duration = duration / num_hook_images
+    print(f"[Hook] Creating {num_hook_images} fallback hook images...")
+
+    # Generate hook images in parallel too
+    images = [None] * num_hook_images
+    with ThreadPoolExecutor(max_workers=4) as executor:
+        future_to_idx = {
+            executor.submit(generate_image_fal, prompt): i
+            for i, prompt in enumerate(hook_prompts[:num_hook_images])
+        }
+        for future in as_completed(future_to_idx):
+            idx = future_to_idx[future]
+            try:
+                images[idx] = future.result()
+            except Exception:
+                images[idx] = create_gradient_background()
+
+    clips = [create_clip(img, clip_duration, zoom_factor=0.05) for img in images]
+    print(f"[Hook] Created {len(clips)} clips ({clip_duration:.2f}s each)")
+    return clips
 
 
 def create_clip(image: Image.Image, duration: float, zoom_factor: float = 0.03) -> ImageClip:
@@ -309,28 +466,6 @@ def create_clip(image: Image.Image, duration: float, zoom_factor: float = 0.03) 
     if duration > 0:
         clip = clip.fx(vfx.resize, lambda t: 1.0 + zoom_factor * (t / duration))
     return clip
-
-
-def create_hook_clips(title: str, duration: float = HOOK_DURATION) -> list:
-    """Create rapid-fire hook sequence for first 5 seconds."""
-    hook_prompts = [
-        f"extreme macro close-up shot, {title}, ultra sharp detail, dramatic rim lighting, shallow depth of field, cinematic 9:16, hyper-realistic",
-        f"impossible camera angle, {title}, bird's eye view mixed with dutch angle, dramatic shadows, high contrast neon accents, surreal perspective",
-        f"frozen action moment, {title}, motion blur trails, dynamic energy, explosive composition, vibrant saturated colors, dramatic backlighting",
-        f"bold graphic composition, {title}, stark contrast, complementary color explosion, minimalist but striking, professional advertising quality"
-    ]
-
-    clip_duration = duration / NUM_HOOK_IMAGES
-    print(f"[Hook] 🎯 Creating {NUM_HOOK_IMAGES} hook images...")
-
-    clips = []
-    for i, prompt in enumerate(hook_prompts[:NUM_HOOK_IMAGES]):
-        print(f"[Hook] {i+1}/{NUM_HOOK_IMAGES}")
-        img = generate_image_fal(prompt)
-        clips.append(create_clip(img, clip_duration, zoom_factor=0.05))
-
-    print(f"[Hook] ✅ Created {len(clips)} clips ({clip_duration:.2f}s each)")
-    return clips
 
 
 def compute_durations(chunks: list, total_time: float) -> list:
@@ -350,23 +485,29 @@ def compute_durations(chunks: list, total_time: float) -> list:
     return [max(0.05, d) for d in durations]
 
 
+# ============================================================
+# Main Pipeline
+# ============================================================
+
 def generate_video(article_id: int, title: str, script: str) -> str:
-    """Generate TikTok-style video with visuals and voiceover."""
+    """Generate TikTok-style video with Sogni video hook + parallel images."""
     videos_dir = Path("static/videos")
     videos_dir.mkdir(parents=True, exist_ok=True)
 
     timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
     output_path = videos_dir / f"article_{article_id}_{timestamp}.mp4"
     temp_audio_path = videos_dir / f"temp_audio_{article_id}.mp3"
+    sogni_hook_path = str(videos_dir / f"sogni_hook_{article_id}_{timestamp}.mp4")
 
     audio = None
     main_video = None
+    hook_clip = None
     clips = []
     actual_audio_path = None
 
     try:
         print(f"\n{'='*50}")
-        print(f"[Video] 🎬 Generating video for article {article_id}")
+        print(f"[Video] Generating video for article {article_id}")
         print(f"{'='*50}")
 
         # Step 1: TTS
@@ -376,9 +517,29 @@ def generate_video(article_id: int, title: str, script: str) -> str:
         audio_duration = float(audio.duration)
         print(f"[Video] Audio: {audio_duration:.1f}s")
 
-        # Step 2: Generate images
-        print("[Video] Step 2: Generating images...")
-        themed_images = generate_themed_images(title, script, num_images=20)
+        hook_len = min(HOOK_DURATION, max(2.0, audio_duration * 0.25))
+
+        # Step 2: Launch Sogni hook + body images concurrently
+        print("[Video] Step 2: Generating Sogni hook + body images concurrently...")
+        sogni_result = [None]
+
+        def _run_sogni():
+            sogni_result[0] = generate_sogni_hook(title, sogni_hook_path)
+
+        sogni_thread = None
+        if os.getenv("SOGNI_USERNAME") and os.getenv("SOGNI_PASSWORD"):
+            from threading import Thread
+            sogni_thread = Thread(target=_run_sogni, daemon=True)
+            sogni_thread.start()
+        else:
+            print("[Video] Sogni not configured, will use image hook fallback")
+
+        # Generate body images in parallel (runs while Sogni generates)
+        themed_images = generate_themed_images(title, script, num_images=NUM_BODY_IMAGES)
+
+        # Wait for Sogni to finish
+        if sogni_thread:
+            sogni_thread.join(timeout=360)
 
         # Step 3: Chunk for pacing
         print("[Video] Step 3: Chunking script...")
@@ -387,9 +548,16 @@ def generate_video(article_id: int, title: str, script: str) -> str:
 
         # Step 4: Hook clips
         print("[Video] Step 4: Creating hook sequence...")
-        hook_len = min(HOOK_DURATION, max(2.0, audio_duration * 0.25))
-        hook_clips = create_hook_clips(title, duration=hook_len)
-        clips.extend(hook_clips)
+        sogni_video = sogni_result[0]
+
+        if sogni_video and Path(sogni_video).exists():
+            print(f"[Video] Using Sogni AI video hook ({hook_len:.1f}s)")
+            hook_clip = create_sogni_hook_clip(sogni_video, hook_len)
+            clips.append(hook_clip)
+        else:
+            print("[Video] Sogni unavailable, using image hook fallback")
+            hook_clips = create_hook_clips(title, duration=hook_len)
+            clips.extend(hook_clips)
         print(f"[Video] Hook: {hook_len:.1f}s")
 
         # Step 5: Body clips
@@ -416,32 +584,32 @@ def generate_video(article_id: int, title: str, script: str) -> str:
         main_video = main_video.set_audio(audio)
         print(f"[Video] Final: {main_video.duration:.1f}s")
 
-        # Step 7: Render
-        print("[Video] Step 7: Rendering...")
+        # Step 7: Render with ultrafast preset
+        print("[Video] Step 7: Rendering (ultrafast)...")
         main_video.write_videofile(
             str(output_path),
             fps=FPS,
             codec="libx264",
             audio_codec="aac",
             threads=4,
-            preset="medium",
+            preset="ultrafast",
             verbose=False,
             logger=None
         )
 
         print(f"\n{'='*50}")
-        print(f"[Video] ✅ SUCCESS: {output_path}")
+        print(f"[Video] SUCCESS: {output_path}")
         print(f"{'='*50}\n")
         return str(output_path)
 
     except Exception as e:
-        print(f"[Video] ❌ Error: {e}")
+        print(f"[Video] Error: {e}")
         import traceback
         traceback.print_exc()
         raise
 
     finally:
-        for resource in [audio, main_video]:
+        for resource in [audio, main_video, hook_clip]:
             try:
                 if resource:
                     resource.close()
@@ -455,6 +623,10 @@ def generate_video(article_id: int, title: str, script: str) -> str:
         try:
             if actual_audio_path:
                 Path(actual_audio_path).unlink(missing_ok=True)
+        except OSError:
+            pass
+        try:
+            Path(sogni_hook_path).unlink(missing_ok=True)
         except OSError:
             pass
 

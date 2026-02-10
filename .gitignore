@@ -48,6 +48,10 @@ htmlcov/
 # Logs
 *.log
 
+# Node.js (Sogni bridge)
+node_modules/
+package-lock.json
+
 # Deployment
 *.pem
 *.key
