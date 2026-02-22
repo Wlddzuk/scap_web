@@ -1,12 +1,11 @@
 """
-TikTok-Style Video Generator - Sogni AI video hook + parallel image generation.
+TikTok-Style Video Generator - Parallel image generation + fast rendering.
 """
 
 import os
 import re
 import time
 import json
-import subprocess
 import random
 from datetime import datetime
 from pathlib import Path
@@ -14,10 +13,7 @@ from io import BytesIO
 from concurrent.futures import ThreadPoolExecutor, as_completed
 
 import numpy as np
-from moviepy.editor import (
-    ImageClip, AudioFileClip, VideoFileClip,
-    concatenate_videoclips, vfx
-)
+from moviepy.editor import ImageClip, AudioFileClip, concatenate_videoclips, vfx
 from PIL import Image, ImageDraw
 import requests
 from dotenv import load_dotenv
@@ -31,6 +27,7 @@ FPS = 30
 
 # Hook settings
 HOOK_DURATION = 5.0
+NUM_HOOK_IMAGES = 4
 
 # Body image count (reduced from 20 for speed)
 NUM_BODY_IMAGES = 14
@@ -311,124 +308,8 @@ def generate_themed_images(title: str, script: str, num_images: int = NUM_BODY_I
     return images
 
 
-# ============================================================
-# Sogni AI Video Hook Generation
-# ============================================================
-
-def generate_sogni_hook(title: str, output_path: str) -> str:
-    """Generate a short video hook using Sogni AI (Node.js subprocess).
-
-    Returns the path to the downloaded MP4, or None if Sogni is unavailable.
-    """
-    username = os.getenv("SOGNI_USERNAME")
-    password = os.getenv("SOGNI_PASSWORD")
-    if not username or not password:
-        print("[Sogni] No credentials set, skipping video hook")
-        return None
-
-    # Build a drawing-style hook prompt from the article title
-    hook_prompt = (
-        f"animated drawing style, colorful sketch art, hand-drawn illustration coming to life, "
-        f"{title}, dynamic motion, vivid colors, artistic brushstrokes, "
-        f"whimsical animation, eye-catching, TikTok viral hook"
-    )
-
-    script_path = Path(__file__).parent / "sogni_generate.js"
-    if not script_path.exists():
-        print("[Sogni] sogni_generate.js not found, skipping video hook")
-        return None
-
-    # Check node_modules
-    node_modules = Path(__file__).parent / "node_modules" / "@sogni-ai"
-    if not node_modules.exists():
-        print("[Sogni] node_modules not installed, run 'npm install'. Skipping video hook")
-        return None
-
-    try:
-        print(f"[Sogni] Generating video hook (this may take 1-3 minutes)...")
-        result = subprocess.run(
-            [
-                "node", str(script_path),
-                hook_prompt,
-                output_path,
-                "480",   # width
-                "480",   # height
-                "81",    # frames (~5s at 16fps)
-                "16",    # fps
-            ],
-            capture_output=True,
-            text=True,
-            timeout=360,
-            cwd=str(Path(__file__).parent),
-        )
-
-        if result.returncode != 0:
-            print(f"[Sogni] Generation failed (exit {result.returncode})")
-            if result.stderr:
-                for line in result.stderr.strip().split('\n')[-5:]:
-                    print(f"  {line}")
-            return None
-
-        # Parse JSON from stdout
-        try:
-            data = json.loads(result.stdout.strip())
-            saved_path = data.get("output_path", output_path)
-            if Path(saved_path).exists():
-                print(f"[Sogni] Video hook saved: {saved_path}")
-                return saved_path
-        except json.JSONDecodeError:
-            pass
-
-        # Fallback: check if file was written anyway
-        if Path(output_path).exists():
-            print(f"[Sogni] Video hook saved: {output_path}")
-            return output_path
-
-        print("[Sogni] No output file produced")
-        return None
-
-    except subprocess.TimeoutExpired:
-        print("[Sogni] Timed out after 6 minutes")
-        return None
-    except Exception as e:
-        print(f"[Sogni] Error: {e}")
-        return None
-
-
-def create_sogni_hook_clip(hook_video_path: str, target_duration: float) -> VideoFileClip:
-    """Import a Sogni-generated video as a MoviePy clip, scaled to 1080x1920."""
-    clip = VideoFileClip(hook_video_path)
-
-    # Trim or loop to target duration
-    if clip.duration > target_duration:
-        clip = clip.subclip(0, target_duration)
-    elif clip.duration < target_duration:
-        # Speed-ramp to fill duration
-        speed_factor = clip.duration / target_duration
-        clip = clip.fx(vfx.speedx, speed_factor)
-
-    # Scale to 1080x1920 (letterbox/pillarbox)
-    clip = clip.resize(height=VIDEO_HEIGHT)
-    if clip.w < VIDEO_WIDTH:
-        clip = clip.on_color(
-            size=(VIDEO_WIDTH, VIDEO_HEIGHT),
-            color=(0, 0, 0),
-            pos='center'
-        )
-    elif clip.w > VIDEO_WIDTH:
-        # Center-crop width
-        x_offset = (clip.w - VIDEO_WIDTH) // 2
-        clip = clip.crop(x1=x_offset, x2=x_offset + VIDEO_WIDTH)
-
-    return clip
-
-
-# ============================================================
-# Fallback: Static Image Hook (when Sogni unavailable)
-# ============================================================
-
 def create_hook_clips(title: str, duration: float = HOOK_DURATION) -> list:
-    """Create rapid-fire hook sequence using static images (fallback)."""
+    """Create rapid-fire hook sequence using parallel image generation."""
     hook_prompts = [
         f"extreme macro close-up shot, {title}, ultra sharp detail, dramatic rim lighting, shallow depth of field, cinematic 9:16, hyper-realistic",
         f"impossible camera angle, {title}, bird's eye view mixed with dutch angle, dramatic shadows, high contrast neon accents, surreal perspective",
@@ -436,16 +317,15 @@ def create_hook_clips(title: str, duration: float = HOOK_DURATION) -> list:
         f"bold graphic composition, {title}, stark contrast, complementary color explosion, minimalist but striking, professional advertising quality"
     ]
 
-    num_hook_images = 4
-    clip_duration = duration / num_hook_images
-    print(f"[Hook] Creating {num_hook_images} fallback hook images...")
+    clip_duration = duration / NUM_HOOK_IMAGES
+    print(f"[Hook] Creating {NUM_HOOK_IMAGES} hook images in parallel...")
 
-    # Generate hook images in parallel too
-    images = [None] * num_hook_images
-    with ThreadPoolExecutor(max_workers=4) as executor:
+    # Generate hook images in parallel
+    images = [None] * NUM_HOOK_IMAGES
+    with ThreadPoolExecutor(max_workers=NUM_HOOK_IMAGES) as executor:
         future_to_idx = {
             executor.submit(generate_image_fal, prompt): i
-            for i, prompt in enumerate(hook_prompts[:num_hook_images])
+            for i, prompt in enumerate(hook_prompts[:NUM_HOOK_IMAGES])
         }
         for future in as_completed(future_to_idx):
             idx = future_to_idx[future]
@@ -485,23 +365,17 @@ def compute_durations(chunks: list, total_time: float) -> list:
     return [max(0.05, d) for d in durations]
 
 
-# ============================================================
-# Main Pipeline
-# ============================================================
-
 def generate_video(article_id: int, title: str, script: str) -> str:
-    """Generate TikTok-style video with Sogni video hook + parallel images."""
+    """Generate TikTok-style video with parallel image generation."""
     videos_dir = Path("static/videos")
     videos_dir.mkdir(parents=True, exist_ok=True)
 
     timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
     output_path = videos_dir / f"article_{article_id}_{timestamp}.mp4"
     temp_audio_path = videos_dir / f"temp_audio_{article_id}.mp3"
-    sogni_hook_path = str(videos_dir / f"sogni_hook_{article_id}_{timestamp}.mp4")
 
     audio = None
     main_video = None
-    hook_clip = None
     clips = []
     actual_audio_path = None
 
@@ -517,47 +391,20 @@ def generate_video(article_id: int, title: str, script: str) -> str:
         audio_duration = float(audio.duration)
         print(f"[Video] Audio: {audio_duration:.1f}s")
 
-        hook_len = min(HOOK_DURATION, max(2.0, audio_duration * 0.25))
-
-        # Step 2: Launch Sogni hook + body images concurrently
-        print("[Video] Step 2: Generating Sogni hook + body images concurrently...")
-        sogni_result = [None]
-
-        def _run_sogni():
-            sogni_result[0] = generate_sogni_hook(title, sogni_hook_path)
-
-        sogni_thread = None
-        if os.getenv("SOGNI_USERNAME") and os.getenv("SOGNI_PASSWORD"):
-            from threading import Thread
-            sogni_thread = Thread(target=_run_sogni, daemon=True)
-            sogni_thread.start()
-        else:
-            print("[Video] Sogni not configured, will use image hook fallback")
-
-        # Generate body images in parallel (runs while Sogni generates)
+        # Step 2: Generate images (parallel)
+        print("[Video] Step 2: Generating images...")
         themed_images = generate_themed_images(title, script, num_images=NUM_BODY_IMAGES)
-
-        # Wait for Sogni to finish
-        if sogni_thread:
-            sogni_thread.join(timeout=360)
 
         # Step 3: Chunk for pacing
         print("[Video] Step 3: Chunking script...")
         chunks = chunk_text(script)
         print(f"[Video] {len(chunks)} chunks")
 
-        # Step 4: Hook clips
+        # Step 4: Hook clips (parallel)
         print("[Video] Step 4: Creating hook sequence...")
-        sogni_video = sogni_result[0]
-
-        if sogni_video and Path(sogni_video).exists():
-            print(f"[Video] Using Sogni AI video hook ({hook_len:.1f}s)")
-            hook_clip = create_sogni_hook_clip(sogni_video, hook_len)
-            clips.append(hook_clip)
-        else:
-            print("[Video] Sogni unavailable, using image hook fallback")
-            hook_clips = create_hook_clips(title, duration=hook_len)
-            clips.extend(hook_clips)
+        hook_len = min(HOOK_DURATION, max(2.0, audio_duration * 0.25))
+        hook_clips = create_hook_clips(title, duration=hook_len)
+        clips.extend(hook_clips)
         print(f"[Video] Hook: {hook_len:.1f}s")
 
         # Step 5: Body clips
@@ -609,7 +456,7 @@ def generate_video(article_id: int, title: str, script: str) -> str:
         raise
 
     finally:
-        for resource in [audio, main_video, hook_clip]:
+        for resource in [audio, main_video]:
             try:
                 if resource:
                     resource.close()
@@ -623,10 +470,6 @@ def generate_video(article_id: int, title: str, script: str) -> str:
         try:
             if actual_audio_path:
                 Path(actual_audio_path).unlink(missing_ok=True)
-        except OSError:
-            pass
-        try:
-            Path(sogni_hook_path).unlink(missing_ok=True)
         except OSError:
             pass
 
