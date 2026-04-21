@@ -244,6 +244,22 @@ validate_api_keys()
 # ============================================================
 # Background task helpers
 # ============================================================
+#
+# Note on pre-warming: we deliberately do NOT pre-import kokoro on startup.
+# If that import ever hangs (torch dispatch init on cold machines), the hung
+# import holds Python's import lock — which means the first real video
+# request will ALSO block on `from kokoro import KPipeline`, forever, waiting
+# for the import lock that the hung warmup thread is holding. Pre-warm helps
+# only when it finishes; when it doesn't, it breaks every subsequent request.
+# The watchdog below is the right defense: it gives users a clean terminal
+# 'failed' state instead of a UI that spins forever.
+
+# Max wall-time for a single video generation before the watchdog flips the
+# article to 'failed'. Configurable via env. The worker thread may still be
+# running after this — Python can't safely kill threads — but the UI sees a
+# clean terminal state so users can retry.
+VIDEO_TIMEOUT_SECONDS = int(os.getenv("VIDEO_TIMEOUT_SECONDS", "900"))
+
 
 def run_summarize_in_background(app_context, article_id):
     """Run summarization in a background thread."""
@@ -285,39 +301,87 @@ def run_summarize_in_background(app_context, article_id):
 
 
 def run_video_in_background(app_context, article_id, style_override=None):
-    """Run video generation in a background thread."""
-    with app_context:
-        article = db.session.get(Article, article_id)
-        if not article:
-            return
+    """Run video generation in a background thread, with a watchdog timeout.
 
-        try:
-            scenes = json.loads(article.scenes) if article.scenes else None
-            style_key = style_override or article.style or None
+    If generation exceeds VIDEO_TIMEOUT_SECONDS, a separate timer thread flips
+    the article to 'failed' so the UI shows a clean terminal state. The worker
+    thread itself may keep running (Python can't safely kill threads), so on
+    successful completion we re-check status and discard the output if the
+    watchdog already declared failure.
+    """
+    from threading import Timer
 
-            video_path = generate_video(
-                article_id=article.id,
-                title=article.title,
-                script=article.video_script,
-                scenes=scenes,
-                style_key=style_key,
-            )
+    def _watchdog_fire():
+        # Runs in a separate thread — needs its own app context.
+        with app.app_context():
+            article = db.session.get(Article, article_id)
+            if article and article.status == 'generating_video':
+                logger.error(
+                    f"Video generation for article {article_id} timed out after "
+                    f"{VIDEO_TIMEOUT_SECONDS}s. Marking failed. Worker thread may "
+                    "still be running and will discard its output on completion."
+                )
+                article.status = 'failed'
+                db.session.commit()
 
-            # Persist the style that was actually used (in case it was auto-picked inside)
-            if style_override:
-                article.style = style_override
+    timer = Timer(VIDEO_TIMEOUT_SECONDS, _watchdog_fire)
+    timer.daemon = True
+    timer.start()
 
-            relative_path = os.path.basename(video_path)
-            article.video_path = relative_path
-            article.status = 'video_done'
-            article.video_generated_at = datetime.now(timezone.utc)
-            db.session.commit()
-            logger.info(f"Video generated for article {article_id}")
+    try:
+        with app_context:
+            article = db.session.get(Article, article_id)
+            if not article:
+                return
 
-        except Exception as e:
-            logger.error(f"Failed to generate video for article {article_id}: {e}", exc_info=True)
-            article.status = 'failed'
-            db.session.commit()
+            try:
+                scenes = json.loads(article.scenes) if article.scenes else None
+                style_key = style_override or article.style or None
+
+                video_path = generate_video(
+                    article_id=article.id,
+                    title=article.title,
+                    script=article.video_script,
+                    scenes=scenes,
+                    style_key=style_key,
+                    emotion=article.dominant_emotion,
+                )
+
+                # Re-fetch: watchdog may have already marked us failed while we
+                # were inside generate_video(). If so, drop the result so we
+                # don't revive a failed row.
+                db.session.refresh(article)
+                if article.status != 'generating_video':
+                    logger.warning(
+                        f"Video for article {article_id} completed after watchdog "
+                        f"already set status={article.status}; discarding {video_path}"
+                    )
+                    try:
+                        os.remove(video_path)
+                    except OSError:
+                        pass
+                    return
+
+                # Persist the style that was actually used (in case it was auto-picked inside)
+                if style_override:
+                    article.style = style_override
+
+                relative_path = os.path.basename(video_path)
+                article.video_path = relative_path
+                article.status = 'video_done'
+                article.video_generated_at = datetime.now(timezone.utc)
+                db.session.commit()
+                logger.info(f"Video generated for article {article_id}")
+
+            except Exception as e:
+                logger.error(f"Failed to generate video for article {article_id}: {e}", exc_info=True)
+                # Only overwrite status if watchdog hasn't already set it.
+                db.session.refresh(article)
+                if article.status == 'generating_video':
+                    article.status = 'failed'
+                    db.session.commit()
+    finally:
+        timer.cancel()
 
 
 # ============================================================

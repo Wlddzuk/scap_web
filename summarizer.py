@@ -33,7 +33,7 @@ Turn the article below into a 60-second vertical video script that HOOKS viewers
 5. LOOP (1 sentence, ~2s) - Mic-drop line that either answers the cold open or asks a question that earns a rewatch.
 
 === WRITING RULES ===
-- 130-150 words total (~60 seconds of speech).
+- HARD LIMIT: video_script must be 130-150 words. Count every word. Anything over 160 is WRONG and will be rejected — a 60-second TikTok at natural pacing is at most 150 words. If you need to cut, drop the weakest PAYOFF sentence, not the hook or loop.
 - Second person: "you", "your" - never "people" or "they".
 - Short sentences. Every line should be tweetable.
 - CONCRETE specifics. Real names, real numbers, real places. Zero generalities.
@@ -237,6 +237,27 @@ def summarize_with_gemini(title: str, content: str) -> dict:
     return parse_response(text)
 
 
+# Word-count bands for the narration. Over the warn band, TikTok delivery
+# gets rushed; over the hard band, we're well past the 60s target.
+SCRIPT_WORD_TARGET = (130, 150)
+SCRIPT_WORD_WARN_OVER = 160
+
+
+def _log_script_stats(result: dict, provider: str) -> None:
+    """Log a warning if the narration busted the word cap — useful for
+    spotting providers that systematically ignore the prompt constraint."""
+    script = result.get('video_script') or ''
+    wc = len(script.split())
+    scene_count = len(result.get('scenes') or [])
+    lo, hi = SCRIPT_WORD_TARGET
+    if wc > SCRIPT_WORD_WARN_OVER:
+        print(
+            f"[Summarizer] WARN {provider}: script is {wc} words "
+            f"(target {lo}-{hi}). Delivery will feel rushed at ~60s."
+        )
+    print(f"[Summarizer] {provider} ok: {wc} words, {scene_count} scenes")
+
+
 def summarize_article(title: str, content: str) -> dict:
     """Generate story-shaped video script + scene beats + style suggestion.
 
@@ -252,34 +273,22 @@ def summarize_article(title: str, content: str) -> dict:
     """
     errors = {}
 
-    try:
-        print("[Summarizer] Trying Kimi K2 (OpenRouter)...")
-        return summarize_with_kimi(title, content)
-    except Exception as e:
-        errors['kimi'] = str(e)
-        print(f"[Summarizer] Kimi K2 failed: {e}")
+    for provider, fn in (
+        ('kimi', summarize_with_kimi),
+        ('claude', summarize_with_claude),
+        ('groq', summarize_with_groq),
+        ('gemini', summarize_with_gemini),
+    ):
+        try:
+            print(f"[Summarizer] Trying {provider}...")
+            result = fn(title, content)
+            _log_script_stats(result, provider)
+            return result
+        except Exception as e:
+            errors[provider] = str(e)
+            print(f"[Summarizer] {provider} failed: {e}")
 
-    try:
-        print("[Summarizer] Trying Claude Sonnet 4.6 (OpenRouter)...")
-        return summarize_with_claude(title, content)
-    except Exception as e:
-        errors['claude'] = str(e)
-        print(f"[Summarizer] Claude failed: {e}")
-
-    try:
-        print("[Summarizer] Trying Groq (speed fallback)...")
-        return summarize_with_groq(title, content)
-    except Exception as e:
-        errors['groq'] = str(e)
-        print(f"[Summarizer] Groq failed: {e}")
-
-    try:
-        print("[Summarizer] Falling back to Gemini 2.5 Flash...")
-        return summarize_with_gemini(title, content)
-    except Exception as e:
-        errors['gemini'] = str(e)
-        print(f"[Summarizer] Gemini also failed: {e}")
-        raise Exception(f"All AI providers failed: {errors}")
+    raise Exception(f"All AI providers failed: {errors}")
 
 
 if __name__ == '__main__':

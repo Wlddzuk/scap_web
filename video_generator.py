@@ -120,26 +120,76 @@ def resize_and_crop_image(img: Image.Image, target_width: int, target_height: in
     return img.resize((target_width, target_height), Image.LANCZOS)
 
 
-# High-quality Kokoro voices (Grade B- or better)
-KOKORO_VOICES = [
-    "af_heart",   # Grade A - warm female
-    "af_bella",   # Grade A- - expressive female
-    "af_nicole",  # Grade B- - clear female
-    "bf_emma",    # Grade B- - British female
-    "am_fenrir",  # Grade C+ - best male
-    "am_michael", # Grade C+ - professional male
-]
+# Kokoro voices, hand-picked for short-form delivery.
+# af_nicole is deliberately excluded — it's whispery/ASMR-leaning and kills
+# energy on hook-driven TikTok content. Keep it available for voice=... overrides
+# if a future use case (bedtime stories, meditation) wants it back.
+#
+# Map dominant emotion -> voice that fits the vibe. Values are ordered;
+# the first entry is the default pick, extras exist for future rotation/A-B.
+EMOTION_VOICE_MAP = {
+    "shocking":   ["af_bella",  "am_fenrir"],   # expressive, cuts through
+    "urgent":     ["am_fenrir", "af_bella"],    # energetic, drives action
+    "curious":    ["af_heart",  "bf_emma"],     # warm, inviting
+    "triumphant": ["af_bella",  "am_fenrir"],   # bright, confident
+    "dark":       ["am_michael","am_fenrir"],   # deeper, serious
+    "funny":      ["af_bella",  "af_heart"],    # expressive, playful
+}
+DEFAULT_VOICE = "af_heart"  # Grade A warm female — safe fallback
+
+# Speed nudges per emotion. TikTok pacing is faster than natural speech;
+# 1.0 feels sluggish, 1.15 feels energetic. Don't go above 1.2 — Kokoro
+# loses articulation.
+EMOTION_SPEED_MAP = {
+    "shocking":   1.15,
+    "urgent":     1.15,
+    "curious":    1.10,
+    "triumphant": 1.12,
+    "dark":       1.05,  # slower for gravitas
+    "funny":      1.12,
+}
+DEFAULT_SPEED = 1.10
 
 
-def generate_tts_kokoro(text: str, output_path: str, voice: str = None) -> str:
-    """Generate TTS using Kokoro-82M only (no fallback)."""
+def pick_voice_for_emotion(emotion: str | None) -> tuple[str, float]:
+    """Return (voice, speed) for a given dominant_emotion string.
+
+    Falls back to warm-neutral defaults when emotion is missing or unknown.
+    Deterministic: same emotion always yields the same (voice, speed) so
+    videos of the same vibe sound consistent across regenerations.
+    """
+    key = (emotion or "").strip().lower()
+    voices = EMOTION_VOICE_MAP.get(key)
+    voice = voices[0] if voices else DEFAULT_VOICE
+    speed = EMOTION_SPEED_MAP.get(key, DEFAULT_SPEED)
+    return voice, speed
+
+
+def generate_tts_kokoro(
+    text: str,
+    output_path: str,
+    voice: str = None,
+    emotion: str = None,
+    speed: float = None,
+) -> str:
+    """Generate TTS using Kokoro-82M.
+
+    Voice selection precedence: explicit `voice` arg > emotion mapping > default.
+    Speed selection precedence: explicit `speed` arg > emotion mapping > default.
+    """
     from kokoro import KPipeline
     import soundfile as sf
 
-    selected_voice = voice or random.choice(KOKORO_VOICES)
-    print(f"[TTS] Using Kokoro-82M with voice: {selected_voice}")
+    emo_voice, emo_speed = pick_voice_for_emotion(emotion)
+    selected_voice = voice or emo_voice
+    selected_speed = speed if speed is not None else emo_speed
+
+    print(
+        f"[TTS] Using Kokoro-82M | voice={selected_voice} speed={selected_speed} "
+        f"emotion={emotion or 'default'}"
+    )
     pipeline = KPipeline(lang_code="a", repo_id="hexgrad/Kokoro-82M")
-    generator = pipeline(text, voice=selected_voice, speed=1.05)
+    generator = pipeline(text, voice=selected_voice, speed=selected_speed)
 
     all_audio = []
     for _gs, _ps, audio_chunk in generator:
@@ -412,12 +462,14 @@ def generate_video(
     script: str,
     scenes: list = None,
     style_key: str = None,
+    emotion: str = None,
 ) -> str:
     """Generate TikTok-style video.
 
-    Preferred path: scenes + style_key provided (from summarizer).
+    Preferred path: scenes + style_key + emotion provided (from summarizer).
     Each scene produces one style-consistent image, and images play in
     narrative order for their scene's proportional speech duration.
+    `emotion` drives TTS voice and speed selection (see pick_voice_for_emotion).
 
     Fallback path: no scenes -> legacy themed-image generation with
     chunked text pacing.
@@ -445,7 +497,9 @@ def generate_video(
 
         # Step 1: TTS
         print("[Video] Step 1: Generating voiceover...")
-        actual_audio_path = generate_tts_kokoro(clean_text(script), str(temp_audio_path))
+        actual_audio_path = generate_tts_kokoro(
+            clean_text(script), str(temp_audio_path), emotion=emotion
+        )
         audio = AudioFileClip(actual_audio_path)
         audio_duration = float(audio.duration)
         print(f"[Video] Audio: {audio_duration:.1f}s")
