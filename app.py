@@ -192,6 +192,7 @@ def _migrate_schema():
         ("hook_variants", "TEXT"),
         ("dominant_emotion", "VARCHAR(32)"),
         ("style", "VARCHAR(32)"),
+        ("substack_post", "TEXT"),
     ]
 
     with app.app_context():
@@ -640,6 +641,36 @@ def generate_video_endpoint(article_id):
         'message': 'Video generation started',
         'article': article.to_dict()
     }), 202
+
+
+@app.route('/api/articles/<int:article_id>/substack', methods=['POST'])
+def generate_substack_endpoint(article_id):
+    """Generate (or return cached) Substack companion post for an article.
+
+    Synchronous — the LLM call takes ~5-10s, far short of request timeout.
+    Returns the updated article dict on success (200).
+    """
+    from summarizer import generate_substack_post
+
+    article = db.session.get(Article, article_id)
+    if not article:
+        return jsonify({'error': 'Article not found'}), 404
+
+    if not article.tldr:
+        return jsonify({'error': 'Article must be summarized first'}), 400
+
+    # Return cached post if already generated
+    if article.substack_post:
+        return jsonify({'article': article.to_dict()})
+
+    try:
+        post = generate_substack_post(article)
+        article.substack_post = post
+        db.session.commit()
+        return jsonify({'article': article.to_dict()})
+    except Exception as e:
+        logger.error("Substack post generation failed for article %s: %s", article_id, e, exc_info=True)
+        return jsonify({'error': 'Failed to generate Substack post'}), 500
 
 
 @app.route('/api/styles', methods=['GET'])

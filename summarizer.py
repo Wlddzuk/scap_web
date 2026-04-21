@@ -291,6 +291,125 @@ def summarize_article(title: str, content: str) -> dict:
     raise Exception(f"All AI providers failed: {errors}")
 
 
+def get_substack_prompt(title: str, site_name: str, tldr: str, bullets: list,
+                        hook_variants: list, scenes: list, dominant_emotion: str) -> str:
+    bullets_text = '\n'.join(f'- {b}' for b in (bullets or []))
+    hooks_text = '\n'.join(f'- {h}' for h in (hook_variants or [])[:3])
+    story_beats = ' '.join(s.get('speech', '') for s in (scenes or []))
+
+    return f"""Write a long-form Substack newsletter post (600–900 words) about this article.
+
+Article: {title}
+Source: {site_name or 'Unknown'}
+Summary: {tldr}
+Key points:
+{bullets_text}
+Hook angles (inspiration only — do NOT copy verbatim):
+{hooks_text}
+Overall emotion: {dominant_emotion or 'curious'}
+Story beats from video:
+{story_beats}
+
+=== RULES ===
+1. OPENING: Start with a relatable everyday analogy or surprising question. NOT the hook verbatim. Give readers a "huh, I never thought of it that way" moment in the first two sentences.
+2. VOICE: Warm, conversational second-person ("you", "we"). Write like a smart friend who just read this article on the train and can't wait to tell you about it.
+3. ANALOGIES: Every technical concept must have a real-world comparison. If a 300-qubit chip beats a computer made of every atom in the universe, compare that to something absurd and relatable — a sports team beating every team that ever existed simultaneously.
+4. STRUCTURE: 3–4 body sections, each with a punchy ## Subheading. No walls of text — short paragraphs (2–4 sentences max).
+5. CALLOUT: One > blockquote for the single most mind-blowing insight. Make it the thing readers screenshot.
+6. CONCLUSION: End with a thought-provoking discussion question that invites comments. Not rhetorical — genuinely curious.
+7. SPECIFICS: Real names, real numbers, relatable scale comparisons. Vague is boring.
+8. LENGTH: 600–900 words in the body. Readable in 4–6 minutes.
+
+=== OUTPUT ===
+Respond ONLY with valid JSON (no markdown fences):
+{{
+  "post_title": "catchy title that promises something different from the original article headline",
+  "subtitle": "one sentence that completes the promise of the title",
+  "body": "full post body in markdown — ## headings, **bold** for emphasis, > callout block, blank lines between paragraphs"
+}}"""
+
+
+def generate_substack_post(article) -> str:
+    """Generate a long-form Substack companion post for an article.
+
+    Reuses the OpenRouter provider chain (Kimi K2 → Claude Sonnet 4.6).
+    Returns the assembled post as a single string ready for clipboard.
+    """
+    import json as _json
+
+    api_key = os.getenv('OPENROUTER_API_KEY')
+    if not api_key:
+        raise ValueError("OPENROUTER_API_KEY not found in environment variables")
+
+    bullets = _json.loads(article.bullets) if article.bullets else []
+    hook_variants = _json.loads(article.hook_variants) if article.hook_variants else []
+    scenes = _json.loads(article.scenes) if article.scenes else []
+
+    prompt = get_substack_prompt(
+        title=article.title,
+        site_name=article.site_name or '',
+        tldr=article.tldr or '',
+        bullets=bullets,
+        hook_variants=hook_variants,
+        scenes=scenes,
+        dominant_emotion=article.dominant_emotion or 'curious',
+    )
+
+    errors = {}
+    for model_id, label in (
+        ("moonshotai/kimi-k2", "kimi"),
+        ("anthropic/claude-sonnet-4.6", "claude"),
+    ):
+        try:
+            print(f"[Substack] Trying {label}...")
+            response = requests.post(
+                "https://openrouter.ai/api/v1/chat/completions",
+                headers={
+                    "Authorization": f"Bearer {api_key}",
+                    "Content-Type": "application/json",
+                    "HTTP-Referer": "http://localhost:5050",
+                    "X-Title": "Clipper"
+                },
+                json={
+                    "model": model_id,
+                    "messages": [
+                        {"role": "system", "content": "You are a Substack newsletter writer who makes complex ideas click for everyone using everyday analogies. Respond ONLY with valid JSON."},
+                        {"role": "user", "content": prompt}
+                    ],
+                    "temperature": 0.80,
+                    "max_tokens": 4000
+                },
+                timeout=120
+            )
+            response.raise_for_status()
+            data = response.json()
+            if 'error' in data:
+                raise Exception(data['error'].get('message', 'Unknown error'))
+
+            raw = data['choices'][0]['message']['content'].strip()
+            # Strip markdown fences if the model wraps in ```json ... ```
+            if raw.startswith('```'):
+                raw = raw.split('```', 2)[1]
+                if raw.startswith('json'):
+                    raw = raw[4:]
+                raw = raw.rsplit('```', 1)[0].strip()
+
+            parsed = _json.loads(raw)
+            post_title = parsed.get('post_title', article.title)
+            subtitle = parsed.get('subtitle', '')
+            body = parsed.get('body', '')
+
+            assembled = f"# {post_title}\n*{subtitle}*\n\n{body}" if subtitle else f"# {post_title}\n\n{body}"
+            print(f"[Substack] {label} ok: {len(assembled.split())} words")
+            return assembled
+
+        except Exception as e:
+            errors[label] = str(e)
+            print(f"[Substack] {label} failed: {e}")
+
+    raise Exception(f"Substack generation failed on all providers: {errors}")
+
+
 if __name__ == '__main__':
     test_result = summarize_article(
         "AI is Rewriting the Rules of Cybersecurity",

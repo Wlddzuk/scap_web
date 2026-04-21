@@ -503,6 +503,8 @@ function renderSummary(article) {
                 </div>
             </div>
         ` : ''}
+
+        ${renderSubstackSection(article)}
     `;
 }
 
@@ -616,6 +618,85 @@ function showToast(message, type = 'info') {
 // ============================================
 // Utility Functions
 // ============================================
+
+function renderSubstackSection(article) {
+    if (!article.tldr) return '';
+
+    if (article.substack_post) {
+        return `
+            <div class="substack-section">
+                <div class="summary-label">
+                    Substack Post
+                    <button class="copy-substack-btn btn btn-sm" onclick="copySubstackPost(event, ${article.id})">
+                        Copy Post
+                    </button>
+                </div>
+                <textarea class="substack-preview" readonly>${escapeHtml(article.substack_post)}</textarea>
+            </div>
+        `;
+    }
+
+    return `
+        <div class="substack-section substack-generate">
+            <div class="summary-label">Substack Post</div>
+            <p class="substack-hint">Turn this story into a long-form newsletter your readers will love — with everyday analogies and a conversational tone.</p>
+            <button class="btn btn-secondary" id="substack-btn-${article.id}" onclick="generateSubstackPost(event, ${article.id})">
+                Generate Substack Post
+            </button>
+        </div>
+    `;
+}
+
+async function generateSubstackPost(event, articleId) {
+    event.stopPropagation();
+    const btn = document.getElementById(`substack-btn-${articleId}`);
+    if (btn) {
+        btn.disabled = true;
+        btn.textContent = 'Generating…';
+    }
+
+    try {
+        const response = await fetch(`/api/articles/${articleId}/substack`, { method: 'POST' });
+        const data = await response.json();
+        if (!response.ok) throw new Error(data.error || 'Generation failed');
+
+        // Update in-memory array and re-render the card
+        const idx = articles.findIndex(a => a.id === articleId);
+        if (idx !== -1) articles[idx] = data.article;
+
+        const card = document.querySelector(`.article-card[data-article-id="${articleId}"]`);
+        if (card) {
+            const contentEl = card.querySelector('.article-content');
+            if (contentEl) {
+                contentEl.querySelector('.substack-section').outerHTML = renderSubstackSection(data.article);
+            }
+        }
+        showToast('Substack post ready!', 'success');
+    } catch (err) {
+        console.error('Substack generation failed:', err);
+        showToast('Failed to generate Substack post', 'error');
+        if (btn) {
+            btn.disabled = false;
+            btn.textContent = 'Generate Substack Post';
+        }
+    }
+}
+
+function copySubstackPost(event, articleId) {
+    event.stopPropagation();
+    const article = articles.find(a => a.id === articleId);
+    if (!article || !article.substack_post) return;
+
+    navigator.clipboard.writeText(article.substack_post).then(() => {
+        showToast('Substack post copied to clipboard!', 'success');
+        const btn = event.target.closest('.copy-substack-btn');
+        if (btn) {
+            const original = btn.textContent;
+            btn.textContent = 'Copied!';
+            setTimeout(() => { btn.textContent = original; }, 2000);
+        }
+    }).catch(() => showToast('Failed to copy post', 'error'));
+}
 
 function copyHashtags(event, articleId) {
     event.stopPropagation();

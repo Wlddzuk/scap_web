@@ -41,6 +41,9 @@ class Article(db.Model):
     # Video output
     video_path = db.Column(db.String(512), nullable=True)
 
+    # Substack companion post (long-form, conversational)
+    substack_post = db.Column(db.Text, nullable=True)
+
     def to_dict(self, include_full_content=False):
         """Convert to dictionary for JSON response.
 
@@ -70,6 +73,7 @@ class Article(db.Model):
             'dominant_emotion': self.dominant_emotion,
             'style': self.style,
             'video_path': self.video_path,
+            'substack_post': self.substack_post,
         }
 
         if include_full_content:

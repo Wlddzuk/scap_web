@@ -551,6 +551,67 @@ body {
 }
 
 /* ============================================
+   Substack Post Section
+   ============================================ */
+
+.substack-section {
+    margin-top: var(--spacing-lg);
+    padding-top: var(--spacing-lg);
+    border-top: 1px solid var(--glass-border);
+}
+
+.substack-section .summary-label {
+    display: flex;
+    justify-content: space-between;
+    align-items: center;
+    margin-bottom: var(--spacing-sm);
+}
+
+.substack-hint {
+    color: var(--text-secondary);
+    font-size: 0.875rem;
+    margin-bottom: var(--spacing-md);
+    line-height: 1.5;
+}
+
+.substack-preview {
+    width: 100%;
+    height: 280px;
+    padding: var(--spacing-md);
+    background: var(--bg-secondary);
+    border: 1px solid var(--glass-border);
+    border-radius: var(--radius-md);
+    color: var(--text-secondary);
+    font-family: inherit;
+    font-size: 0.875rem;
+    line-height: 1.6;
+    resize: vertical;
+    box-sizing: border-box;
+}
+
+.substack-preview:focus {
+    outline: none;
+    border-color: var(--accent-blue);
+}
+
+.copy-substack-btn {
+    padding: 4px 12px;
+    font-size: 0.75rem;
+    border-radius: var(--radius-sm);
+    background: var(--bg-secondary);
+    border: 1px solid var(--glass-border);
+    color: var(--text-secondary);
+    cursor: pointer;
+    transition: background var(--transition-fast), color var(--transition-fast);
+}
+
+.copy-substack-btn:hover {
+    background: var(--accent-blue);
+    color: #fff;
+    border-color: var(--accent-blue);
+}
+
+/* ============================================
    Hashtags Section
    ============================================ */
 
