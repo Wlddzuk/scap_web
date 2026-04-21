@@ -277,6 +277,12 @@ function renderArticles() {
     const searchBar = document.getElementById('search-bar');
     const sectionHeader = document.getElementById('section-header');
     const sectionTitle = document.getElementById('section-title');
+    const scraperForm = document.querySelector('.url-scraper-form');
+
+    // Collapse the hero once the user has articles — full pitch only matters on the empty dashboard.
+    if (scraperForm) {
+        scraperForm.classList.toggle('compact', articles.length > 0);
+    }
 
     if (articles.length === 0) {
         container.classList.add('hidden');
@@ -368,27 +374,23 @@ function renderArticleCard(article) {
 }
 
 function getStatusBadges(article) {
-    const badges = [];
-
-    badges.push('<span class="badge badge-scraped">Scraped</span>');
-
-    if (article.status === 'summarizing') {
-        badges.push('<span class="badge badge-processing">Summarizing</span>');
-    } else if (article.tldr) {
-        badges.push('<span class="badge badge-summarized">Summarized</span>');
-    }
-
-    if (article.status === 'generating_video') {
-        badges.push('<span class="badge badge-processing">Generating Video</span>');
-    } else if (article.video_path) {
-        badges.push('<span class="badge badge-video">Video Ready</span>');
-    }
-
+    // Single current-state pill. Priority: failed > processing > completed > scraped.
     if (article.status === 'failed') {
-        badges.push('<span class="badge badge-failed">Failed</span>');
+        return '<span class="badge badge-failed">Failed</span>';
     }
-
-    return badges.join('');
+    if (article.status === 'generating_video') {
+        return '<span class="badge badge-processing">Generating Video</span>';
+    }
+    if (article.status === 'summarizing') {
+        return '<span class="badge badge-processing">Summarizing</span>';
+    }
+    if (article.video_path) {
+        return '<span class="badge badge-video">Video Ready</span>';
+    }
+    if (article.tldr) {
+        return '<span class="badge badge-summarized">Summarized</span>';
+    }
+    return '<span class="badge badge-scraped">Scraped</span>';
 }
 
 function renderStylePicker(article) {
@@ -481,7 +483,7 @@ function renderSummary(article) {
 
         ${article.video_path ? `
             <div class="video-container">
-                <video controls preload="metadata">
+                <video controls preload="none" playsinline>
                     <source src="/videos/${encodeURIComponent(article.video_path)}" type="video/mp4">
                     Your browser does not support the video tag.
                 </video>

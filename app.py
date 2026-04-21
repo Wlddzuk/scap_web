@@ -212,6 +212,36 @@ with app.app_context():
 _migrate_schema()
 
 
+def _prune_missing_videos():
+    """Null out video_path for articles whose mp4 file no longer exists on disk.
+
+    SQLite rows can outlive their referenced files (manual deletes, static
+    dir reset, branch switches). Stale video_path values cause the frontend
+    to render <video> tags pointing at 404s, which pollutes the network tab
+    and burns bytes on every page load. One-shot cleanup at startup keeps
+    the dashboard honest.
+    """
+    videos_dir = os.path.join(os.path.dirname(__file__), "static", "videos")
+    with app.app_context():
+        stale = Article.query.filter(Article.video_path.isnot(None)).all()
+        pruned = 0
+        for a in stale:
+            full = os.path.join(videos_dir, a.video_path)
+            if not os.path.exists(full):
+                a.video_path = None
+                # If the only reason we called this 'video_done' was that stale
+                # path, walk back to a sensible state.
+                if a.status == 'video_done':
+                    a.status = 'summarized' if a.tldr else 'scraped'
+                pruned += 1
+        if pruned:
+            db.session.commit()
+            logger.info(f"Pruned {pruned} stale video_path entries on startup")
+
+
+_prune_missing_videos()
+
+
 # Validate API keys on startup
 def validate_api_keys():
     """Check if at least one summarization API key is configured."""
