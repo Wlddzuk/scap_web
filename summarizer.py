@@ -291,41 +291,89 @@ def summarize_article(title: str, content: str) -> dict:
     raise Exception(f"All AI providers failed: {errors}")
 
 
+def _strip_dashes(text: str) -> str:
+    """Remove em-dashes and en-dashes as a safety net, even if the model slips.
+
+    Em/en-dashes are the #1 AI tell in generated prose. The prompt bans them
+    explicitly, but we strip any survivors here. Replacement is ', ' which
+    preserves the pause without the telltale character.
+    """
+    if not text:
+        return text
+    return (
+        text.replace(' — ', ', ')
+            .replace('— ', ', ')
+            .replace(' —', ',')
+            .replace('—', ',')
+            .replace(' – ', ', ')
+            .replace('– ', ', ')
+            .replace(' –', ',')
+            .replace('–', ',')
+    )
+
+
 def get_substack_prompt(title: str, site_name: str, tldr: str, bullets: list,
                         hook_variants: list, scenes: list, dominant_emotion: str) -> str:
     bullets_text = '\n'.join(f'- {b}' for b in (bullets or []))
     hooks_text = '\n'.join(f'- {h}' for h in (hook_variants or [])[:3])
     story_beats = ' '.join(s.get('speech', '') for s in (scenes or []))
 
-    return f"""Write a long-form Substack newsletter post (600–900 words) about this article.
+    return f"""Write a long-form Substack newsletter post (600 to 900 words) about this article.
 
 Article: {title}
 Source: {site_name or 'Unknown'}
 Summary: {tldr}
 Key points:
 {bullets_text}
-Hook angles (inspiration only — do NOT copy verbatim):
+Hook angles (inspiration only, do NOT copy verbatim):
 {hooks_text}
 Overall emotion: {dominant_emotion or 'curious'}
 Story beats from video:
 {story_beats}
 
-=== RULES ===
-1. OPENING: Start with a relatable everyday analogy or surprising question. NOT the hook verbatim. Give readers a "huh, I never thought of it that way" moment in the first two sentences.
-2. VOICE: Warm, conversational second-person ("you", "we"). Write like a smart friend who just read this article on the train and can't wait to tell you about it.
-3. ANALOGIES: Every technical concept must have a real-world comparison. If a 300-qubit chip beats a computer made of every atom in the universe, compare that to something absurd and relatable — a sports team beating every team that ever existed simultaneously.
-4. STRUCTURE: 3–4 body sections, each with a punchy ## Subheading. No walls of text — short paragraphs (2–4 sentences max).
-5. CALLOUT: One > blockquote for the single most mind-blowing insight. Make it the thing readers screenshot.
-6. CONCLUSION: End with a thought-provoking discussion question that invites comments. Not rhetorical — genuinely curious.
-7. SPECIFICS: Real names, real numbers, relatable scale comparisons. Vague is boring.
-8. LENGTH: 600–900 words in the body. Readable in 4–6 minutes.
+=== HARD BANS (non-negotiable) ===
+Do NOT use em-dashes or en-dashes ANYWHERE in your output. Not in the title, not in the subtitle, not in the body. Use a comma, a period, parentheses, or rewrite the sentence. This rule overrides every other stylistic instinct. A single em-dash means the post is broken.
+
+Do NOT use these AI-giveaway phrases or patterns:
+- "It's not just X, it's Y"
+- "In the realm of", "delve into", "navigate the complexities of", "in today's world"
+- "groundbreaking", "revolutionary", "unprecedented", "paradigm shift", "at the forefront"
+- "tapestry", "landscape" (metaphorical), "journey" (metaphorical)
+- "Whether you're X or Y, this..." openers
+- "Let's dive in", "Let's unpack", "Buckle up"
+- Perfectly tricolon sentences ("faster, smarter, better")
+- Bullet lists where every item starts with a bolded lead-in word
+
+=== HUMANIZATION (this is the point) ===
+Write like a real human who is genuinely excited to share what they learned. Specifically:
+- Use contractions: don't, can't, won't, it's, they're, you'll.
+- Vary sentence length aggressively. Mix a 4-word punch with a 25-word winding thought.
+- Start a sentence with "And" or "But" when it flows naturally.
+- Drop a casual aside in parentheses once or twice (like this one).
+- Use a one-word paragraph for emphasis.
+
+  Seriously.
+
+- Let your voice show. A "weird, right?" or "honestly, this broke my brain" lands better than a polished transition.
+- Personal micro-takes are welcome: "This is the part I keep thinking about."
+- Occasional lowercase "i" or trailing "..." is fine if it sounds like someone talking.
+
+=== STRUCTURE ===
+1. OPENING: Start with a relatable everyday analogy or a surprising question. Not the hook verbatim. Give readers a "huh, never thought of it that way" moment in the first two sentences.
+2. VOICE: Warm, conversational, second person ("you", "we"). Write like you just read this on the train and had to text a friend about it.
+3. ANALOGIES: Every technical idea needs an everyday comparison. If a 300-qubit chip beats a computer made from every atom in the universe, compare that to something absurd and relatable, like one chess player beating every grandmaster who ever lived, all at once.
+4. SECTIONS: 3 to 4 body sections, each with a punchy ## Subheading. Short paragraphs (2 to 4 sentences).
+5. CALLOUT: Exactly one > blockquote for the single most mind-blowing insight. The line someone would screenshot.
+6. CLOSE: End with a genuinely curious discussion question that invites comments. Not rhetorical.
+7. SPECIFICS: Real names, real numbers, relatable scale comparisons. Vague kills interest.
+8. LENGTH: 600 to 900 words in the body.
 
 === OUTPUT ===
-Respond ONLY with valid JSON (no markdown fences):
+Respond ONLY with valid JSON (no markdown fences). Reminder: zero em-dashes or en-dashes anywhere in any field.
 {{
-  "post_title": "catchy title that promises something different from the original article headline",
-  "subtitle": "one sentence that completes the promise of the title",
-  "body": "full post body in markdown — ## headings, **bold** for emphasis, > callout block, blank lines between paragraphs"
+  "post_title": "catchy title, different from the original article headline, no em-dashes",
+  "subtitle": "one sentence that completes the promise of the title, no em-dashes",
+  "body": "full post body in markdown. Use ## headings, **bold** for emphasis, > callout block, blank lines between paragraphs. No em-dashes anywhere."
 }}"""
 
 
@@ -373,10 +421,10 @@ def generate_substack_post(article) -> str:
                 json={
                     "model": model_id,
                     "messages": [
-                        {"role": "system", "content": "You are a Substack newsletter writer who makes complex ideas click for everyone using everyday analogies. Respond ONLY with valid JSON."},
+                        {"role": "system", "content": "You are a real human newsletter writer on Substack. You write conversationally and make complex ideas click using everyday analogies. You NEVER use em-dashes or en-dashes because they scream 'AI-generated'. Respond ONLY with valid JSON."},
                         {"role": "user", "content": prompt}
                     ],
-                    "temperature": 0.80,
+                    "temperature": 0.70,
                     "max_tokens": 4000
                 },
                 timeout=120
@@ -395,9 +443,9 @@ def generate_substack_post(article) -> str:
                 raw = raw.rsplit('```', 1)[0].strip()
 
             parsed = _json.loads(raw)
-            post_title = parsed.get('post_title', article.title)
-            subtitle = parsed.get('subtitle', '')
-            body = parsed.get('body', '')
+            post_title = _strip_dashes(parsed.get('post_title', article.title))
+            subtitle = _strip_dashes(parsed.get('subtitle', ''))
+            body = _strip_dashes(parsed.get('body', ''))
 
             assembled = f"# {post_title}\n*{subtitle}*\n\n{body}" if subtitle else f"# {post_title}\n\n{body}"
             print(f"[Substack] {label} ok: {len(assembled.split())} words")

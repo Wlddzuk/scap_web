@@ -659,8 +659,12 @@ def generate_substack_endpoint(article_id):
     if not article.tldr:
         return jsonify({'error': 'Article must be summarized first'}), 400
 
-    # Return cached post if already generated
-    if article.substack_post:
+    # Regeneration via ?regenerate=1 or JSON {regenerate: true}
+    payload = request.get_json(silent=True) or {}
+    force = request.args.get('regenerate') == '1' or payload.get('regenerate') is True
+
+    # Return cached post if already generated (unless force regenerate)
+    if article.substack_post and not force:
         return jsonify({'article': article.to_dict()})
 
     try:

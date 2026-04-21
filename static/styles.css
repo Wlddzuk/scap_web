@@ -594,7 +594,13 @@ body {
     border-color: var(--accent-blue);
 }
 
-.copy-substack-btn {
+.substack-actions-inline {
+    display: flex;
+    gap: var(--spacing-xs);
+}
+
+.copy-substack-btn,
+.regenerate-substack-btn {
     padding: 4px 12px;
     font-size: 0.75rem;
     border-radius: var(--radius-sm);
@@ -603,12 +609,24 @@ body {
     color: var(--text-secondary);
     cursor: pointer;
     transition: background var(--transition-fast), color var(--transition-fast);
+    font-family: inherit;
 }
 
 .copy-substack-btn:hover {
     background: var(--accent-blue);
     color: #fff;
     border-color: var(--accent-blue);
+}
+
+.regenerate-substack-btn:hover {
+    background: var(--accent-purple, #7c3aed);
+    color: #fff;
+    border-color: var(--accent-purple, #7c3aed);
+}
+
+.regenerate-substack-btn:disabled {
+    opacity: 0.6;
+    cursor: wait;
 }
 
 /* ============================================

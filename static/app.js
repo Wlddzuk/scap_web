@@ -627,9 +627,14 @@ function renderSubstackSection(article) {
             <div class="substack-section">
                 <div class="summary-label">
                     Substack Post
-                    <button class="copy-substack-btn btn btn-sm" onclick="copySubstackPost(event, ${article.id})">
-                        Copy Post
-                    </button>
+                    <div class="substack-actions-inline">
+                        <button class="copy-substack-btn" onclick="copySubstackPost(event, ${article.id})">
+                            Copy Post
+                        </button>
+                        <button class="regenerate-substack-btn" id="substack-btn-${article.id}" onclick="generateSubstackPost(event, ${article.id}, true)" title="Regenerate with latest prompt">
+                            Regenerate
+                        </button>
+                    </div>
                 </div>
                 <textarea class="substack-preview" readonly>${escapeHtml(article.substack_post)}</textarea>
             </div>
@@ -647,16 +652,18 @@ function renderSubstackSection(article) {
     `;
 }
 
-async function generateSubstackPost(event, articleId) {
+async function generateSubstackPost(event, articleId, regenerate = false) {
     event.stopPropagation();
     const btn = document.getElementById(`substack-btn-${articleId}`);
+    const originalText = btn ? btn.textContent : 'Generate Substack Post';
     if (btn) {
         btn.disabled = true;
-        btn.textContent = 'Generating…';
+        btn.textContent = regenerate ? 'Regenerating…' : 'Generating…';
     }
 
     try {
-        const response = await fetch(`/api/articles/${articleId}/substack`, { method: 'POST' });
+        const url = `/api/articles/${articleId}/substack${regenerate ? '?regenerate=1' : ''}`;
+        const response = await fetch(url, { method: 'POST' });
         const data = await response.json();
         if (!response.ok) throw new Error(data.error || 'Generation failed');
 
@@ -671,13 +678,13 @@ async function generateSubstackPost(event, articleId) {
                 contentEl.querySelector('.substack-section').outerHTML = renderSubstackSection(data.article);
             }
         }
-        showToast('Substack post ready!', 'success');
+        showToast(regenerate ? 'Substack post regenerated!' : 'Substack post ready!', 'success');
     } catch (err) {
         console.error('Substack generation failed:', err);
         showToast('Failed to generate Substack post', 'error');
         if (btn) {
             btn.disabled = false;
-            btn.textContent = 'Generate Substack Post';
+            btn.textContent = originalText;
         }
     }
 }
