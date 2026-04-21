@@ -12,6 +12,8 @@ let articles = [];
 let expandedArticles = new Set();
 let searchQuery = '';
 let initialLoadDone = false;
+let availableStyles = [];       // loaded from /api/styles
+let selectedStyleByArticle = {}; // { [articleId]: 'manga' } — user override
 
 // ============================================
 // API Functions
@@ -140,6 +142,27 @@ async function summarizeArticle(articleId) {
     }
 }
 
+async function loadStyles() {
+    try {
+        const res = await fetch(`${API_BASE}/api/styles`);
+        const data = await res.json();
+        availableStyles = data.styles || [];
+    } catch (err) {
+        console.warn('Failed to load styles', err);
+    }
+}
+
+function selectStyle(articleId, styleKey) {
+    selectedStyleByArticle[articleId] = styleKey;
+    // Update chip highlighting in place (no full re-render needed)
+    const container = document.querySelector(`.style-picker[data-article-id="${articleId}"]`);
+    if (container) {
+        container.querySelectorAll('.style-chip').forEach(chip => {
+            chip.classList.toggle('selected', chip.dataset.styleKey === styleKey);
+        });
+    }
+}
+
 async function generateVideo(articleId) {
     const btn = document.querySelector(`[data-video="${articleId}"]`);
     if (btn) {
@@ -147,11 +170,16 @@ async function generateVideo(articleId) {
         btn.textContent = 'Generating...';
     }
 
-    showToast('Generating video - this may take a few minutes', 'info');
+    const article = articles.find(a => a.id === articleId);
+    const chosenStyle = selectedStyleByArticle[articleId] || (article && article.style) || null;
+
+    showToast(`Generating video${chosenStyle ? ' (' + chosenStyle + ')' : ''} — this may take a few minutes`, 'info');
 
     try {
         const response = await fetch(`${API_BASE}/api/articles/${articleId}/video`, {
-            method: 'POST'
+            method: 'POST',
+            headers: { 'Content-Type': 'application/json' },
+            body: JSON.stringify(chosenStyle ? { style: chosenStyle } : {})
         });
 
         const data = await response.json();
@@ -363,6 +391,57 @@ function getStatusBadges(article) {
     return badges.join('');
 }
 
+function renderStylePicker(article) {
+    if (!availableStyles.length) return '';
+    const currentStyle = selectedStyleByArticle[article.id] || article.style || null;
+    const suggested = article.style;
+
+    return `
+        <div class="summary-section">
+            <div class="summary-label">
+                Visual Style
+                ${article.dominant_emotion ? `<span class="emotion-pill">${escapeHtml(article.dominant_emotion)}</span>` : ''}
+            </div>
+            <div class="style-picker" data-article-id="${article.id}">
+                ${availableStyles.map(s => `
+                    <button
+                        type="button"
+                        class="style-chip ${currentStyle === s.key ? 'selected' : ''}"
+                        data-style-key="${s.key}"
+                        onclick="event.stopPropagation(); selectStyle(${article.id}, '${s.key}')"
+                        title="${escapeHtml(s.description)}${suggested === s.key ? ' (AI suggested)' : ''}"
+                    >
+                        <span class="style-emoji">${s.emoji}</span>
+                        <span class="style-name">${escapeHtml(s.name)}</span>
+                        ${suggested === s.key ? '<span class="style-suggested-dot" title="AI suggested"></span>' : ''}
+                        <span class="style-palette">
+                            ${(s.palette || []).slice(0, 4).map(c => `<i style="background:${c}"></i>`).join('')}
+                        </span>
+                    </button>
+                `).join('')}
+            </div>
+        </div>
+    `;
+}
+
+function renderHookVariants(article) {
+    const variants = article.hook_variants || [];
+    if (variants.length === 0) return '';
+    return `
+        <div class="summary-section">
+            <div class="summary-label">Hook Options (AI wrote ${variants.length})</div>
+            <ol class="hook-variants">
+                ${variants.map((h, i) => `
+                    <li class="hook-variant">
+                        <span class="hook-index">${i + 1}</span>
+                        <span class="hook-text">${escapeHtml(h)}</span>
+                    </li>
+                `).join('')}
+            </ol>
+        </div>
+    `;
+}
+
 function renderSummary(article) {
     if (!article.tldr) {
         return `
@@ -389,6 +468,9 @@ function renderSummary(article) {
                 ${bullets.map(b => `<li>${escapeHtml(b)}</li>`).join('')}
             </ul>
         </div>
+
+        ${renderHookVariants(article)}
+        ${renderStylePicker(article)}
 
         ${article.video_script ? `
             <div class="summary-section">
@@ -609,6 +691,7 @@ document.addEventListener('DOMContentLoaded', () => {
     // Hide empty state initially (show skeleton instead)
     document.getElementById('empty-state').classList.add('hidden');
 
+    loadStyles();
     handleBookmarkletHash();
     fetchArticles();
 

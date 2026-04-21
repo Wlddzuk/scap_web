@@ -48,7 +48,11 @@ if not hasattr(Image, 'ANTIALIAS'):
 
 
 def generate_image_fal(prompt: str, retry_count: int = RETRY_ATTEMPTS) -> Image.Image:
-    """Generate image using FAL.ai FLUX model."""
+    """Generate image using FAL.ai FLUX model.
+
+    The prompt should already include style directives (via visual_styles.apply_style).
+    We append only minimal universal quality tokens.
+    """
     import fal_client
 
     fal_key = os.getenv("FAL_KEY")
@@ -56,14 +60,11 @@ def generate_image_fal(prompt: str, retry_count: int = RETRY_ATTEMPTS) -> Image.
         print("[Image] No FAL_KEY, using gradient")
         return create_gradient_background()
 
-    enhanced_prompt = (
-        f"{prompt}, vibrant bright colors, high contrast, eye-catching, "
-        f"clean composition, vertical 9:16, professional quality, no text no words"
-    )
+    enhanced_prompt = f"{prompt}, professional quality, sharp detail"
 
     for attempt in range(retry_count):
         try:
-            print(f"[Image] Generating: {prompt[:40]}...")
+            print(f"[Image] Generating: {prompt[:60]}...")
             result = fal_client.run(
                 "fal-ai/flux/schnell",
                 arguments={
@@ -276,8 +277,8 @@ def generate_image_prompts(title: str, script: str, num_prompts: int, style: str
 
 
 def generate_themed_images(title: str, script: str, num_images: int = NUM_BODY_IMAGES) -> list:
-    """Generate themed images for video body using parallel workers."""
-    print(f"[Video] Generating {num_images} images in parallel (max {MAX_IMAGE_WORKERS} workers)...")
+    """Fallback: generate themed images when no scene beats are available."""
+    print(f"[Video] Generating {num_images} themed images (fallback path)...")
 
     subjects = extract_story_subjects(title, script)
     style = select_style_with_groq(title, script)
@@ -289,12 +290,16 @@ def generate_themed_images(title: str, script: str, num_images: int = NUM_BODY_I
         setting = subjects.get("setting", "")
         prompts = [f"{kw}, {setting}, {style}" for kw in (keywords * 5)[:num_images]]
 
-    # Parallel image generation
+    return _parallel_image_gen(prompts)
+
+
+def _parallel_image_gen(prompts: list) -> list:
+    """Generate N images in parallel. Returns list[PIL.Image] in prompt order."""
     images = [None] * len(prompts)
     with ThreadPoolExecutor(max_workers=MAX_IMAGE_WORKERS) as executor:
         future_to_idx = {
-            executor.submit(generate_image_fal, prompt): i
-            for i, prompt in enumerate(prompts)
+            executor.submit(generate_image_fal, p): i
+            for i, p in enumerate(prompts)
         }
         for future in as_completed(future_to_idx):
             idx = future_to_idx[future]
@@ -303,22 +308,45 @@ def generate_themed_images(title: str, script: str, num_images: int = NUM_BODY_I
             except Exception as e:
                 print(f"[Video] Image {idx+1} failed: {e}")
                 images[idx] = create_gradient_background()
-
     print(f"[Video] Generated {len(images)} images")
     return images
 
 
-def create_hook_clips(title: str, duration: float = HOOK_DURATION) -> list:
-    """Create rapid-fire hook sequence using parallel image generation."""
-    hook_prompts = [
-        f"extreme macro close-up shot, {title}, ultra sharp detail, dramatic rim lighting, shallow depth of field, cinematic 9:16, hyper-realistic",
-        f"impossible camera angle, {title}, bird's eye view mixed with dutch angle, dramatic shadows, high contrast neon accents, surreal perspective",
-        f"frozen action moment, {title}, motion blur trails, dynamic energy, explosive composition, vibrant saturated colors, dramatic backlighting",
-        f"bold graphic composition, {title}, stark contrast, complementary color explosion, minimalist but striking, professional advertising quality"
+def generate_scene_images(scenes: list, style_key: str) -> list:
+    """Generate one image per scene, style applied consistently."""
+    from visual_styles import apply_style
+
+    prompts = [apply_style(s.get("visual", ""), style_key, is_hook=False) for s in scenes]
+    print(f"[Video] Generating {len(prompts)} scene images in style '{style_key}'...")
+    return _parallel_image_gen(prompts)
+
+
+def create_hook_clips(title: str, duration: float = HOOK_DURATION, style_key: str = None, opening_visual: str = None) -> list:
+    """Create rapid-fire hook sequence. Style-aware when style_key given."""
+    from visual_styles import apply_style
+
+    # Anchor on the opening scene visual if we have one; else derive from title.
+    anchor = (opening_visual or title).strip().rstrip(",.")
+    angle_variations = [
+        f"{anchor}, extreme macro close-up, ultra sharp detail",
+        f"{anchor}, impossible low-angle looking up, dramatic perspective",
+        f"{anchor}, frozen peak action moment, motion blur trails",
+        f"{anchor}, stark silhouette against explosive backdrop",
     ]
 
+    if style_key:
+        hook_prompts = [apply_style(v, style_key, is_hook=True) for v in angle_variations]
+    else:
+        # Legacy path (no style): use old generic punch prompts
+        hook_prompts = [
+            f"extreme macro close-up shot, {title}, ultra sharp detail, dramatic rim lighting, shallow depth of field, cinematic 9:16, hyper-realistic",
+            f"impossible camera angle, {title}, bird's eye view mixed with dutch angle, dramatic shadows, high contrast neon accents, surreal perspective",
+            f"frozen action moment, {title}, motion blur trails, dynamic energy, explosive composition, vibrant saturated colors, dramatic backlighting",
+            f"bold graphic composition, {title}, stark contrast, complementary color explosion, minimalist but striking, professional advertising quality"
+        ]
+
     clip_duration = duration / NUM_HOOK_IMAGES
-    print(f"[Hook] Creating {NUM_HOOK_IMAGES} hook images in parallel...")
+    print(f"[Hook] Creating {NUM_HOOK_IMAGES} hook images in parallel (style: {style_key or 'legacy'})...")
 
     # Generate hook images in parallel
     images = [None] * NUM_HOOK_IMAGES
@@ -365,8 +393,37 @@ def compute_durations(chunks: list, total_time: float) -> list:
     return [max(0.05, d) for d in durations]
 
 
-def generate_video(article_id: int, title: str, script: str) -> str:
-    """Generate TikTok-style video with parallel image generation."""
+def compute_scene_durations(scenes: list, total_time: float) -> list:
+    """Allocate time per scene proportional to its speech length."""
+    if not scenes:
+        return []
+    weights = [max(1, len((s.get("speech") or "").split())) for s in scenes]
+    total_w = sum(weights)
+    if total_w <= 0:
+        return [total_time / len(scenes)] * len(scenes)
+    durations = [total_time * w / total_w for w in weights]
+    durations[-1] += total_time - sum(durations)  # fix drift
+    return [max(0.3, d) for d in durations]
+
+
+def generate_video(
+    article_id: int,
+    title: str,
+    script: str,
+    scenes: list = None,
+    style_key: str = None,
+) -> str:
+    """Generate TikTok-style video.
+
+    Preferred path: scenes + style_key provided (from summarizer).
+    Each scene produces one style-consistent image, and images play in
+    narrative order for their scene's proportional speech duration.
+
+    Fallback path: no scenes -> legacy themed-image generation with
+    chunked text pacing.
+    """
+    from visual_styles import auto_pick_style
+
     videos_dir = Path("static/videos")
     videos_dir.mkdir(parents=True, exist_ok=True)
 
@@ -378,10 +435,12 @@ def generate_video(article_id: int, title: str, script: str) -> str:
     main_video = None
     clips = []
     actual_audio_path = None
+    use_scenes = bool(scenes)
 
     try:
         print(f"\n{'='*50}")
         print(f"[Video] Generating video for article {article_id}")
+        print(f"[Video] Mode: {'scene-based' if use_scenes else 'legacy'} | Style: {style_key or 'auto'}")
         print(f"{'='*50}")
 
         # Step 1: TTS
@@ -391,31 +450,49 @@ def generate_video(article_id: int, title: str, script: str) -> str:
         audio_duration = float(audio.duration)
         print(f"[Video] Audio: {audio_duration:.1f}s")
 
-        # Step 2: Generate images (parallel)
-        print("[Video] Step 2: Generating images...")
-        themed_images = generate_themed_images(title, script, num_images=NUM_BODY_IMAGES)
+        # Step 2: Resolve style (only matters for scene-based path)
+        if use_scenes and not style_key:
+            style_key = auto_pick_style(title, script)
+            print(f"[Video] Auto-picked style: {style_key}")
 
-        # Step 3: Chunk for pacing
-        print("[Video] Step 3: Chunking script...")
-        chunks = chunk_text(script)
-        print(f"[Video] {len(chunks)} chunks")
+        # Step 3: Generate images (parallel)
+        if use_scenes:
+            print("[Video] Step 3: Generating scene-aligned images...")
+            body_images = generate_scene_images(scenes, style_key)
+        else:
+            print("[Video] Step 3: Generating themed images (legacy)...")
+            body_images = generate_themed_images(title, script, num_images=NUM_BODY_IMAGES)
 
-        # Step 4: Hook clips (parallel)
+        # Step 4: Hook sequence (style-aware when we have a style)
         print("[Video] Step 4: Creating hook sequence...")
         hook_len = min(HOOK_DURATION, max(2.0, audio_duration * 0.25))
-        hook_clips = create_hook_clips(title, duration=hook_len)
+        opening_visual = scenes[0].get("visual") if use_scenes and scenes else None
+        hook_clips = create_hook_clips(
+            title,
+            duration=hook_len,
+            style_key=style_key if use_scenes else None,
+            opening_visual=opening_visual,
+        )
         clips.extend(hook_clips)
         print(f"[Video] Hook: {hook_len:.1f}s")
 
         # Step 5: Body clips
         print("[Video] Step 5: Creating body clips...")
         remaining = max(0.1, audio_duration - hook_len)
-        durations = compute_durations(chunks, remaining)
 
-        for i in range(len(chunks)):
-            img = themed_images[i % len(themed_images)]
-            dur = durations[i] if i < len(durations) else DEFAULT_CHUNK_DURATION
-            clips.append(create_clip(img, dur))
+        if use_scenes:
+            durations = compute_scene_durations(scenes, remaining)
+            for i, scene in enumerate(scenes):
+                img = body_images[i] if i < len(body_images) else body_images[-1]
+                dur = durations[i] if i < len(durations) else DEFAULT_CHUNK_DURATION
+                clips.append(create_clip(img, dur))
+        else:
+            chunks = chunk_text(script)
+            durations = compute_durations(chunks, remaining)
+            for i in range(len(chunks)):
+                img = body_images[i % len(body_images)]
+                dur = durations[i] if i < len(durations) else DEFAULT_CHUNK_DURATION
+                clips.append(create_clip(img, dur))
 
         # Step 6: Assemble
         print("[Video] Step 6: Assembling...")

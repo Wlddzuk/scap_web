@@ -21,6 +21,7 @@ load_dotenv()
 from models import db, Article
 from summarizer import summarize_article
 from video_generator import generate_video
+from visual_styles import list_styles, get_style, STYLES as VISUAL_STYLES
 
 # Configure logging
 logging.basicConfig(
@@ -181,8 +182,34 @@ app.config['SQLALCHEMY_TRACK_MODIFICATIONS'] = False
 
 db.init_app(app)
 
+
+def _migrate_schema():
+    """Idempotent SQLite migration: add new columns if they don't exist yet."""
+    from sqlalchemy import text, inspect
+
+    new_cols = [
+        ("scenes", "TEXT"),
+        ("hook_variants", "TEXT"),
+        ("dominant_emotion", "VARCHAR(32)"),
+        ("style", "VARCHAR(32)"),
+    ]
+
+    with app.app_context():
+        inspector = inspect(db.engine)
+        if "articles" not in inspector.get_table_names():
+            return
+        existing = {c["name"] for c in inspector.get_columns("articles")}
+        with db.engine.begin() as conn:
+            for col_name, col_type in new_cols:
+                if col_name not in existing:
+                    conn.execute(text(f"ALTER TABLE articles ADD COLUMN {col_name} {col_type}"))
+                    logger.info(f"Schema migrated: added articles.{col_name}")
+
+
 with app.app_context():
     db.create_all()
+
+_migrate_schema()
 
 
 # Validate API keys on startup
@@ -191,7 +218,6 @@ def validate_api_keys():
     api_keys = {
         'OPENROUTER_API_KEY': os.getenv('OPENROUTER_API_KEY'),
         'GROQ_API_KEY': os.getenv('GROQ_API_KEY'),
-        'MISTRAL_API_KEY': os.getenv('MISTRAL_API_KEY'),
         'GEMINI_API_KEY': os.getenv('GEMINI_API_KEY')
     }
 
@@ -200,7 +226,7 @@ def validate_api_keys():
     if not configured_keys:
         logger.warning(
             "No summarization API keys found! "
-            "Set at least one of: OPENROUTER_API_KEY, GROQ_API_KEY, MISTRAL_API_KEY, or GEMINI_API_KEY"
+            "Set at least one of: OPENROUTER_API_KEY, GROQ_API_KEY, or GEMINI_API_KEY"
         )
     else:
         logger.info(f"Configured API keys: {', '.join(configured_keys)}")
@@ -233,10 +259,24 @@ def run_summarize_in_background(app_context, article_id):
             article.bullets = json.dumps(result['bullets'])
             article.video_script = result['video_script']
             article.hashtags = json.dumps(result.get('hashtags', []))
+
+            # Engagement metadata
+            scenes = result.get('scenes') or []
+            article.scenes = json.dumps(scenes) if scenes else None
+            hook_variants = result.get('hook_variants') or []
+            article.hook_variants = json.dumps(hook_variants) if hook_variants else None
+            article.dominant_emotion = result.get('dominant_emotion') or None
+            suggested = result.get('suggested_style')
+            if suggested and suggested in VISUAL_STYLES:
+                article.style = suggested
+
             article.status = 'summarized'
             article.summarized_at = datetime.now(timezone.utc)
             db.session.commit()
-            logger.info(f"Article {article_id} summarized successfully")
+            logger.info(
+                f"Article {article_id} summarized (scenes={len(scenes)}, "
+                f"style={article.style}, emotion={article.dominant_emotion})"
+            )
 
         except Exception as e:
             logger.error(f"Failed to summarize article {article_id}: {e}", exc_info=True)
@@ -244,7 +284,7 @@ def run_summarize_in_background(app_context, article_id):
             db.session.commit()
 
 
-def run_video_in_background(app_context, article_id):
+def run_video_in_background(app_context, article_id, style_override=None):
     """Run video generation in a background thread."""
     with app_context:
         article = db.session.get(Article, article_id)
@@ -252,11 +292,20 @@ def run_video_in_background(app_context, article_id):
             return
 
         try:
+            scenes = json.loads(article.scenes) if article.scenes else None
+            style_key = style_override or article.style or None
+
             video_path = generate_video(
                 article_id=article.id,
                 title=article.title,
-                script=article.video_script
+                script=article.video_script,
+                scenes=scenes,
+                style_key=style_key,
             )
+
+            # Persist the style that was actually used (in case it was auto-picked inside)
+            if style_override:
+                article.style = style_override
 
             relative_path = os.path.basename(video_path)
             article.video_path = relative_path
@@ -464,7 +513,10 @@ def summarize_article_endpoint(article_id):
 
 @app.route('/api/articles/<int:article_id>/video', methods=['POST'])
 def generate_video_endpoint(article_id):
-    """Trigger video generation for an article (runs in background)."""
+    """Trigger video generation for an article (runs in background).
+
+    Optional JSON body: {"style": "manga"} overrides the auto-picked style.
+    """
     article = db.session.get(Article, article_id)
     if not article:
         return jsonify({'error': 'Article not found'}), 404
@@ -475,13 +527,17 @@ def generate_video_endpoint(article_id):
     if article.status in ('summarizing', 'generating_video'):
         return jsonify({'error': 'Article is already being processed'}), 409
 
+    payload = request.get_json(silent=True) or {}
+    style_override = payload.get('style')
+    if style_override and style_override not in VISUAL_STYLES:
+        return jsonify({'error': f'Unknown style: {style_override}'}), 400
+
     article.status = 'generating_video'
     db.session.commit()
 
-    # Run in background thread
     thread = Thread(
         target=run_video_in_background,
-        args=(app.app_context(), article.id)
+        args=(app.app_context(), article.id, style_override)
     )
     thread.daemon = True
     thread.start()
@@ -490,6 +546,12 @@ def generate_video_endpoint(article_id):
         'message': 'Video generation started',
         'article': article.to_dict()
     }), 202
+
+
+@app.route('/api/styles', methods=['GET'])
+def list_styles_endpoint():
+    """Return available visual style presets for UI consumption."""
+    return jsonify({'styles': list_styles()})
 
 
 @app.route('/api/health', methods=['GET'])
