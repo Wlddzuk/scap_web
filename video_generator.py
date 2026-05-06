@@ -29,12 +29,15 @@ FPS = 30
 HOOK_DURATION = 5.0
 NUM_HOOK_IMAGES = 4
 
-# AI video hook (opt-in). When set, the 5s hook becomes a single FAL video clip
-# instead of 4 stills with Ken Burns zoom. Falls back to image hook on any
-# failure. Models tested: fal-ai/ltx-video (cheap/fast), fal-ai/kling-video/v1/standard/text-to-video,
+# AI video hook. When the per-request `use_video_hook` flag is True (set by the
+# UI toggle), or when HOOK_VIDEO_MODEL is set in the env, the 5s hook becomes a
+# single FAL video clip instead of 4 stills with Ken Burns zoom. Falls back to
+# image hook on any failure.
+# Models tested: fal-ai/ltx-video (cheap/fast), fal-ai/kling-video/v1/standard/text-to-video,
 # fal-ai/minimax/video-01.
 HOOK_VIDEO_MODEL = os.getenv("HOOK_VIDEO_MODEL", "").strip()
 HOOK_VIDEO_ASPECT = os.getenv("HOOK_VIDEO_ASPECT", "9:16")
+DEFAULT_HOOK_VIDEO_MODEL = "fal-ai/ltx-video"  # used when UI toggle is on and env is empty
 
 # Body image count (reduced from 20 for speed)
 NUM_BODY_IMAGES = 14
@@ -458,27 +461,47 @@ def generate_scene_images(scenes: list, style_key: str) -> list:
     return _parallel_image_gen(prompts)
 
 
-def create_hook_clips(title: str, duration: float = HOOK_DURATION, style_key: str = None, opening_visual: str = None) -> list:
+def create_hook_clips(
+    title: str,
+    duration: float = HOOK_DURATION,
+    style_key: str = None,
+    opening_visual: str = None,
+    use_video_hook: bool | None = None,
+) -> list:
     """Create the hook sequence. Returns list[Clip].
 
-    If HOOK_VIDEO_MODEL is set, tries to fetch a single AI video clip from FAL
-    (one clip in the returned list). On any failure, falls back to the legacy
-    4-stills-with-Ken-Burns hook so a flaky video model never breaks the pipeline.
+    Hook mode resolution:
+      - use_video_hook=True  -> AI video hook (env model OR DEFAULT_HOOK_VIDEO_MODEL)
+      - use_video_hook=False -> always image hook
+      - use_video_hook=None  -> env-driven (HOOK_VIDEO_MODEL set => video, else image)
+
+    On any failure of the video path, falls back to the 4-stills image hook so
+    a flaky video model never breaks the pipeline. The hook video is generated
+    with the SAME style preset (apply_style + style_key) as the body images,
+    so the whole video reads as one consistent visual identity.
     """
     from visual_styles import apply_style
 
     # Anchor on the opening scene visual if we have one; else derive from title.
     anchor = (opening_visual or title).strip().rstrip(",.")
 
-    # --- AI video hook path (opt-in) ---
-    if HOOK_VIDEO_MODEL:
+    # Resolve which hook mode to run.
+    if use_video_hook is True:
+        video_model = HOOK_VIDEO_MODEL or DEFAULT_HOOK_VIDEO_MODEL
+    elif use_video_hook is False:
+        video_model = ""
+    else:
+        video_model = HOOK_VIDEO_MODEL  # env-driven default
+
+    # --- AI video hook path ---
+    if video_model:
         motion_prompt = f"{anchor}, dramatic camera push-in, kinetic motion, dynamic energy"
         if style_key:
             video_prompt = apply_style(motion_prompt, style_key, is_hook=True)
         else:
             video_prompt = f"{motion_prompt}, cinematic lighting, vertical 9:16, high energy, no text"
 
-        local_mp4 = generate_hook_video_fal(video_prompt, HOOK_VIDEO_MODEL)
+        local_mp4 = generate_hook_video_fal(video_prompt, video_model)
         if local_mp4:
             try:
                 vclip = load_hook_video_clip(local_mp4, duration)
@@ -582,6 +605,7 @@ def generate_video(
     scenes: list = None,
     style_key: str = None,
     emotion: str = None,
+    use_video_hook: bool | None = None,
 ) -> str:
     """Generate TikTok-style video.
 
@@ -623,8 +647,15 @@ def generate_video(
         audio_duration = float(audio.duration)
         print(f"[Video] Audio: {audio_duration:.1f}s")
 
-        # Step 2: Resolve style (only matters for scene-based path)
-        if use_scenes and not style_key:
+        # Step 2: Resolve style. Always resolve when video hook is on (legacy
+        # path included) so the AI video clip is generated with the SAME style
+        # preset as the body images — otherwise the hook looks alien next to
+        # the rest of the video.
+        will_use_video_hook = (
+            use_video_hook is True
+            or (use_video_hook is None and bool(HOOK_VIDEO_MODEL))
+        )
+        if (use_scenes or will_use_video_hook) and not style_key:
             style_key = auto_pick_style(title, script)
             print(f"[Video] Auto-picked style: {style_key}")
 
@@ -643,8 +674,11 @@ def generate_video(
         hook_clips = create_hook_clips(
             title,
             duration=hook_len,
-            style_key=style_key if use_scenes else None,
+            # Pass style_key whenever we have one — even on the legacy path —
+            # so the video hook (if active) matches the rest visually.
+            style_key=style_key,
             opening_visual=opening_visual,
+            use_video_hook=use_video_hook,
         )
         clips.extend(hook_clips)
         print(f"[Video] Hook: {hook_len:.1f}s")

@@ -163,6 +163,22 @@ function selectStyle(articleId, styleKey) {
     }
 }
 
+function getVideoHookPref() {
+    // localStorage value is the source of truth; checkbox is its UI mirror.
+    return localStorage.getItem('clipper_video_hook') === '1';
+}
+
+function onHookToggleChange() {
+    const cb = document.getElementById('video-hook-toggle');
+    if (!cb) return;
+    localStorage.setItem('clipper_video_hook', cb.checked ? '1' : '0');
+}
+
+function syncHookToggle() {
+    const cb = document.getElementById('video-hook-toggle');
+    if (cb) cb.checked = getVideoHookPref();
+}
+
 async function generateVideo(articleId) {
     const btn = document.querySelector(`[data-video="${articleId}"]`);
     if (btn) {
@@ -172,14 +188,20 @@ async function generateVideo(articleId) {
 
     const article = articles.find(a => a.id === articleId);
     const chosenStyle = selectedStyleByArticle[articleId] || (article && article.style) || null;
+    const useVideoHook = getVideoHookPref();
 
-    showToast(`Generating video${chosenStyle ? ' (' + chosenStyle + ')' : ''} — this may take a few minutes`, 'info');
+    const hookLabel = useVideoHook ? ' · AI video hook' : '';
+    showToast(`Generating video${chosenStyle ? ' (' + chosenStyle + ')' : ''}${hookLabel} — this may take a few minutes`, 'info');
 
     try {
+        const body = {};
+        if (chosenStyle) body.style = chosenStyle;
+        body.use_video_hook = useVideoHook;
+
         const response = await fetch(`${API_BASE}/api/articles/${articleId}/video`, {
             method: 'POST',
             headers: { 'Content-Type': 'application/json' },
-            body: JSON.stringify(chosenStyle ? { style: chosenStyle } : {})
+            body: JSON.stringify(body)
         });
 
         const data = await response.json();
@@ -781,6 +803,7 @@ document.addEventListener('DOMContentLoaded', () => {
     // Hide empty state initially (show skeleton instead)
     document.getElementById('empty-state').classList.add('hidden');
 
+    syncHookToggle();
     loadStyles();
     handleBookmarkletHash();
     fetchArticles();
