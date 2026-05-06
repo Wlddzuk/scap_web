@@ -39,6 +39,14 @@
                         </button>
                     </div>
                 </form>
+                <label class="hook-toggle" for="video-hook-toggle" title="When on, the 5-second opening uses a real AI video clip from FAL (slower, costs more, more cinematic). When off, it's 4 stills with a Ken Burns zoom.">
+                    <input type="checkbox" id="video-hook-toggle" onchange="onHookToggleChange()">
+                    <span class="hook-toggle-track"><span class="hook-toggle-thumb"></span></span>
+                    <span class="hook-toggle-label">
+                        <strong>AI video hook</strong>
+                        <span class="hook-toggle-hint">5s motion clip vs 4 stills · slower, costs more · matches image style</span>
+                    </span>
+                </label>
             </div>
 
             <!-- Progress Banner (shows during processing) -->

@@ -1,16 +1,14 @@
 """Gunicorn configuration for production."""
 
-import multiprocessing
-
 # Server socket
 bind = "0.0.0.0:5050"
 backlog = 2048
 
-# Worker processes
-workers = multiprocessing.cpu_count() * 2 + 1
+# Worker processes — capped at 2 to stay within RAM budget alongside Kokoro/PyTorch
+workers = 2
 worker_class = "sync"
 worker_connections = 1000
-timeout = 120
+timeout = 300
 keepalive = 5
 
 # Logging
@@ -29,7 +27,3 @@ umask = 0
 user = None
 group = None
 tmp_upload_dir = None
-
-# SSL (if needed)
-# keyfile = "path/to/keyfile"
-# certfile = "path/to/certfile"

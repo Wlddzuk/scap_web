@@ -331,7 +331,7 @@ def run_summarize_in_background(app_context, article_id):
             db.session.commit()
 
 
-def run_video_in_background(app_context, article_id, style_override=None):
+def run_video_in_background(app_context, article_id, style_override=None, use_video_hook=None):
     """Run video generation in a background thread, with a watchdog timeout.
 
     If generation exceeds VIDEO_TIMEOUT_SECONDS, a separate timer thread flips
@@ -376,6 +376,7 @@ def run_video_in_background(app_context, article_id, style_override=None):
                     scenes=scenes,
                     style_key=style_key,
                     emotion=article.dominant_emotion,
+                    use_video_hook=use_video_hook,
                 )
 
                 # Re-fetch: watchdog may have already marked us failed while we
@@ -627,12 +628,20 @@ def generate_video_endpoint(article_id):
     if style_override and style_override not in VISUAL_STYLES:
         return jsonify({'error': f'Unknown style: {style_override}'}), 400
 
+    # `use_video_hook` is a tri-state: True/False/None.
+    #   True  -> AI video hook (FAL); False -> image hook; None -> env default.
+    raw_hook = payload.get('use_video_hook', None)
+    if raw_hook is None:
+        use_video_hook = None
+    else:
+        use_video_hook = bool(raw_hook)
+
     article.status = 'generating_video'
     db.session.commit()
 
     thread = Thread(
         target=run_video_in_background,
-        args=(app.app_context(), article.id, style_override)
+        args=(app.app_context(), article.id, style_override, use_video_hook)
     )
     thread.daemon = True
     thread.start()

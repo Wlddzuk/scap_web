@@ -14,6 +14,7 @@
  */
 
 (function () {
+    // Change this to your production URL when deployed (e.g. 'https://clipper.example.com')
     var DASHBOARD_URL = 'http://localhost:5050';
 
     // Extract article content (DOM access works even with strict CSP)
