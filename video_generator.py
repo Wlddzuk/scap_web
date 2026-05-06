@@ -13,7 +13,7 @@ from io import BytesIO
 from concurrent.futures import ThreadPoolExecutor, as_completed
 
 import numpy as np
-from moviepy.editor import ImageClip, AudioFileClip, concatenate_videoclips, vfx
+from moviepy.editor import ImageClip, AudioFileClip, VideoFileClip, concatenate_videoclips, vfx
 from PIL import Image, ImageDraw
 import requests
 from dotenv import load_dotenv
@@ -28,6 +28,13 @@ FPS = 30
 # Hook settings
 HOOK_DURATION = 5.0
 NUM_HOOK_IMAGES = 4
+
+# AI video hook (opt-in). When set, the 5s hook becomes a single FAL video clip
+# instead of 4 stills with Ken Burns zoom. Falls back to image hook on any
+# failure. Models tested: fal-ai/ltx-video (cheap/fast), fal-ai/kling-video/v1/standard/text-to-video,
+# fal-ai/minimax/video-01.
+HOOK_VIDEO_MODEL = os.getenv("HOOK_VIDEO_MODEL", "").strip()
+HOOK_VIDEO_ASPECT = os.getenv("HOOK_VIDEO_ASPECT", "9:16")
 
 # Body image count (reduced from 20 for speed)
 NUM_BODY_IMAGES = 14
@@ -89,6 +96,86 @@ def generate_image_fal(prompt: str, retry_count: int = RETRY_ATTEMPTS) -> Image.
 
     print("[Image] Failed, using gradient")
     return create_gradient_background()
+
+
+def generate_hook_video_fal(prompt: str, model: str) -> str | None:
+    """Generate a short AI video clip via FAL. Returns local mp4 path, or None on failure.
+
+    Caller is responsible for unlinking the returned path. We write to the system
+    temp dir (not static/) so failures don't leak public files.
+    """
+    import fal_client
+    import tempfile
+
+    if not os.getenv("FAL_KEY"):
+        print("[HookVideo] No FAL_KEY, skipping video hook")
+        return None
+
+    try:
+        print(f"[HookVideo] Generating via {model}: {prompt[:80]}...")
+        result = fal_client.run(
+            model,
+            arguments={"prompt": prompt, "aspect_ratio": HOOK_VIDEO_ASPECT},
+        )
+
+        video_url = None
+        if isinstance(result, dict):
+            video_field = result.get("video")
+            if isinstance(video_field, dict):
+                video_url = video_field.get("url")
+            elif isinstance(video_field, str):
+                video_url = video_field
+            elif "url" in result:
+                video_url = result["url"]
+
+        if not video_url:
+            print(f"[HookVideo] No video URL in response keys={list(result) if isinstance(result, dict) else type(result)}")
+            return None
+
+        fd, local_path = tempfile.mkstemp(suffix=".mp4", prefix="hook_")
+        os.close(fd)
+        response = requests.get(video_url, timeout=120, stream=True)
+        response.raise_for_status()
+        with open(local_path, "wb") as f:
+            for chunk in response.iter_content(chunk_size=65536):
+                f.write(chunk)
+
+        print(f"[HookVideo] Saved: {local_path}")
+        return local_path
+    except Exception as e:
+        print(f"[HookVideo] Failed: {e}")
+        return None
+
+
+def load_hook_video_clip(video_path: str, target_duration: float):
+    """Load a downloaded FAL video as a moviepy clip fitted to 1080x1920 / target_duration."""
+    clip = VideoFileClip(video_path).without_audio()
+
+    if clip.duration > target_duration:
+        clip = clip.subclip(0, target_duration)
+    elif clip.duration < target_duration:
+        # If close, ease via speed; otherwise loop.
+        if clip.duration >= target_duration * 0.7:
+            clip = clip.fx(vfx.speedx, clip.duration / target_duration)
+        else:
+            loops = int(target_duration / clip.duration) + 1
+            clip = concatenate_videoclips([clip] * loops, method="compose").subclip(0, target_duration)
+
+    cw, ch = clip.size
+    target_ratio = VIDEO_WIDTH / VIDEO_HEIGHT
+    src_ratio = cw / ch
+
+    if abs(src_ratio - target_ratio) > 0.01:
+        if src_ratio > target_ratio:
+            new_w = int(ch * target_ratio)
+            x_center = cw // 2
+            clip = clip.crop(x1=x_center - new_w // 2, x2=x_center + new_w // 2)
+        else:
+            new_h = int(cw / target_ratio)
+            y_center = ch // 2
+            clip = clip.crop(y1=y_center - new_h // 2, y2=y_center + new_h // 2)
+
+    return clip.resize((VIDEO_WIDTH, VIDEO_HEIGHT))
 
 
 def create_gradient_background() -> Image.Image:
@@ -372,11 +459,43 @@ def generate_scene_images(scenes: list, style_key: str) -> list:
 
 
 def create_hook_clips(title: str, duration: float = HOOK_DURATION, style_key: str = None, opening_visual: str = None) -> list:
-    """Create rapid-fire hook sequence. Style-aware when style_key given."""
+    """Create the hook sequence. Returns list[Clip].
+
+    If HOOK_VIDEO_MODEL is set, tries to fetch a single AI video clip from FAL
+    (one clip in the returned list). On any failure, falls back to the legacy
+    4-stills-with-Ken-Burns hook so a flaky video model never breaks the pipeline.
+    """
     from visual_styles import apply_style
 
     # Anchor on the opening scene visual if we have one; else derive from title.
     anchor = (opening_visual or title).strip().rstrip(",.")
+
+    # --- AI video hook path (opt-in) ---
+    if HOOK_VIDEO_MODEL:
+        motion_prompt = f"{anchor}, dramatic camera push-in, kinetic motion, dynamic energy"
+        if style_key:
+            video_prompt = apply_style(motion_prompt, style_key, is_hook=True)
+        else:
+            video_prompt = f"{motion_prompt}, cinematic lighting, vertical 9:16, high energy, no text"
+
+        local_mp4 = generate_hook_video_fal(video_prompt, HOOK_VIDEO_MODEL)
+        if local_mp4:
+            try:
+                vclip = load_hook_video_clip(local_mp4, duration)
+                # Stash temp path on the clip so generate_video's finally can unlink it.
+                vclip._scap_temp_path = local_mp4
+                print(f"[Hook] Using AI video hook ({duration:.1f}s)")
+                return [vclip]
+            except Exception as e:
+                print(f"[Hook] Video clip load failed: {e}, falling back to image hook")
+                try:
+                    Path(local_mp4).unlink(missing_ok=True)
+                except OSError:
+                    pass
+        else:
+            print("[Hook] Video hook unavailable, falling back to image hook")
+
+    # --- Legacy image-based hook ---
     angle_variations = [
         f"{anchor}, extreme macro close-up, ultra sharp detail",
         f"{anchor}, impossible low-angle looking up, dramatic perspective",
@@ -598,6 +717,12 @@ def generate_video(
                 c.close()
             except Exception:
                 pass
+            temp_path = getattr(c, "_scap_temp_path", None)
+            if temp_path:
+                try:
+                    Path(temp_path).unlink(missing_ok=True)
+                except OSError:
+                    pass
         try:
             if actual_audio_path:
                 Path(actual_audio_path).unlink(missing_ok=True)
