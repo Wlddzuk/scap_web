@@ -17,6 +17,7 @@ class Article(db.Model):
     content = db.Column(db.Text, nullable=False)
     hero_image = db.Column(db.String(2048), nullable=True)
     site_name = db.Column(db.String(256), nullable=True)
+    viral_score = db.Column(db.Float, nullable=True)
 
     # Status tracking
     status = db.Column(db.String(50), default='scraped')
@@ -25,6 +26,7 @@ class Article(db.Model):
     scraped_at = db.Column(db.DateTime, default=lambda: datetime.now(timezone.utc))
     summarized_at = db.Column(db.DateTime, nullable=True)
     video_generated_at = db.Column(db.DateTime, nullable=True)
+    carousel_generated_at = db.Column(db.DateTime, nullable=True)
 
     # Summary fields (populated after AI processing)
     tldr = db.Column(db.Text, nullable=True)
@@ -34,6 +36,10 @@ class Article(db.Model):
 
     # Video output
     video_path = db.Column(db.String(512), nullable=True)
+
+    # Carousel output
+    carousel_dir = db.Column(db.String(512), nullable=True)   # e.g. "42"
+    carousel_audio = db.Column(db.String(512), nullable=True)  # e.g. "voiceover.wav"
 
     def to_dict(self, include_full_content=False):
         """Convert to dictionary for JSON response.
@@ -51,15 +57,19 @@ class Article(db.Model):
             'content': self.content[:500] + '...' if len(self.content) > 500 else self.content,
             'hero_image': self.hero_image,
             'site_name': self.site_name,
+            'viral_score': self.viral_score,
             'status': self.status,
             'scraped_at': self.scraped_at.isoformat() if self.scraped_at else None,
             'summarized_at': self.summarized_at.isoformat() if self.summarized_at else None,
             'video_generated_at': self.video_generated_at.isoformat() if self.video_generated_at else None,
+            'carousel_generated_at': self.carousel_generated_at.isoformat() if self.carousel_generated_at else None,
             'tldr': self.tldr,
             'bullets': json.loads(self.bullets) if self.bullets else None,
             'video_script': self.video_script,
             'hashtags': json.loads(self.hashtags) if self.hashtags else None,
             'video_path': self.video_path,
+            'carousel_dir': self.carousel_dir,
+            'carousel_audio': self.carousel_audio,
         }
 
         if include_full_content:

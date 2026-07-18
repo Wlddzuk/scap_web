@@ -1,16 +1,15 @@
 # Flask Backend
 flask==3.0.0
 flask-cors==4.0.0
-
-# Database
 flask-sqlalchemy==3.1.1
 
-# AI - Gemini & Groq
+# AI APIs
 google-generativeai==0.8.3
+google-genai>=2.11.0,<3.0.0
 groq>=0.4.0
+fal-client>=0.5.0
 
-# TTS - Google & Kokoro
-gTTS==2.5.3
+# TTS - Kokoro
 kokoro>=0.9.4
 soundfile>=0.13.0
 torch>=2.0.0,<2.5.0
@@ -18,11 +17,20 @@ transformers>=4.40.0,<4.44.0
 
 # Video Generation
 moviepy==1.0.3
-Pillow==10.4.0
+Pillow>=10.0.0
+numpy>=1.24.0
+faster-whisper>=1.1.0,<2.0.0
 
 # Web Scraping
 requests>=2.31.0
 beautifulsoup4>=4.12.0
+feedparser>=6.0.11,<7.0.0
+
+# QR Code (mobile transfer)
+qrcode[pil]>=7.4
+
+# Discord Bot
+discord.py>=2.3.0
 
 # Environment
 python-dotenv==1.0.0

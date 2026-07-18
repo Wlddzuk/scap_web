@@ -1,0 +1,22 @@
+[Unit]
+Description=Clipper - Article to Video + Discord Bot
+After=network.target
+
+[Service]
+User=ubuntu
+Group=ubuntu
+WorkingDirectory=/var/www/clipper
+Environment="PATH=/var/www/clipper/.venv/bin"
+EnvironmentFile=/var/www/clipper/.env
+ExecStart=/var/www/clipper/.venv/bin/python discord_bot.py
+Restart=always
+RestartSec=10
+
+StandardOutput=journal
+StandardError=journal
+
+NoNewPrivileges=true
+PrivateTmp=true
+
+[Install]
+WantedBy=multi-user.target

@@ -1,15 +1,16 @@
-# Production Dockerfile for Article Scraper MVP
+# Clipper - Article to TikTok Video Generator + Discord Bot
+# Optimized for Oracle Cloud Free Tier (ARM64)
 FROM python:3.11-slim
 
-# Set working directory
 WORKDIR /app
 
-# Install system dependencies
-RUN apt-get update && apt-get install -y \
+# Install system dependencies (ffmpeg for video, espeak for TTS fallback)
+RUN apt-get update && apt-get install -y --no-install-recommends \
     ffmpeg \
+    espeak-ng \
     && rm -rf /var/lib/apt/lists/*
 
-# Copy requirements first for better caching
+# Copy requirements first for Docker layer caching
 COPY requirements.txt .
 RUN pip install --no-cache-dir -r requirements.txt
 
@@ -17,19 +18,17 @@ RUN pip install --no-cache-dir -r requirements.txt
 COPY . .
 
 # Create necessary directories
-RUN mkdir -p instance static/videos
+RUN mkdir -p instance static/videos static/carousels
 
-# Create non-root user for security
+# Create non-root user
 RUN useradd -m -u 1000 appuser && \
     chown -R appuser:appuser /app
 USER appuser
 
-# Expose port
 EXPOSE 5050
 
-# Health check
-HEALTHCHECK --interval=30s --timeout=10s --start-period=5s --retries=3 \
+HEALTHCHECK --interval=30s --timeout=10s --start-period=30s --retries=3 \
     CMD python -c "import requests; requests.get('http://localhost:5050/api/health', timeout=5)"
 
-# Run application
-CMD ["python", "app.py"]
+# Run the Discord bot (which also starts Flask in background)
+CMD ["python", "discord_bot.py"]

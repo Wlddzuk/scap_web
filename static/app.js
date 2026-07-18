@@ -53,6 +53,7 @@ function articlesChanged(prev, next) {
         if (prev[i].id !== next[i].id ||
             prev[i].status !== next[i].status ||
             prev[i].video_path !== next[i].video_path ||
+            prev[i].carousel_dir !== next[i].carousel_dir ||
             prev[i].tldr !== next[i].tldr) {
             return true;
         }
@@ -70,7 +71,9 @@ async function scrapeUrl(event) {
     if (!url) return;
 
     scrapeBtn.disabled = true;
-    scrapeBtn.textContent = 'Scraping...';
+    scrapeBtn.classList.add('is-loading');
+    scrapeBtn.innerHTML = 'Scraping...<div class="btn-loading-bar"></div>';
+
     showToast('Fetching article...', 'info');
 
     try {
@@ -98,7 +101,8 @@ async function scrapeUrl(event) {
         showToast('Failed to scrape article', 'error');
     } finally {
         scrapeBtn.disabled = false;
-        scrapeBtn.textContent = 'Scrape';
+        scrapeBtn.classList.remove('is-loading');
+        scrapeBtn.innerHTML = 'Scrape';
     }
 }
 
@@ -140,7 +144,7 @@ async function summarizeArticle(articleId) {
     }
 }
 
-async function generateVideo(articleId) {
+async function generateVideo(articleId, imageSource = 'ai') {
     const btn = document.querySelector(`[data-video="${articleId}"]`);
     if (btn) {
         btn.disabled = true;
@@ -151,7 +155,9 @@ async function generateVideo(articleId) {
 
     try {
         const response = await fetch(`${API_BASE}/api/articles/${articleId}/video`, {
-            method: 'POST'
+            method: 'POST',
+            headers: { 'Content-Type': 'application/json' },
+            body: JSON.stringify({ image_source: imageSource })
         });
 
         const data = await response.json();
@@ -178,6 +184,44 @@ async function generateVideo(articleId) {
     }
 }
 
+async function generateCarousel(articleId, imageSource = 'ai') {
+    showToast('Generating photo carousel - this may take a few minutes', 'info');
+
+    try {
+        const response = await fetch(`${API_BASE}/api/articles/${articleId}/carousel`, {
+            method: 'POST',
+            headers: { 'Content-Type': 'application/json' },
+            body: JSON.stringify({ image_source: imageSource })
+        });
+
+        const data = await response.json();
+
+        if (response.ok) {
+            showToast('Photo carousel generated!', 'success');
+            await fetchArticles();
+            expandedArticles.add(articleId);
+            renderArticles();
+        } else {
+            showToast(data.error || 'Failed to generate carousel', 'error');
+        }
+    } catch (error) {
+        console.error('Error generating carousel:', error);
+        showToast('Failed to generate carousel', 'error');
+    }
+}
+
+function generateOutput(articleId) {
+    const formatSelect = document.querySelector(`[data-format-select="${articleId}"]`);
+    const sourceSelect = document.querySelector(`[data-source-select="${articleId}"]`);
+    const format = formatSelect ? formatSelect.value : 'video';
+    const imageSource = sourceSelect ? sourceSelect.value : 'ai';
+    if (format === 'carousel') {
+        generateCarousel(articleId, imageSource);
+    } else {
+        generateVideo(articleId, imageSource);
+    }
+}
+
 async function deleteArticle(articleId) {
     if (!confirm('Delete this article and its generated content?')) return;
 
@@ -196,6 +240,65 @@ async function deleteArticle(articleId) {
     } catch (error) {
         console.error('Error deleting article:', error);
         showToast('Failed to delete article', 'error');
+    }
+}
+
+// ============================================
+// QR Code Modal
+// ============================================
+
+function showQrModal(articleId, title, type = 'carousel') {
+    // Remove existing modal
+    closeQrModal();
+
+    const modal = document.createElement('div');
+    modal.id = 'qr-modal';
+    modal.className = 'qr-modal-overlay';
+    modal.onclick = (e) => { if (e.target === modal) closeQrModal(); };
+
+    const shortTitle = title.length > 50 ? title.slice(0, 50) + '...' : title;
+    const qrUrl = type === 'video'
+        ? `/api/articles/${articleId}/video/qr`
+        : `/api/articles/${articleId}/carousel/qr`;
+
+    const steps = type === 'video'
+        ? `<div class="qr-step">1️⃣ Scan QR → opens mobile page</div>
+           <div class="qr-step">2️⃣ Tap "Save Video" → saves to Camera Roll</div>
+           <div class="qr-step">3️⃣ Open TikTok → Create → Upload from Camera Roll</div>`
+        : `<div class="qr-step">1️⃣ Scan QR → opens mobile page</div>
+           <div class="qr-step">2️⃣ Long-press each image → "Save to Photos"</div>
+           <div class="qr-step">3️⃣ Open TikTok → Photo Mode → select from Camera Roll</div>`;
+
+    const typeLabel = type === 'video' ? 'Video' : 'Photo Carousel';
+
+    modal.innerHTML = `
+        <div class="qr-modal-content">
+            <button class="qr-modal-close" onclick="closeQrModal()">&times;</button>
+            <div class="qr-modal-icon">📱</div>
+            <h3 class="qr-modal-title">Send ${typeLabel} to Phone</h3>
+            <p class="qr-modal-subtitle">${shortTitle}</p>
+            <div class="qr-modal-code">
+                <img src="${qrUrl}" alt="QR Code" class="qr-img">
+            </div>
+            <p class="qr-modal-instructions">
+                Scan this QR code with your iPhone camera.<br>
+                Make sure your phone is on the <strong>same WiFi</strong> network.
+            </p>
+            <div class="qr-modal-steps">
+                ${steps}
+            </div>
+        </div>
+    `;
+
+    document.body.appendChild(modal);
+    requestAnimationFrame(() => modal.classList.add('active'));
+}
+
+function closeQrModal() {
+    const modal = document.getElementById('qr-modal');
+    if (modal) {
+        modal.classList.remove('active');
+        setTimeout(() => modal.remove(), 200);
     }
 }
 
@@ -222,13 +325,17 @@ function getFilteredArticles() {
 // ============================================
 
 function updateProgressBanner() {
+    const bannerContainer = document.querySelector('.progress-banner-container');
     const banner = document.getElementById('progress-banner');
     const text = document.getElementById('progress-text');
-    const processing = articles.filter(a => ['summarizing', 'generating_video'].includes(a.status));
+    const processing = articles.filter(a => ['summarizing', 'generating_video', 'generating_carousel'].includes(a.status));
 
     if (processing.length > 0) {
         const names = processing.map(a => {
-            const label = a.status === 'summarizing' ? 'Summarizing' : 'Generating video for';
+            let label = 'Processing';
+            if (a.status === 'summarizing') label = 'Summarizing';
+            else if (a.status === 'generating_video') label = 'Generating video for';
+            else if (a.status === 'generating_carousel') label = 'Generating carousel for';
             const short = a.title.length > 40 ? a.title.slice(0, 40) + '...' : a.title;
             return `${label}: ${short}`;
         });
@@ -356,6 +463,12 @@ function getStatusBadges(article) {
         badges.push('<span class="badge badge-video">Video Ready</span>');
     }
 
+    if (article.status === 'generating_carousel') {
+        badges.push('<span class="badge badge-processing">Generating Carousel</span>');
+    } else if (article.carousel_dir) {
+        badges.push('<span class="badge badge-carousel">Carousel Ready</span>');
+    }
+
     if (article.status === 'failed') {
         badges.push('<span class="badge badge-failed">Failed</span>');
     }
@@ -397,12 +510,54 @@ function renderSummary(article) {
             </div>
         ` : ''}
 
-        ${article.video_path ? `
+    ${article.video_path ? `
             <div class="video-container">
                 <video controls preload="metadata">
                     <source src="/videos/${encodeURIComponent(article.video_path)}" type="video/mp4">
                     Your browser does not support the video tag.
                 </video>
+            </div>
+            <div class="video-transfer-row">
+                <a href="/videos/${encodeURIComponent(article.video_path)}" 
+                   class="btn btn-action btn-carousel-dl" download>
+                    📦 Download Video
+                </a>
+                <button class="btn btn-action btn-video-qr" 
+                        onclick="showQrModal(${article.id}, '${escapeHtml(article.title)}', 'video')">
+                    📱 Send to Phone
+                </button>
+            </div>
+        ` : ''}
+
+        ${article.carousel_dir ? `
+            <div class="carousel-preview">
+                <div class="carousel-header-row">
+                    <div class="carousel-label">Photo Carousel (${6} slides)</div>
+                    <div class="carousel-actions-row">
+                        <a href="/api/articles/${article.id}/carousel/download" 
+                           class="btn btn-action btn-carousel-dl" download>
+                            📦 Download ZIP
+                        </a>
+                        <button class="btn btn-action btn-carousel-qr" 
+                                onclick="showQrModal(${article.id}, '${escapeHtml(article.title)}')">
+                            📱 Send to Phone
+                        </button>
+                    </div>
+                </div>
+                <div class="carousel-thumbnails">
+                    ${[1, 2, 3, 4, 5, 6].map(i => `
+                        <img src="/carousels/${article.id}/slide_${i}.png" 
+                             alt="Slide ${i}" 
+                             class="carousel-thumb"
+                             loading="lazy"
+                             onclick="window.open(this.src, '_blank')">
+                    `).join('')}
+                </div>
+                ${article.carousel_audio ? `
+                    <audio controls preload="metadata" class="carousel-audio">
+                        <source src="/carousels/${article.id}/${article.carousel_audio}">
+                    </audio>
+                ` : ''}
             </div>
         ` : ''}
 
@@ -424,13 +579,13 @@ function renderSummary(article) {
 
 function renderActions(article) {
     const canSummarize = article.status !== 'summarizing';
-    const canGenerateVideo = article.video_script && article.status !== 'generating_video';
-    const isProcessing = ['summarizing', 'generating_video'].includes(article.status);
+    const canGenerate = article.video_script && !['generating_video', 'generating_carousel'].includes(article.status);
+    const isProcessing = ['summarizing', 'generating_video', 'generating_carousel'].includes(article.status);
 
     return `
         <div class="article-actions">
             <button
-                class="btn btn-primary"
+                class="btn btn-action"
                 data-summarize="${article.id}"
                 onclick="summarizeArticle(${article.id})"
                 ${!canSummarize || isProcessing ? 'disabled' : ''}
@@ -438,17 +593,26 @@ function renderActions(article) {
                 ${article.tldr ? 'Re-Summarize' : 'Summarize'}
             </button>
 
-            <button
-                class="btn btn-success"
-                data-video="${article.id}"
-                onclick="generateVideo(${article.id})"
-                ${!canGenerateVideo || isProcessing ? 'disabled' : ''}
-            >
-                ${article.video_path ? 'Regenerate Video' : 'Generate Video'}
-            </button>
+            <div class="generate-group">
+                <select class="output-format-select" data-format-select="${article.id}" ${!canGenerate || isProcessing ? 'disabled' : ''}>
+                    <option value="video">Classic Video</option>
+                    <option value="carousel">Photo Carousel</option>
+                </select>
+                <select class="output-format-select" data-source-select="${article.id}" ${!canGenerate || isProcessing ? 'disabled' : ''}>
+                    <option value="ai">🤖 AI Images</option>
+                    <option value="stock">📷 Stock Photos</option>
+                </select>
+                <button
+                    class="btn btn-action btn-success"
+                    onclick="generateOutput(${article.id})"
+                    ${!canGenerate || isProcessing ? 'disabled' : ''}
+                >
+                    Generate
+                </button>
+            </div>
 
             <button
-                class="btn btn-danger"
+                class="btn btn-action btn-danger"
                 onclick="deleteArticle(${article.id})"
                 ${isProcessing ? 'disabled' : ''}
             >
@@ -489,16 +653,54 @@ function toggleExpand(articleId, cardElement) {
                 height: ['0px', newCard.scrollHeight + 'px'],
                 opacity: [0, 1],
                 duration: 600,
-                easing: 'easeOutElastic(1, .8)'
+                easing: 'easeOutElastic(1, .8)',
+                complete: function () {
+                    newCard.style.height = 'auto';
+                }
             });
         }
     }
 }
 
 function updateStats() {
-    document.getElementById('total-count').textContent = `${articles.length} article${articles.length !== 1 ? 's' : ''}`;
+    const totalCountEl = document.getElementById('total-count');
+    const videoCountEl = document.getElementById('video-count');
+
+    const prevTotal = totalCountEl.textContent;
+    const newTotal = `${articles.length} article${articles.length !== 1 ? 's' : ''}`;
+
     const videoCount = articles.filter(a => a.video_path).length;
-    document.getElementById('video-count').textContent = `${videoCount} video${videoCount !== 1 ? 's' : ''}`;
+    const prevVideo = videoCountEl.textContent;
+    const newVideo = `${videoCount} video${videoCount !== 1 ? 's' : ''}`;
+
+    totalCountEl.textContent = newTotal;
+    videoCountEl.textContent = newVideo;
+
+    // Update carousel count in header if element exists
+    const carouselCountEl = document.getElementById('carousel-count');
+    if (carouselCountEl) {
+        const carouselCount = articles.filter(a => a.carousel_dir).length;
+        carouselCountEl.textContent = `${carouselCount} carousel${carouselCount !== 1 ? 's' : ''}`;
+    }
+
+    if (window.anime) {
+        if (prevTotal !== newTotal) {
+            anime({
+                targets: totalCountEl,
+                scale: [1.2, 1],
+                duration: 800,
+                easing: 'spring(1, 80, 10, 0)'
+            });
+        }
+        if (prevVideo !== newVideo) {
+            anime({
+                targets: videoCountEl,
+                scale: [1.2, 1],
+                duration: 800,
+                easing: 'spring(1, 80, 10, 0)'
+            });
+        }
+    }
 }
 
 // ============================================
@@ -615,7 +817,7 @@ document.addEventListener('DOMContentLoaded', () => {
     // Poll for status updates when articles are processing
     setInterval(() => {
         const hasProcessing = articles.some(a =>
-            ['summarizing', 'generating_video'].includes(a.status)
+            ['summarizing', 'generating_video', 'generating_carousel'].includes(a.status)
         );
         if (hasProcessing) {
             fetchArticles();

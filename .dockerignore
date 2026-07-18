@@ -1,35 +1,17 @@
 # Python
 __pycache__/
 *.py[cod]
-*$py.class
 *.so
-.Python
-env/
-venv/
 .venv/
-ENV/
-
-# Testing
-.pytest_cache/
-htmlcov/
-.coverage
-.tox/
-
-# IDEs
-.vscode/
-.idea/
-*.swp
-*.swo
-*~
 
 # OS
 .DS_Store
-Thumbs.db
 
-# Project specific
+# Project
 instance/
 static/videos/*
-!static/videos/.gitkeep
+static/carousels/*
+static/tts_previews/*
 .env
 *.db
 *.log
@@ -38,10 +20,9 @@ static/videos/*
 .git/
 .gitignore
 
-# Documentation
+# Docs
 *.md
-!README.md
 
-# Development
-tests/
+# Dev
 .claude/
+.planning/

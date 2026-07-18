@@ -31,7 +31,13 @@ Thumbs.db
 
 # Generated content
 static/videos/
+static/carousels/
+static/tts_previews/
 videos/
+
+# Node (removed, but just in case)
+node_modules/
+package-lock.json
 
 # Test files
 test_*.mp4

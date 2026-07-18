@@ -9,7 +9,10 @@ import socket
 from datetime import datetime, timezone
 from urllib.parse import urlparse
 from threading import Thread
-from flask import Flask, request, jsonify, send_from_directory
+import shutil
+import zipfile
+from io import BytesIO
+from flask import Flask, request, jsonify, send_from_directory, send_file
 from flask_cors import CORS
 from werkzeug.utils import secure_filename
 from dotenv import load_dotenv
@@ -21,6 +24,7 @@ load_dotenv()
 from models import db, Article
 from summarizer import summarize_article
 from video_generator import generate_video
+from carousel_generator import generate_carousel
 
 # Configure logging
 logging.basicConfig(
@@ -184,6 +188,33 @@ db.init_app(app)
 with app.app_context():
     db.create_all()
 
+    # Auto-migrate: add carousel columns if missing (for existing databases)
+    from sqlalchemy import inspect, text
+    inspector = inspect(db.engine)
+    existing_columns = [c['name'] for c in inspector.get_columns('articles')]
+    migrations = {
+        'carousel_dir': 'VARCHAR(512)',
+        'carousel_audio': 'VARCHAR(512)',
+        'carousel_generated_at': 'DATETIME',
+    }
+    for col_name, col_type in migrations.items():
+        if col_name not in existing_columns:
+            db.session.execute(text(f'ALTER TABLE articles ADD COLUMN {col_name} {col_type}'))
+            logger.info(f"Migrated: added column '{col_name}' to articles table")
+    db.session.commit()
+
+    # Auto-migrate: add discovery scoring to databases created before story discovery.
+    inspector = inspect(db.engine)
+    existing_columns = [c['name'] for c in inspector.get_columns('articles')]
+    discovery_migrations = {
+        'viral_score': 'FLOAT',
+    }
+    for col_name, col_type in discovery_migrations.items():
+        if col_name not in existing_columns:
+            db.session.execute(text(f'ALTER TABLE articles ADD COLUMN {col_name} {col_type}'))
+            logger.info(f"Migrated: added column '{col_name}' to articles table")
+    db.session.commit()
+
 
 # Validate API keys on startup
 def validate_api_keys():
@@ -209,7 +240,6 @@ def validate_api_keys():
         logger.info("FAL.ai image generation enabled")
     else:
         logger.info("FAL_KEY not set - will use gradient backgrounds for videos")
-
 
 
 validate_api_keys()
@@ -244,7 +274,7 @@ def run_summarize_in_background(app_context, article_id):
             db.session.commit()
 
 
-def run_video_in_background(app_context, article_id):
+def run_video_in_background(app_context, article_id, image_source="ai"):
     """Run video generation in a background thread."""
     with app_context:
         article = db.session.get(Article, article_id)
@@ -255,7 +285,8 @@ def run_video_in_background(app_context, article_id):
             video_path = generate_video(
                 article_id=article.id,
                 title=article.title,
-                script=article.video_script
+                script=article.video_script,
+                image_source=image_source
             )
 
             relative_path = os.path.basename(video_path)
@@ -267,6 +298,34 @@ def run_video_in_background(app_context, article_id):
 
         except Exception as e:
             logger.error(f"Failed to generate video for article {article_id}: {e}", exc_info=True)
+            article.status = 'failed'
+            db.session.commit()
+
+
+def run_carousel_in_background(app_context, article_id, image_source="ai"):
+    """Run carousel generation in a background thread."""
+    with app_context:
+        article = db.session.get(Article, article_id)
+        if not article:
+            return
+
+        try:
+            result = generate_carousel(
+                article_id=article.id,
+                title=article.title,
+                script=article.video_script,
+                image_source=image_source
+            )
+
+            article.carousel_dir = result['carousel_dir']
+            article.carousel_audio = result['carousel_audio']
+            article.status = 'carousel_done'
+            article.carousel_generated_at = datetime.now(timezone.utc)
+            db.session.commit()
+            logger.info(f"Carousel generated for article {article_id}")
+
+        except Exception as e:
+            logger.error(f"Failed to generate carousel for article {article_id}: {e}", exc_info=True)
             article.status = 'failed'
             db.session.commit()
 
@@ -294,6 +353,389 @@ def serve_video(filename):
     if not safe_filename or safe_filename != filename:
         return jsonify({'error': 'Invalid filename'}), 400
     return send_from_directory('static/videos', safe_filename)
+
+
+@app.route('/carousels/<int:article_id>/<path:filename>')
+def serve_carousel_file(article_id, filename):
+    """Serve carousel images and audio files."""
+    safe_filename = secure_filename(filename)
+    if not safe_filename or safe_filename != filename:
+        return jsonify({'error': 'Invalid filename'}), 400
+    carousel_dir = os.path.join('static', 'carousels', str(article_id))
+    if not os.path.isdir(carousel_dir):
+        return jsonify({'error': 'Carousel not found'}), 404
+    return send_from_directory(carousel_dir, safe_filename)
+
+
+@app.route('/api/articles/<int:article_id>/carousel/download')
+def download_carousel_zip(article_id):
+    """Download all carousel assets as a ZIP file."""
+    article = db.session.get(Article, article_id)
+    if not article or not article.carousel_dir:
+        return jsonify({'error': 'Carousel not found'}), 404
+
+    carousel_path = os.path.join('static', 'carousels', article.carousel_dir)
+    if not os.path.isdir(carousel_path):
+        return jsonify({'error': 'Carousel files not found'}), 404
+
+    # Create ZIP in memory
+    zip_buffer = BytesIO()
+    with zipfile.ZipFile(zip_buffer, 'w', zipfile.ZIP_DEFLATED) as zf:
+        for fname in sorted(os.listdir(carousel_path)):
+            fpath = os.path.join(carousel_path, fname)
+            if os.path.isfile(fpath):
+                zf.write(fpath, fname)
+
+    zip_buffer.seek(0)
+
+    # Clean title for filename
+    safe_title = re.sub(r'[^\w\s-]', '', article.title)[:40].strip().replace(' ', '_')
+    zip_name = f"carousel_{safe_title}_{article_id}.zip"
+
+    return send_file(
+        zip_buffer,
+        mimetype='application/zip',
+        as_attachment=True,
+        download_name=zip_name
+    )
+
+
+@app.route('/api/articles/<int:article_id>/carousel/qr')
+def carousel_qr_code(article_id):
+    """Generate a QR code pointing to the mobile download page."""
+    import qrcode
+
+    article = db.session.get(Article, article_id)
+    if not article or not article.carousel_dir:
+        return jsonify({'error': 'Carousel not found'}), 404
+
+    # Get the local network IP so the phone can access it
+    local_ip = _get_local_ip()
+    port = request.host.split(':')[-1] if ':' in request.host else '5050'
+    mobile_url = f"http://{local_ip}:{port}/carousels/{article_id}/mobile"
+
+    # Generate QR code
+    qr = qrcode.QRCode(version=1, box_size=10, border=2)
+    qr.add_data(mobile_url)
+    qr.make(fit=True)
+    img = qr.make_image(fill_color="black", back_color="white")
+
+    # Convert to PNG bytes
+    buf = BytesIO()
+    img.save(buf, format='PNG')
+    buf.seek(0)
+
+    return send_file(buf, mimetype='image/png')
+
+
+def _get_local_ip():
+    """Get the local network IP address."""
+    try:
+        s = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+        s.connect(('8.8.8.8', 80))
+        ip = s.getsockname()[0]
+        s.close()
+        return ip
+    except Exception:
+        return '127.0.0.1'
+
+
+@app.route('/carousels/<int:article_id>/mobile')
+def carousel_mobile_page(article_id):
+    """Serve a mobile-friendly page to save carousel images to Camera Roll."""
+    article = db.session.get(Article, article_id)
+    if not article or not article.carousel_dir:
+        return "Carousel not found", 404
+
+    carousel_path = os.path.join('static', 'carousels', article.carousel_dir)
+    if not os.path.isdir(carousel_path):
+        return "Carousel files not found", 404
+
+    # Get list of slide files
+    slides = sorted([f for f in os.listdir(carousel_path) if f.startswith('slide_') and f.endswith('.png')])
+    audio_file = article.carousel_audio
+
+    # Build a self-contained mobile HTML page
+    slides_html = ""
+    for i, slide in enumerate(slides, 1):
+        slides_html += f'''
+        <div class="slide-card">
+            <div class="slide-number">Slide {i}</div>
+            <img src="/carousels/{article_id}/{slide}" alt="Slide {i}" class="slide-img">
+            <a href="/carousels/{article_id}/{slide}" download="{slide}" class="save-btn">
+                💾 Save Image {i}
+            </a>
+        </div>
+        '''
+
+    audio_html = ""
+    if audio_file:
+        audio_html = f'''
+        <div class="audio-card">
+            <div class="slide-number">🎙️ Voiceover</div>
+            <audio controls preload="metadata" class="audio-player">
+                <source src="/carousels/{article_id}/{audio_file}">
+            </audio>
+            <a href="/carousels/{article_id}/{audio_file}" download="{audio_file}" class="save-btn">
+                💾 Save Audio
+            </a>
+        </div>
+        '''
+
+    html = f'''<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0, user-scalable=no">
+    <title>Clipper — Save Carousel</title>
+    <link href="https://fonts.googleapis.com/css2?family=Inter:wght@400;600;700&display=swap" rel="stylesheet">
+    <style>
+        * {{ margin: 0; padding: 0; box-sizing: border-box; }}
+        body {{
+            font-family: 'Inter', -apple-system, sans-serif;
+            background: #0B0F14;
+            color: #F3F4F6;
+            min-height: 100vh;
+            padding: 20px;
+            padding-bottom: 40px;
+            -webkit-font-smoothing: antialiased;
+        }}
+        .header {{
+            text-align: center;
+            padding: 20px 0 24px;
+        }}
+        .logo {{ color: #5EEAD4; font-size: 0.9rem; }}
+        h1 {{
+            font-size: 1.5rem;
+            font-weight: 700;
+            margin: 8px 0 4px;
+            letter-spacing: -0.02em;
+        }}
+        .subtitle {{
+            color: #9CA3AF;
+            font-size: 0.85rem;
+            line-height: 1.4;
+        }}
+        .tip {{
+            background: rgba(94, 234, 212, 0.1);
+            border: 1px solid rgba(94, 234, 212, 0.2);
+            border-radius: 12px;
+            padding: 12px 16px;
+            margin: 16px 0 20px;
+            font-size: 0.8rem;
+            color: #5EEAD4;
+            text-align: center;
+        }}
+        .slide-card {{
+            background: #111827;
+            border: 1px solid rgba(255,255,255,0.08);
+            border-radius: 16px;
+            overflow: hidden;
+            margin-bottom: 16px;
+        }}
+        .slide-number {{
+            padding: 12px 16px;
+            font-size: 0.75rem;
+            font-weight: 600;
+            text-transform: uppercase;
+            letter-spacing: 0.05em;
+            color: #9CA3AF;
+        }}
+        .slide-img {{
+            width: 100%;
+            display: block;
+            border-top: 1px solid rgba(255,255,255,0.06);
+            border-bottom: 1px solid rgba(255,255,255,0.06);
+        }}
+        .save-btn {{
+            display: block;
+            text-align: center;
+            padding: 14px;
+            color: #0B0F14;
+            background: #5EEAD4;
+            font-weight: 600;
+            font-size: 0.9rem;
+            text-decoration: none;
+            transition: background 0.2s;
+        }}
+        .save-btn:active {{ background: #3dd1b9; }}
+        .audio-card {{
+            background: #111827;
+            border: 1px solid rgba(255,255,255,0.08);
+            border-radius: 16px;
+            overflow: hidden;
+            margin-bottom: 16px;
+        }}
+        .audio-player {{
+            width: calc(100% - 32px);
+            margin: 0 16px 12px;
+            height: 44px;
+        }}
+        .instructions {{
+            text-align: center;
+            padding: 20px 0;
+            color: #667085;
+            font-size: 0.75rem;
+            line-height: 1.6;
+        }}
+    </style>
+</head>
+<body>
+    <div class="header">
+        <div class="logo">▲ Clipper</div>
+        <h1>{article.title[:60]}</h1>
+        <p class="subtitle">Photo Carousel — {len(slides)} slides</p>
+    </div>
+    <div class="tip">
+        📱 <strong>Tip:</strong> Long-press each image → "Save to Photos"<br>
+        Or tap the save buttons below each slide
+    </div>
+    {slides_html}
+    {audio_html}
+    <div class="instructions">
+        After saving, open TikTok → Create → Photo Mode<br>
+        Select all images from Camera Roll → Add voiceover
+    </div>
+</body>
+</html>'''
+
+    return html
+
+
+@app.route('/api/articles/<int:article_id>/video/qr')
+def video_qr_code(article_id):
+    """Generate a QR code pointing to the mobile video download page."""
+    import qrcode
+
+    article = db.session.get(Article, article_id)
+    if not article or not article.video_path:
+        return jsonify({'error': 'Video not found'}), 404
+
+    local_ip = _get_local_ip()
+    port = request.host.split(':')[-1] if ':' in request.host else '5050'
+    mobile_url = f"http://{local_ip}:{port}/videos/{article_id}/mobile"
+
+    qr = qrcode.QRCode(version=1, box_size=10, border=2)
+    qr.add_data(mobile_url)
+    qr.make(fit=True)
+    img = qr.make_image(fill_color="black", back_color="white")
+
+    buf = BytesIO()
+    img.save(buf, format='PNG')
+    buf.seek(0)
+
+    return send_file(buf, mimetype='image/png')
+
+
+@app.route('/videos/<int:article_id>/mobile')
+def video_mobile_page(article_id):
+    """Serve a mobile-friendly page to save a video to Camera Roll."""
+    article = db.session.get(Article, article_id)
+    if not article or not article.video_path:
+        return "Video not found", 404
+
+    video_url = f"/videos/{article.video_path}"
+
+    html = f'''<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0, user-scalable=no">
+    <title>Clipper — Save Video</title>
+    <link href="https://fonts.googleapis.com/css2?family=Inter:wght@400;600;700&display=swap" rel="stylesheet">
+    <style>
+        * {{ margin: 0; padding: 0; box-sizing: border-box; }}
+        body {{
+            font-family: 'Inter', -apple-system, sans-serif;
+            background: #0B0F14;
+            color: #F3F4F6;
+            min-height: 100vh;
+            padding: 20px;
+            padding-bottom: 40px;
+            -webkit-font-smoothing: antialiased;
+        }}
+        .header {{
+            text-align: center;
+            padding: 20px 0 24px;
+        }}
+        .logo {{ color: #5EEAD4; font-size: 0.9rem; }}
+        h1 {{
+            font-size: 1.4rem;
+            font-weight: 700;
+            margin: 8px 0 4px;
+            letter-spacing: -0.02em;
+        }}
+        .subtitle {{
+            color: #9CA3AF;
+            font-size: 0.85rem;
+        }}
+        .tip {{
+            background: rgba(94, 234, 212, 0.1);
+            border: 1px solid rgba(94, 234, 212, 0.2);
+            border-radius: 12px;
+            padding: 12px 16px;
+            margin: 16px 0 20px;
+            font-size: 0.8rem;
+            color: #5EEAD4;
+            text-align: center;
+        }}
+        .video-card {{
+            background: #111827;
+            border: 1px solid rgba(255,255,255,0.08);
+            border-radius: 16px;
+            overflow: hidden;
+            margin-bottom: 16px;
+        }}
+        .video-card video {{
+            width: 100%;
+            display: block;
+        }}
+        .save-btn {{
+            display: block;
+            text-align: center;
+            padding: 16px;
+            color: #0B0F14;
+            background: #5EEAD4;
+            font-weight: 600;
+            font-size: 1rem;
+            text-decoration: none;
+            transition: background 0.2s;
+        }}
+        .save-btn:active {{ background: #3dd1b9; }}
+        .instructions {{
+            text-align: center;
+            padding: 20px 0;
+            color: #667085;
+            font-size: 0.75rem;
+            line-height: 1.6;
+        }}
+    </style>
+</head>
+<body>
+    <div class="header">
+        <div class="logo">▲ Clipper</div>
+        <h1>{article.title[:60]}</h1>
+        <p class="subtitle">Generated Video</p>
+    </div>
+    <div class="tip">
+        📱 <strong>Tip:</strong> Tap "Save Video" or long-press the video → "Save to Photos"
+    </div>
+    <div class="video-card">
+        <video controls playsinline preload="metadata">
+            <source src="{video_url}" type="video/mp4">
+        </video>
+        <a href="{video_url}" download="{article.video_path}" class="save-btn">
+            💾 Save Video
+        </a>
+    </div>
+    <div class="instructions">
+        After saving, open TikTok → Create → Upload<br>
+        Select the video from Camera Roll
+    </div>
+</body>
+</html>'''
+
+    return html
 
 
 # ============================================================
@@ -430,6 +872,15 @@ def delete_article(article_id):
             except OSError as e:
                 logger.warning(f"Could not delete video file {video_file}: {e}")
 
+    # Clean up carousel directory if it exists
+    if article.carousel_dir:
+        carousel_path = os.path.join('static', 'carousels', article.carousel_dir)
+        if os.path.isdir(carousel_path):
+            try:
+                shutil.rmtree(carousel_path)
+            except OSError as e:
+                logger.warning(f"Could not delete carousel dir {carousel_path}: {e}")
+
     db.session.delete(article)
     db.session.commit()
     return jsonify({'message': 'Article deleted'})
@@ -442,7 +893,7 @@ def summarize_article_endpoint(article_id):
     if not article:
         return jsonify({'error': 'Article not found'}), 404
 
-    if article.status in ('summarizing', 'generating_video'):
+    if article.status in ('summarizing', 'generating_video', 'generating_carousel'):
         return jsonify({'error': 'Article is already being processed'}), 409
 
     article.status = 'summarizing'
@@ -472,8 +923,14 @@ def generate_video_endpoint(article_id):
     if not article.video_script:
         return jsonify({'error': 'Article must be summarized first'}), 400
 
-    if article.status in ('summarizing', 'generating_video'):
+    if article.status in ('summarizing', 'generating_video', 'generating_carousel'):
         return jsonify({'error': 'Article is already being processed'}), 409
+
+    # Get image source from request body
+    data = request.get_json(silent=True) or {}
+    image_source = data.get('image_source', 'ai')
+    if image_source not in ('ai', 'stock'):
+        image_source = 'ai'
 
     article.status = 'generating_video'
     db.session.commit()
@@ -481,13 +938,49 @@ def generate_video_endpoint(article_id):
     # Run in background thread
     thread = Thread(
         target=run_video_in_background,
-        args=(app.app_context(), article.id)
+        args=(app.app_context(), article.id, image_source)
     )
     thread.daemon = True
     thread.start()
 
     return jsonify({
         'message': 'Video generation started',
+        'article': article.to_dict()
+    }), 202
+
+
+@app.route('/api/articles/<int:article_id>/carousel', methods=['POST'])
+def generate_carousel_endpoint(article_id):
+    """Trigger carousel generation for an article (runs in background)."""
+    article = db.session.get(Article, article_id)
+    if not article:
+        return jsonify({'error': 'Article not found'}), 404
+
+    if not article.video_script:
+        return jsonify({'error': 'Article must be summarized first'}), 400
+
+    if article.status in ('summarizing', 'generating_video', 'generating_carousel'):
+        return jsonify({'error': 'Article is already being processed'}), 409
+
+    # Get image source from request body
+    data = request.get_json(silent=True) or {}
+    image_source = data.get('image_source', 'ai')
+    if image_source not in ('ai', 'stock'):
+        image_source = 'ai'
+
+    article.status = 'generating_carousel'
+    db.session.commit()
+
+    # Run in background thread
+    thread = Thread(
+        target=run_carousel_in_background,
+        args=(app.app_context(), article.id, image_source)
+    )
+    thread.daemon = True
+    thread.start()
+
+    return jsonify({
+        'message': 'Carousel generation started',
         'article': article.to_dict()
     }), 202
 
