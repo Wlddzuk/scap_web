@@ -22,6 +22,7 @@ from moviepy.editor import (
     CompositeVideoClip,
     ImageClip,
     VideoClip,
+    VideoFileClip,
     concatenate_videoclips,
     vfx,
 )
@@ -52,6 +53,16 @@ FPS = 30
 # Hook settings
 HOOK_DURATION = 5.0
 NUM_HOOK_IMAGES = 4
+
+# AI video hook. When the per-request `use_video_hook` flag is True (set by the
+# UI toggle), or when HOOK_VIDEO_MODEL is set in the env, the 5s hook becomes a
+# single FAL video clip instead of 4 stills with Ken Burns zoom. Falls back to
+# image hook on any failure.
+# Models tested: fal-ai/ltx-video (cheap/fast), fal-ai/kling-video/v1/standard/text-to-video,
+# fal-ai/minimax/video-01.
+HOOK_VIDEO_MODEL = os.getenv("HOOK_VIDEO_MODEL", "").strip()
+HOOK_VIDEO_ASPECT = os.getenv("HOOK_VIDEO_ASPECT", "9:16")
+DEFAULT_HOOK_VIDEO_MODEL = "fal-ai/ltx-video"  # used when UI toggle is on and env is empty
 
 # Body image count (reduced from 20 for speed)
 NUM_BODY_IMAGES = 14
@@ -127,6 +138,86 @@ def generate_image_fal(prompt: str, retry_count: int = RETRY_ATTEMPTS) -> Image.
 
     logger.info("[Image] Failed, using gradient")
     return create_gradient_background()
+
+
+def generate_hook_video_fal(prompt: str, model: str) -> str | None:
+    """Generate a short AI video clip via FAL. Returns local mp4 path, or None on failure.
+
+    Caller is responsible for unlinking the returned path. We write to the system
+    temp dir (not static/) so failures don't leak public files.
+    """
+    import fal_client
+    import tempfile
+
+    if not os.getenv("FAL_KEY"):
+        logger.info("[HookVideo] No FAL_KEY, skipping video hook")
+        return None
+
+    try:
+        logger.info(f"[HookVideo] Generating via {model}: {prompt[:80]}...")
+        result = fal_client.run(
+            model,
+            arguments={"prompt": prompt, "aspect_ratio": HOOK_VIDEO_ASPECT},
+        )
+
+        video_url = None
+        if isinstance(result, dict):
+            video_field = result.get("video")
+            if isinstance(video_field, dict):
+                video_url = video_field.get("url")
+            elif isinstance(video_field, str):
+                video_url = video_field
+            elif "url" in result:
+                video_url = result["url"]
+
+        if not video_url:
+            logger.info(f"[HookVideo] No video URL in response keys={list(result) if isinstance(result, dict) else type(result)}")
+            return None
+
+        fd, local_path = tempfile.mkstemp(suffix=".mp4", prefix="hook_")
+        os.close(fd)
+        response = requests.get(video_url, timeout=120, stream=True)
+        response.raise_for_status()
+        with open(local_path, "wb") as f:
+            for chunk in response.iter_content(chunk_size=65536):
+                f.write(chunk)
+
+        logger.info(f"[HookVideo] Saved: {local_path}")
+        return local_path
+    except Exception as e:
+        logger.info(f"[HookVideo] Failed: {e}")
+        return None
+
+
+def load_hook_video_clip(video_path: str, target_duration: float):
+    """Load a downloaded FAL video as a moviepy clip fitted to 1080x1920 / target_duration."""
+    clip = VideoFileClip(video_path).without_audio()
+
+    if clip.duration > target_duration:
+        clip = clip.subclip(0, target_duration)
+    elif clip.duration < target_duration:
+        # If close, ease via speed; otherwise loop.
+        if clip.duration >= target_duration * 0.7:
+            clip = clip.fx(vfx.speedx, clip.duration / target_duration)
+        else:
+            loops = int(target_duration / clip.duration) + 1
+            clip = concatenate_videoclips([clip] * loops, method="compose").subclip(0, target_duration)
+
+    cw, ch = clip.size
+    target_ratio = VIDEO_WIDTH / VIDEO_HEIGHT
+    src_ratio = cw / ch
+
+    if abs(src_ratio - target_ratio) > 0.01:
+        if src_ratio > target_ratio:
+            new_w = int(ch * target_ratio)
+            x_center = cw // 2
+            clip = clip.crop(x1=x_center - new_w // 2, x2=x_center + new_w // 2)
+        else:
+            new_h = int(cw / target_ratio)
+            y_center = ch // 2
+            clip = clip.crop(y1=y_center - new_h // 2, y2=y_center + new_h // 2)
+
+    return clip.resize((VIDEO_WIDTH, VIDEO_HEIGHT))
 
 
 def search_pexels_images(query: str, num_images: int, orientation: str = "portrait") -> list:
@@ -749,21 +840,136 @@ def generate_themed_images(title: str, script: str, num_images: int = NUM_BODY_I
     return images
 
 
-def create_hook_clips(title: str, duration: float = HOOK_DURATION, image_source: str = "ai") -> list:
-    """Create rapid-fire hook sequence."""
+def _parallel_image_gen(prompts: list) -> list:
+    """Generate N images in parallel. Returns list[PIL.Image] in prompt order."""
+    images = [None] * len(prompts)
+    with ThreadPoolExecutor(max_workers=MAX_IMAGE_WORKERS) as executor:
+        future_to_idx = {
+            executor.submit(generate_image_fal, p): i
+            for i, p in enumerate(prompts)
+        }
+        for future in as_completed(future_to_idx):
+            idx = future_to_idx[future]
+            try:
+                images[idx] = future.result()
+            except Exception as e:
+                logger.info(f"[Video] Image {idx+1} failed: {e}")
+                images[idx] = create_gradient_background()
+    logger.info(f"[Video] Generated {len(images)} images")
+    return images
+
+
+def generate_scene_images(scenes: list, style_key: str, image_source: str = "ai") -> list:
+    """Generate one image per scene, style applied consistently.
+
+    Stock mode queries Pexels with each scene's visual description instead of
+    generating with FAL, so cheap test runs stay scene-aligned too.
+    """
+    if image_source == "stock":
+        logger.info(f"[Video] Fetching {len(scenes)} scene-aligned stock photos...")
+        images = []
+        for scene in scenes:
+            query = " ".join((scene.get("visual") or scene.get("speech") or "").split()[:6])
+            found = search_pexels_images(query or "science", 1)
+            images.append(found[0] if found else create_gradient_background())
+        return images
+
+    from visual_styles import apply_style
+
+    prompts = [apply_style(s.get("visual", ""), style_key, is_hook=False) for s in scenes]
+    logger.info(f"[Video] Generating {len(prompts)} scene images in style '{style_key}'...")
+    return _parallel_image_gen(prompts)
+
+
+def create_hook_clips(
+    title: str,
+    duration: float = HOOK_DURATION,
+    image_source: str = "ai",
+    style_key: str = None,
+    opening_visual: str = None,
+    use_video_hook: bool | None = None,
+) -> list:
+    """Create the hook sequence. Returns list[Clip].
+
+    Hook mode resolution:
+      - use_video_hook=True  -> AI video hook (env model OR DEFAULT_HOOK_VIDEO_MODEL)
+      - use_video_hook=False -> always image hook
+      - use_video_hook=None  -> env-driven (HOOK_VIDEO_MODEL set => video, else image)
+
+    On any failure of the video path, falls back to the image hook so a flaky
+    video model never breaks the pipeline. The hook video is generated with the
+    SAME style preset (apply_style + style_key) as the body images, so the whole
+    video reads as one consistent visual identity. Stock mode never uses the
+    video hook (it exists for cheap test runs).
+    """
+    # Anchor on the opening scene visual if we have one; else derive from title.
+    anchor = (opening_visual or title).strip().rstrip(",.")
+
+    # Resolve which hook mode to run.
+    if use_video_hook is True:
+        video_model = HOOK_VIDEO_MODEL or DEFAULT_HOOK_VIDEO_MODEL
+    elif use_video_hook is False:
+        video_model = ""
+    else:
+        video_model = HOOK_VIDEO_MODEL  # env-driven default
+
+    # --- AI video hook path (never in stock mode) ---
+    if video_model and image_source != "stock":
+        try:
+            from visual_styles import apply_style
+        except ImportError:
+            apply_style = None
+
+        motion_prompt = f"{anchor}, dramatic camera push-in, kinetic motion, dynamic energy"
+        if style_key and apply_style:
+            video_prompt = apply_style(motion_prompt, style_key, is_hook=True)
+        else:
+            video_prompt = f"{motion_prompt}, cinematic lighting, vertical 9:16, high energy, no text"
+
+        local_mp4 = generate_hook_video_fal(video_prompt, video_model)
+        if local_mp4:
+            try:
+                vclip = load_hook_video_clip(local_mp4, duration)
+                # Stash temp path on the clip so generate_video's finally can unlink it.
+                vclip._scap_temp_path = local_mp4
+                logger.info(f"[Hook] Using AI video hook ({duration:.1f}s)")
+                return [vclip]
+            except Exception as e:
+                logger.info(f"[Hook] Video clip load failed: {e}, falling back to image hook")
+                try:
+                    Path(local_mp4).unlink(missing_ok=True)
+                except OSError:
+                    pass
+        else:
+            logger.info("[Hook] Video hook unavailable, falling back to image hook")
+
+    # --- Image-based hook ---
     clip_duration = duration / NUM_HOOK_IMAGES
 
     if image_source == "stock":
         logger.info(f"[Hook] Fetching {NUM_HOOK_IMAGES} stock hook images...")
         images = search_pexels_images(title, NUM_HOOK_IMAGES)
     else:
-        hook_prompts = [
-            f"extreme macro close-up shot, {title}, ultra sharp detail, dramatic rim lighting, shallow depth of field, cinematic 9:16, hyper-realistic",
-            f"impossible camera angle, {title}, bird's eye view mixed with dutch angle, dramatic shadows, high contrast neon accents, surreal perspective",
-            f"frozen action moment, {title}, motion blur trails, dynamic energy, explosive composition, vibrant saturated colors, dramatic backlighting",
-            f"bold graphic composition, {title}, stark contrast, complementary color explosion, minimalist but striking, professional advertising quality"
+        angle_variations = [
+            f"{anchor}, extreme macro close-up, ultra sharp detail",
+            f"{anchor}, impossible low-angle looking up, dramatic perspective",
+            f"{anchor}, frozen peak action moment, motion blur trails",
+            f"{anchor}, stark silhouette against explosive backdrop",
         ]
-        logger.info(f"[Hook] Creating {NUM_HOOK_IMAGES} hook images in parallel...")
+
+        if style_key:
+            from visual_styles import apply_style
+            hook_prompts = [apply_style(v, style_key, is_hook=True) for v in angle_variations]
+        else:
+            # Legacy path (no style): use old generic punch prompts
+            hook_prompts = [
+                f"extreme macro close-up shot, {title}, ultra sharp detail, dramatic rim lighting, shallow depth of field, cinematic 9:16, hyper-realistic",
+                f"impossible camera angle, {title}, bird's eye view mixed with dutch angle, dramatic shadows, high contrast neon accents, surreal perspective",
+                f"frozen action moment, {title}, motion blur trails, dynamic energy, explosive composition, vibrant saturated colors, dramatic backlighting",
+                f"bold graphic composition, {title}, stark contrast, complementary color explosion, minimalist but striking, professional advertising quality"
+            ]
+
+        logger.info(f"[Hook] Creating {NUM_HOOK_IMAGES} hook images in parallel (style: {style_key or 'legacy'})...")
         images = [None] * NUM_HOOK_IMAGES
         with ThreadPoolExecutor(max_workers=NUM_HOOK_IMAGES) as executor:
             future_to_idx = {
@@ -821,18 +1027,45 @@ def compute_durations(chunks: list, total_time: float) -> list:
     return [max(0.05, d) for d in durations]
 
 
+def compute_scene_durations(scenes: list, total_time: float) -> list:
+    """Allocate time per scene proportional to its speech length."""
+    if not scenes:
+        return []
+    weights = [max(1, len((s.get("speech") or "").split())) for s in scenes]
+    total_w = sum(weights)
+    if total_w <= 0:
+        return [total_time / len(scenes)] * len(scenes)
+    durations = [total_time * w / total_w for w in weights]
+    durations[-1] += total_time - sum(durations)  # fix drift
+    return [max(0.3, d) for d in durations]
+
+
 def generate_video(
     article_id: int,
     title: str,
     script: str,
     image_source: str = "ai",
     captions: bool = True,
+    scenes: list = None,
+    style_key: str = None,
+    emotion: str = None,
+    use_video_hook: bool | None = None,
 ) -> str:
     """Generate TikTok-style video with parallel image generation.
+
+    Preferred path: scenes + style_key + emotion provided (from summarizer).
+    Each scene produces one style-consistent image, and images play in
+    narrative order for their scene's proportional speech duration.
+    `emotion` drives TTS voice/speed (Kokoro) and delivery styling (Gemini).
+
+    Fallback path: no scenes -> legacy themed-image generation with
+    chunked text pacing.
 
     Args:
         image_source: 'ai' for FAL.ai, 'stock' for Pexels stock photos.
         captions: Burn word-synced captions into the video when True.
+        use_video_hook: True forces the AI video hook, False forces stills,
+            None follows the HOOK_VIDEO_MODEL env default.
     """
     videos_dir = Path("static/videos")
     videos_dir.mkdir(parents=True, exist_ok=True)
@@ -847,14 +1080,21 @@ def generate_video(
     clips = []
     overlay_clips = []
     actual_audio_path = None
+    use_scenes = bool(scenes)
 
     try:
-        logger.info(f"Generating video for article {article_id} (images: {image_source})")
+        logger.info(
+            f"Generating video for article {article_id} "
+            f"(images: {image_source}, mode: {'scene-based' if use_scenes else 'legacy'}, "
+            f"style: {style_key or 'auto'}, emotion: {emotion or 'default'})"
+        )
 
         # Step 1: TTS
         logger.info("Step 1: Generating voiceover...")
         narration_text = clean_text(script)
-        actual_audio_path = tts_engine.synthesize(narration_text, str(temp_audio_path))
+        actual_audio_path = tts_engine.synthesize(
+            narration_text, str(temp_audio_path), emotion=emotion
+        )
         audio = AudioFileClip(actual_audio_path)
         audio_duration = float(audio.duration)
         logger.info(f"Audio duration: {audio_duration:.1f}s")
@@ -872,30 +1112,58 @@ def generate_video(
 
         hook_len = min(HOOK_DURATION, max(2.0, audio_duration * 0.25))
 
-        # Step 3: Generate images
-        logger.info("Step 3: Generating images...")
-        themed_images = generate_themed_images(title, script, num_images=NUM_BODY_IMAGES, image_source=image_source)
+        # Step 3: Resolve visual style. Always resolve when the video hook is on
+        # (legacy path included) so the AI video clip is generated with the SAME
+        # style preset as the body images — otherwise the hook looks alien next
+        # to the rest of the video.
+        will_use_video_hook = (
+            use_video_hook is True
+            or (use_video_hook is None and bool(HOOK_VIDEO_MODEL))
+        ) and image_source != "stock"
+        if (use_scenes or will_use_video_hook) and not style_key:
+            from visual_styles import auto_pick_style
+            style_key = auto_pick_style(title, script)
+            logger.info(f"[Video] Auto-picked style: {style_key}")
 
-        # Step 4: Chunk for pacing
-        logger.info("Step 4: Chunking script...")
-        chunks = chunk_text(script)
-        logger.info(f"{len(chunks)} chunks")
+        # Step 4: Generate body images
+        if use_scenes:
+            logger.info("Step 4: Generating scene-aligned images...")
+            themed_images = generate_scene_images(scenes, style_key, image_source=image_source)
+        else:
+            logger.info("Step 4: Generating themed images (legacy)...")
+            themed_images = generate_themed_images(title, script, num_images=NUM_BODY_IMAGES, image_source=image_source)
 
-        # Step 5: Hook clips (rapid-fire image sequence)
+        # Step 5: Hook clips (AI video hook or rapid-fire image sequence)
         logger.info("Step 5: Creating hook sequence...")
-        hook_clips = create_hook_clips(title, duration=hook_len, image_source=image_source)
+        opening_visual = scenes[0].get("visual") if use_scenes else None
+        hook_clips = create_hook_clips(
+            title,
+            duration=hook_len,
+            image_source=image_source,
+            style_key=style_key,
+            opening_visual=opening_visual,
+            use_video_hook=use_video_hook,
+        )
         clips.extend(hook_clips)
         logger.info(f"Hook: {hook_len:.1f}s")
 
         # Step 6: Body clips
         logger.info("Step 6: Creating body clips...")
         remaining = max(0.1, audio_duration - hook_len)
-        durations = compute_durations(chunks, remaining)
 
-        for i in range(len(chunks)):
-            img = themed_images[i % len(themed_images)]
-            dur = durations[i] if i < len(durations) else DEFAULT_CHUNK_DURATION
-            clips.append(create_clip(img, dur))
+        if use_scenes:
+            durations = compute_scene_durations(scenes, remaining)
+            for i, scene in enumerate(scenes):
+                img = themed_images[i] if i < len(themed_images) else themed_images[-1]
+                dur = durations[i] if i < len(durations) else DEFAULT_CHUNK_DURATION
+                clips.append(create_clip(img, dur))
+        else:
+            chunks = chunk_text(script)
+            durations = compute_durations(chunks, remaining)
+            for i in range(len(chunks)):
+                img = themed_images[i % len(themed_images)]
+                dur = durations[i] if i < len(durations) else DEFAULT_CHUNK_DURATION
+                clips.append(create_clip(img, dur))
 
         # Step 7: Assemble visuals and PIL text overlays
         logger.info("Step 7: Assembling...")
@@ -977,6 +1245,12 @@ def generate_video(
                 c.close()
             except Exception:
                 pass
+            temp_path = getattr(c, "_scap_temp_path", None)
+            if temp_path:
+                try:
+                    Path(temp_path).unlink(missing_ok=True)
+                except OSError:
+                    pass
         if actual_audio_path:
             try:
                 Path(actual_audio_path).unlink(missing_ok=True)

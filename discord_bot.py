@@ -155,12 +155,25 @@ async def process_article_url(
 
         # Step 2: Summarize
         with app.app_context():
+            from visual_styles import STYLES as VISUAL_STYLES
+
             article = db.session.get(Article, article.id)
             result = summarize_article(article.title, article.content)
             article.tldr = result["tldr"]
             article.bullets = json.dumps(result["bullets"])
             article.video_script = result["video_script"]
             article.hashtags = json.dumps(result.get("hashtags", []))
+
+            # Engagement metadata (scene-based generation)
+            scenes = result.get("scenes") or []
+            article.scenes = json.dumps(scenes) if scenes else None
+            hook_variants = result.get("hook_variants") or []
+            article.hook_variants = json.dumps(hook_variants) if hook_variants else None
+            article.dominant_emotion = result.get("dominant_emotion") or None
+            suggested = result.get("suggested_style")
+            if suggested and suggested in VISUAL_STYLES:
+                article.style = suggested
+
             article.status = "summarized"
             article.summarized_at = datetime.now(timezone.utc)
             db.session.commit()
@@ -168,6 +181,9 @@ async def process_article_url(
             script = article.video_script
             title = article.title
             article_id = article.id
+            article_scenes = scenes or None
+            article_style = article.style
+            article_emotion = article.dominant_emotion
 
         await progress_msg.edit(
             content=(
@@ -183,6 +199,9 @@ async def process_article_url(
                 title=title,
                 script=script,
                 image_source="ai",
+                scenes=article_scenes,
+                style_key=article_style,
+                emotion=article_emotion,
             )
 
             article = db.session.get(Article, article_id)

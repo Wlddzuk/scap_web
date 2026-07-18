@@ -129,6 +129,31 @@ Set `DISCOVERY_ENABLED=true` to run once daily at the configured UTC hour.
 Reconnects do not start duplicate scheduler tasks. A `GROQ_API_KEY` is required
 for discovery scoring.
 
+## Scene-Based Videos, Visual Styles & AI Video Hook
+
+When the summarizer returns scene beats (`scenes`, `dominant_emotion`,
+`suggested_style`), each narration beat gets its own style-consistent image
+(presets in `visual_styles.py`, picker in the dashboard), and the dominant
+emotion steers the voice: Kokoro picks a matching voice + speaking speed,
+Gemini/Qwen3 get a matching delivery instruction. Articles summarized before
+this feature fall back to the legacy keyword-image path automatically.
+
+The 5-second opening hook can optionally be a real AI video clip from FAL
+instead of stills — toggle it per-run in the dashboard, or set a default:
+
+```env
+# HOOK_VIDEO_MODEL=fal-ai/ltx-video
+# HOOK_VIDEO_ASPECT=9:16
+```
+
+Any failure of the video hook silently falls back to the image hook.
+
+## Substack Companion Posts
+
+`POST /api/articles/<id>/substack` (or the dashboard button) generates a
+long-form, conversational Substack post from the article's summary and scene
+beats. Cached on the article; pass `{"regenerate": true}` to rewrite.
+
 ## Quick Start
 
 ```bash

@@ -407,17 +407,35 @@ def _process_candidate(candidate: StoryCandidate) -> dict:
             article.bullets = json.dumps(summary["bullets"])
             article.video_script = summary["video_script"]
             article.hashtags = json.dumps(summary.get("hashtags", []))
+
+            # Engagement metadata (scene-based generation)
+            from visual_styles import STYLES as VISUAL_STYLES
+            scenes = summary.get("scenes") or []
+            article.scenes = json.dumps(scenes) if scenes else None
+            hook_variants = summary.get("hook_variants") or []
+            article.hook_variants = json.dumps(hook_variants) if hook_variants else None
+            article.dominant_emotion = summary.get("dominant_emotion") or None
+            suggested = summary.get("suggested_style")
+            if suggested and suggested in VISUAL_STYLES:
+                article.style = suggested
+
             article.status = "summarized"
             article.summarized_at = datetime.now(timezone.utc)
             db.session.commit()
             title = article.title
             script = article.video_script
+            article_scenes = scenes or None
+            article_style = article.style
+            article_emotion = article.dominant_emotion
 
         video_path = generate_video(
             article_id=article_id,
             title=title,
             script=script,
             image_source="ai",
+            scenes=article_scenes,
+            style_key=article_style,
+            emotion=article_emotion,
         )
 
         with app.app_context():

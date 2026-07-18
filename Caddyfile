@@ -1,0 +1,14 @@
+# Replace YOUR_DOMAIN with your actual domain (e.g. clipper.example.com)
+# or replace with your server IP for HTTP-only access (no HTTPS without a domain).
+#
+# Generate a password hash to fill in below:
+#   docker run caddy:2-alpine caddy hash-password --plaintext 'yourpassword'
+#
+# Then replace BCRYPT_HASH_HERE with the output.
+
+YOUR_DOMAIN {
+    basicauth /* {
+        walid BCRYPT_HASH_HERE
+    }
+    reverse_proxy clipper:5050
+}

@@ -34,12 +34,21 @@ class Article(db.Model):
     video_script = db.Column(db.Text, nullable=True)
     hashtags = db.Column(db.Text, nullable=True)  # JSON array of 5 hashtags
 
+    # Engagement metadata (populated by summarizer for story-shaped video gen)
+    scenes = db.Column(db.Text, nullable=True)  # JSON array of {speech, visual, emotion}
+    hook_variants = db.Column(db.Text, nullable=True)  # JSON array of 3 alt opening lines
+    dominant_emotion = db.Column(db.String(32), nullable=True)
+    style = db.Column(db.String(32), nullable=True)  # visual_styles key
+
     # Video output
     video_path = db.Column(db.String(512), nullable=True)
 
     # Carousel output
     carousel_dir = db.Column(db.String(512), nullable=True)   # e.g. "42"
     carousel_audio = db.Column(db.String(512), nullable=True)  # e.g. "voiceover.wav"
+
+    # Substack companion post (long-form, conversational)
+    substack_post = db.Column(db.Text, nullable=True)
 
     def to_dict(self, include_full_content=False):
         """Convert to dictionary for JSON response.
@@ -67,9 +76,14 @@ class Article(db.Model):
             'bullets': json.loads(self.bullets) if self.bullets else None,
             'video_script': self.video_script,
             'hashtags': json.loads(self.hashtags) if self.hashtags else None,
+            'scenes': json.loads(self.scenes) if self.scenes else None,
+            'hook_variants': json.loads(self.hook_variants) if self.hook_variants else None,
+            'dominant_emotion': self.dominant_emotion,
+            'style': self.style,
             'video_path': self.video_path,
             'carousel_dir': self.carousel_dir,
             'carousel_audio': self.carousel_audio,
+            'substack_post': self.substack_post,
         }
 
         if include_full_content:

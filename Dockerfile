@@ -30,5 +30,6 @@ EXPOSE 5050
 HEALTHCHECK --interval=30s --timeout=10s --start-period=30s --retries=3 \
     CMD python -c "import requests; requests.get('http://localhost:5050/api/health', timeout=5)"
 
-# Run the Discord bot (which also starts Flask in background)
+# Run the Discord bot (which also starts Flask in background).
+# For a Flask-only deployment use: gunicorn -c gunicorn.conf.py wsgi:app
 CMD ["python", "discord_bot.py"]

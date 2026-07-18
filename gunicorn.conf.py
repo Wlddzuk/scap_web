@@ -4,7 +4,7 @@
 bind = "0.0.0.0:5050"
 backlog = 2048
 
-# Workers — use threads for background video generation
+# Workers — threads for background video generation; capped to fit RAM alongside Kokoro/PyTorch
 workers = 2
 threads = 4
 worker_class = "gthread"
@@ -19,3 +19,8 @@ loglevel = "info"
 # Process
 proc_name = "clipper"
 daemon = False
+pidfile = None
+umask = 0
+user = None
+group = None
+tmp_upload_dir = None

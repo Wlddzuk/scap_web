@@ -12,6 +12,8 @@ let articles = [];
 let expandedArticles = new Set();
 let searchQuery = '';
 let initialLoadDone = false;
+let availableStyles = [];       // loaded from /api/styles
+let selectedStyleByArticle = {}; // { [articleId]: 'manga' } — user override
 
 // ============================================
 // API Functions
@@ -144,6 +146,43 @@ async function summarizeArticle(articleId) {
     }
 }
 
+async function loadStyles() {
+    try {
+        const res = await fetch(`${API_BASE}/api/styles`);
+        const data = await res.json();
+        availableStyles = data.styles || [];
+    } catch (err) {
+        console.warn('Failed to load styles', err);
+    }
+}
+
+function selectStyle(articleId, styleKey) {
+    selectedStyleByArticle[articleId] = styleKey;
+    // Update chip highlighting in place (no full re-render needed)
+    const container = document.querySelector(`.style-picker[data-article-id="${articleId}"]`);
+    if (container) {
+        container.querySelectorAll('.style-chip').forEach(chip => {
+            chip.classList.toggle('selected', chip.dataset.styleKey === styleKey);
+        });
+    }
+}
+
+function getVideoHookPref() {
+    // localStorage value is the source of truth; checkbox is its UI mirror.
+    return localStorage.getItem('clipper_video_hook') === '1';
+}
+
+function onHookToggleChange() {
+    const cb = document.getElementById('video-hook-toggle');
+    if (!cb) return;
+    localStorage.setItem('clipper_video_hook', cb.checked ? '1' : '0');
+}
+
+function syncHookToggle() {
+    const cb = document.getElementById('video-hook-toggle');
+    if (cb) cb.checked = getVideoHookPref();
+}
+
 async function generateVideo(articleId, imageSource = 'ai') {
     const btn = document.querySelector(`[data-video="${articleId}"]`);
     if (btn) {
@@ -151,13 +190,23 @@ async function generateVideo(articleId, imageSource = 'ai') {
         btn.textContent = 'Generating...';
     }
 
-    showToast('Generating video - this may take a few minutes', 'info');
+    const article = articles.find(a => a.id === articleId);
+    const chosenStyle = selectedStyleByArticle[articleId] || (article && article.style) || null;
+    const useVideoHook = getVideoHookPref();
+
+    const hookLabel = useVideoHook ? ' · AI video hook' : '';
+    showToast(`Generating video${chosenStyle ? ' (' + chosenStyle + ')' : ''}${hookLabel} — this may take a few minutes`, 'info');
 
     try {
+        const body = {};
+        if (chosenStyle) body.style = chosenStyle;
+        body.use_video_hook = useVideoHook;
+        body.image_source = imageSource;
+
         const response = await fetch(`${API_BASE}/api/articles/${articleId}/video`, {
             method: 'POST',
             headers: { 'Content-Type': 'application/json' },
-            body: JSON.stringify({ image_source: imageSource })
+            body: JSON.stringify(body)
         });
 
         const data = await response.json();
@@ -356,6 +405,12 @@ function renderArticles() {
     const searchBar = document.getElementById('search-bar');
     const sectionHeader = document.getElementById('section-header');
     const sectionTitle = document.getElementById('section-title');
+    const scraperForm = document.querySelector('.url-scraper-form');
+
+    // Collapse the hero once the user has articles — full pitch only matters on the empty dashboard.
+    if (scraperForm) {
+        scraperForm.classList.toggle('compact', articles.length > 0);
+    }
 
     if (articles.length === 0) {
         container.classList.add('hidden');
@@ -447,33 +502,80 @@ function renderArticleCard(article) {
 }
 
 function getStatusBadges(article) {
-    const badges = [];
-
-    badges.push('<span class="badge badge-scraped">Scraped</span>');
-
-    if (article.status === 'summarizing') {
-        badges.push('<span class="badge badge-processing">Summarizing</span>');
-    } else if (article.tldr) {
-        badges.push('<span class="badge badge-summarized">Summarized</span>');
-    }
-
-    if (article.status === 'generating_video') {
-        badges.push('<span class="badge badge-processing">Generating Video</span>');
-    } else if (article.video_path) {
-        badges.push('<span class="badge badge-video">Video Ready</span>');
-    }
-
-    if (article.status === 'generating_carousel') {
-        badges.push('<span class="badge badge-processing">Generating Carousel</span>');
-    } else if (article.carousel_dir) {
-        badges.push('<span class="badge badge-carousel">Carousel Ready</span>');
-    }
-
+    // Single current-state pill. Priority: failed > processing > completed > scraped.
     if (article.status === 'failed') {
-        badges.push('<span class="badge badge-failed">Failed</span>');
+        return '<span class="badge badge-failed">Failed</span>';
     }
+    if (article.status === 'generating_video') {
+        return '<span class="badge badge-processing">Generating Video</span>';
+    }
+    if (article.status === 'generating_carousel') {
+        return '<span class="badge badge-processing">Generating Carousel</span>';
+    }
+    if (article.status === 'summarizing') {
+        return '<span class="badge badge-processing">Summarizing</span>';
+    }
+    if (article.video_path) {
+        return '<span class="badge badge-video">Video Ready</span>';
+    }
+    if (article.carousel_dir) {
+        return '<span class="badge badge-carousel">Carousel Ready</span>';
+    }
+    if (article.tldr) {
+        return '<span class="badge badge-summarized">Summarized</span>';
+    }
+    return '<span class="badge badge-scraped">Scraped</span>';
+}
 
-    return badges.join('');
+function renderStylePicker(article) {
+    if (!availableStyles.length) return '';
+    const currentStyle = selectedStyleByArticle[article.id] || article.style || null;
+    const suggested = article.style;
+
+    return `
+        <div class="summary-section">
+            <div class="summary-label">
+                Visual Style
+                ${article.dominant_emotion ? `<span class="emotion-pill">${escapeHtml(article.dominant_emotion)}</span>` : ''}
+            </div>
+            <div class="style-picker" data-article-id="${article.id}">
+                ${availableStyles.map(s => `
+                    <button
+                        type="button"
+                        class="style-chip ${currentStyle === s.key ? 'selected' : ''}"
+                        data-style-key="${s.key}"
+                        onclick="event.stopPropagation(); selectStyle(${article.id}, '${s.key}')"
+                        title="${escapeHtml(s.description)}${suggested === s.key ? ' (AI suggested)' : ''}"
+                    >
+                        <span class="style-emoji">${s.emoji}</span>
+                        <span class="style-name">${escapeHtml(s.name)}</span>
+                        ${suggested === s.key ? '<span class="style-suggested-dot" title="AI suggested"></span>' : ''}
+                        <span class="style-palette">
+                            ${(s.palette || []).slice(0, 4).map(c => `<i style="background:${c}"></i>`).join('')}
+                        </span>
+                    </button>
+                `).join('')}
+            </div>
+        </div>
+    `;
+}
+
+function renderHookVariants(article) {
+    const variants = article.hook_variants || [];
+    if (variants.length === 0) return '';
+    return `
+        <div class="summary-section">
+            <div class="summary-label">Hook Options (AI wrote ${variants.length})</div>
+            <ol class="hook-variants">
+                ${variants.map((h, i) => `
+                    <li class="hook-variant">
+                        <span class="hook-index">${i + 1}</span>
+                        <span class="hook-text">${escapeHtml(h)}</span>
+                    </li>
+                `).join('')}
+            </ol>
+        </div>
+    `;
 }
 
 function renderSummary(article) {
@@ -503,6 +605,9 @@ function renderSummary(article) {
             </ul>
         </div>
 
+        ${renderHookVariants(article)}
+        ${renderStylePicker(article)}
+
         ${article.video_script ? `
             <div class="summary-section">
                 <div class="summary-label">Video Script</div>
@@ -512,7 +617,7 @@ function renderSummary(article) {
 
     ${article.video_path ? `
             <div class="video-container">
-                <video controls preload="metadata">
+                <video controls preload="none" playsinline>
                     <source src="/videos/${encodeURIComponent(article.video_path)}" type="video/mp4">
                     Your browser does not support the video tag.
                 </video>
@@ -574,6 +679,8 @@ function renderSummary(article) {
                 </div>
             </div>
         ` : ''}
+
+        ${renderSubstackSection(article)}
     `;
 }
 
@@ -735,6 +842,92 @@ function showToast(message, type = 'info') {
 // Utility Functions
 // ============================================
 
+function renderSubstackSection(article) {
+    if (!article.tldr) return '';
+
+    if (article.substack_post) {
+        return `
+            <div class="substack-section">
+                <div class="summary-label">
+                    Substack Post
+                    <div class="substack-actions-inline">
+                        <button class="copy-substack-btn" onclick="copySubstackPost(event, ${article.id})">
+                            Copy Post
+                        </button>
+                        <button class="regenerate-substack-btn" id="substack-btn-${article.id}" onclick="generateSubstackPost(event, ${article.id}, true)" title="Regenerate with latest prompt">
+                            Regenerate
+                        </button>
+                    </div>
+                </div>
+                <textarea class="substack-preview" readonly>${escapeHtml(article.substack_post)}</textarea>
+            </div>
+        `;
+    }
+
+    return `
+        <div class="substack-section substack-generate">
+            <div class="summary-label">Substack Post</div>
+            <p class="substack-hint">Turn this story into a long-form newsletter your readers will love — with everyday analogies and a conversational tone.</p>
+            <button class="btn btn-secondary" id="substack-btn-${article.id}" onclick="generateSubstackPost(event, ${article.id})">
+                Generate Substack Post
+            </button>
+        </div>
+    `;
+}
+
+async function generateSubstackPost(event, articleId, regenerate = false) {
+    event.stopPropagation();
+    const btn = document.getElementById(`substack-btn-${articleId}`);
+    const originalText = btn ? btn.textContent : 'Generate Substack Post';
+    if (btn) {
+        btn.disabled = true;
+        btn.textContent = regenerate ? 'Regenerating…' : 'Generating…';
+    }
+
+    try {
+        const url = `/api/articles/${articleId}/substack${regenerate ? '?regenerate=1' : ''}`;
+        const response = await fetch(url, { method: 'POST' });
+        const data = await response.json();
+        if (!response.ok) throw new Error(data.error || 'Generation failed');
+
+        // Update in-memory array and re-render the card
+        const idx = articles.findIndex(a => a.id === articleId);
+        if (idx !== -1) articles[idx] = data.article;
+
+        const card = document.querySelector(`.article-card[data-article-id="${articleId}"]`);
+        if (card) {
+            const contentEl = card.querySelector('.article-content');
+            if (contentEl) {
+                contentEl.querySelector('.substack-section').outerHTML = renderSubstackSection(data.article);
+            }
+        }
+        showToast(regenerate ? 'Substack post regenerated!' : 'Substack post ready!', 'success');
+    } catch (err) {
+        console.error('Substack generation failed:', err);
+        showToast('Failed to generate Substack post', 'error');
+        if (btn) {
+            btn.disabled = false;
+            btn.textContent = originalText;
+        }
+    }
+}
+
+function copySubstackPost(event, articleId) {
+    event.stopPropagation();
+    const article = articles.find(a => a.id === articleId);
+    if (!article || !article.substack_post) return;
+
+    navigator.clipboard.writeText(article.substack_post).then(() => {
+        showToast('Substack post copied to clipboard!', 'success');
+        const btn = event.target.closest('.copy-substack-btn');
+        if (btn) {
+            const original = btn.textContent;
+            btn.textContent = 'Copied!';
+            setTimeout(() => { btn.textContent = original; }, 2000);
+        }
+    }).catch(() => showToast('Failed to copy post', 'error'));
+}
+
 function copyHashtags(event, articleId) {
     event.stopPropagation();
 
@@ -811,6 +1004,8 @@ document.addEventListener('DOMContentLoaded', () => {
     // Hide empty state initially (show skeleton instead)
     document.getElementById('empty-state').classList.add('hidden');
 
+    syncHookToggle();
+    loadStyles();
     handleBookmarkletHash();
     fetchArticles();
 
