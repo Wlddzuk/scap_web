@@ -1,0 +1,27 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>Connecting TikTok — 60s Science Studio</title>
+  <style>
+    body { margin: 0; min-height: 100vh; display: grid; place-items: center; background: #09090d; color: #fff; font: 16px/1.5 system-ui, sans-serif; }
+    main { max-width: 34rem; padding: 2rem; text-align: center; }
+    p { color: #aaaab8; }
+    a { color: #25f4ee; }
+  </style>
+</head>
+<body>
+  <main>
+    <h1>Connecting TikTok…</h1>
+    <p id="status">Returning securely to Clipper on this computer. <a id="continue-link">Continue manually</a></p>
+    <noscript>JavaScript is required to finish the local TikTok connection.</noscript>
+  </main>
+  <script>
+    const localCallback = 'http://127.0.0.1:5050/api/tiktok/oauth/callback';
+    const destination = localCallback + window.location.search;
+    document.getElementById('continue-link').href = destination;
+    window.location.replace(destination);
+  </script>
+</body>
+</html>
