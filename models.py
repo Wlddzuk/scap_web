@@ -43,6 +43,12 @@ class Article(db.Model):
     # Video output
     video_path = db.Column(db.String(512), nullable=True)
 
+    # TikTok Direct Post state
+    tiktok_publish_id = db.Column(db.String(256), nullable=True)
+    tiktok_publish_status = db.Column(db.String(64), nullable=True)
+    tiktok_publish_error = db.Column(db.Text, nullable=True)
+    tiktok_published_at = db.Column(db.DateTime, nullable=True)
+
     # Carousel output
     carousel_dir = db.Column(db.String(512), nullable=True)   # e.g. "42"
     carousel_audio = db.Column(db.String(512), nullable=True)  # e.g. "voiceover.wav"
@@ -81,6 +87,10 @@ class Article(db.Model):
             'dominant_emotion': self.dominant_emotion,
             'style': self.style,
             'video_path': self.video_path,
+            'tiktok_publish_id': self.tiktok_publish_id,
+            'tiktok_publish_status': self.tiktok_publish_status,
+            'tiktok_publish_error': self.tiktok_publish_error,
+            'tiktok_published_at': self.tiktok_published_at.isoformat() if self.tiktok_published_at else None,
             'carousel_dir': self.carousel_dir,
             'carousel_audio': self.carousel_audio,
             'substack_post': self.substack_post,
@@ -90,3 +100,40 @@ class Article(db.Model):
             result['full_content'] = self.content
 
         return result
+
+
+class TikTokAccount(db.Model):
+    """The single TikTok creator account connected to this Clipper instance."""
+
+    __tablename__ = 'tiktok_accounts'
+
+    id = db.Column(db.Integer, primary_key=True)
+    open_id = db.Column(db.String(128), unique=True, nullable=False)
+    access_token_encrypted = db.Column(db.Text, nullable=False)
+    refresh_token_encrypted = db.Column(db.Text, nullable=False)
+    scope = db.Column(db.String(512), nullable=True)
+    access_token_expires_at = db.Column(db.DateTime, nullable=False)
+    refresh_token_expires_at = db.Column(db.DateTime, nullable=False)
+
+    creator_username = db.Column(db.String(128), nullable=True)
+    creator_nickname = db.Column(db.String(256), nullable=True)
+    creator_avatar_url = db.Column(db.String(2048), nullable=True)
+    connected_at = db.Column(db.DateTime, default=lambda: datetime.now(timezone.utc))
+    updated_at = db.Column(
+        db.DateTime,
+        default=lambda: datetime.now(timezone.utc),
+        onupdate=lambda: datetime.now(timezone.utc),
+    )
+
+    def to_public_dict(self):
+        """Return connection metadata without ever exposing OAuth tokens."""
+        return {
+            'connected': True,
+            'open_id': self.open_id,
+            'scope': self.scope.split(',') if self.scope else [],
+            'creator_username': self.creator_username,
+            'creator_nickname': self.creator_nickname,
+            'creator_avatar_url': self.creator_avatar_url,
+            'access_token_expires_at': self.access_token_expires_at.isoformat() if self.access_token_expires_at else None,
+            'connected_at': self.connected_at.isoformat() if self.connected_at else None,
+        }

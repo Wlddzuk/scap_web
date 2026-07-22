@@ -154,6 +154,32 @@ Any failure of the video hook silently falls back to the image hook.
 long-form, conversational Substack post from the article's summary and scene
 beats. Cached on the article; pass `{"regenerate": true}` to rewrite.
 
+## TikTok Direct Post
+
+Clipper can connect one creator account with TikTok Login Kit and upload a
+generated MP4 through the Content Posting API. OAuth access and refresh tokens
+are encrypted before they are stored in SQLite, refreshed automatically, and
+never returned by the API.
+
+Configure the TikTok app and callback:
+
+```env
+FLASK_SECRET_KEY=a-long-random-secret
+TIKTOK_CLIENT_KEY=your-client-key
+TIKTOK_CLIENT_SECRET=your-client-secret
+TIKTOK_REDIRECT_URI=https://clipper.example.com/api/tiktok/oauth/callback
+TIKTOK_TOKEN_ENCRYPTION_KEY=a-separate-long-random-secret
+TIKTOK_ALLOW_PUBLIC_POSTS=false
+SESSION_COOKIE_SECURE=true
+```
+
+In the TikTok Developer Portal, add Login Kit and Content Posting API, register
+the exact static HTTPS redirect URI above, and request `user.info.basic` plus
+`video.publish`. The dashboard fetches creator settings before every upload,
+requires an explicit privacy selection and music-usage consent, and leaves
+comments, Duet, and Stitch off by default. Until TikTok audits the client,
+Clipper locks uploads to `SELF_ONLY` (Only you).
+
 ## Quick Start
 
 ```bash

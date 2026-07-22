@@ -6,13 +6,14 @@ import re
 import logging
 import ipaddress
 import socket
-from datetime import datetime, timezone
-from urllib.parse import urlparse
+import secrets
+from datetime import datetime, timezone, timedelta
+from urllib.parse import urlparse, urlencode
 from threading import Thread
 import shutil
 import zipfile
 from io import BytesIO
-from flask import Flask, request, jsonify, send_from_directory, send_file
+from flask import Flask, request, jsonify, send_from_directory, send_file, session, redirect
 from flask_cors import CORS
 from werkzeug.utils import secure_filename
 from dotenv import load_dotenv
@@ -21,11 +22,24 @@ from bs4 import BeautifulSoup
 
 load_dotenv()
 
-from models import db, Article
+from models import db, Article, TikTokAccount
 from summarizer import summarize_article
 from video_generator import generate_video
 from carousel_generator import generate_carousel
 from visual_styles import list_styles, get_style, STYLES as VISUAL_STYLES
+from tiktok_service import (
+    AUTH_URL as TIKTOK_AUTH_URL,
+    TikTokAPIError,
+    TokenCipher,
+    exchange_code as tiktok_exchange_code,
+    refresh_access_token as tiktok_refresh_access_token,
+    revoke_access_token as tiktok_revoke_access_token,
+    query_creator_info as tiktok_query_creator_info,
+    make_upload_plan,
+    initialize_video_post,
+    upload_video_file,
+    fetch_publish_status,
+)
 
 # Configure logging
 logging.basicConfig(
@@ -168,6 +182,18 @@ def scrape_url_content(url):
 # Initialize Flask app
 app = Flask(__name__, static_folder='static')
 
+# OAuth state is kept in Flask's signed session cookie. Production must set a
+# stable secret so callbacks remain valid across process restarts/workers.
+_configured_flask_secret = os.getenv('FLASK_SECRET_KEY')
+app.secret_key = _configured_flask_secret or secrets.token_hex(32)
+app.config.update(
+    SESSION_COOKIE_HTTPONLY=True,
+    SESSION_COOKIE_SAMESITE='Lax',
+    SESSION_COOKIE_SECURE=os.getenv('SESSION_COOKIE_SECURE', 'false').lower() == 'true',
+)
+if not _configured_flask_secret:
+    logger.warning('FLASK_SECRET_KEY is not set; TikTok OAuth is disabled until configured')
+
 # Configure CORS
 allowed_origins = os.getenv('CORS_ORIGINS', 'http://localhost:3000,http://localhost:5050').split(',')
 CORS(app, resources={
@@ -201,6 +227,10 @@ def _migrate_schema():
         ("carousel_audio", "VARCHAR(512)"),
         ("carousel_generated_at", "DATETIME"),
         ("viral_score", "FLOAT"),
+        ("tiktok_publish_id", "VARCHAR(256)"),
+        ("tiktok_publish_status", "VARCHAR(64)"),
+        ("tiktok_publish_error", "TEXT"),
+        ("tiktok_published_at", "DATETIME"),
     ]
 
     with app.app_context():
@@ -277,6 +307,157 @@ def validate_api_keys():
 
 
 validate_api_keys()
+
+
+# ============================================================
+# TikTok connection helpers
+# ============================================================
+
+TIKTOK_SCOPES = ('user.info.basic', 'video.publish')
+TIKTOK_PENDING_STATUSES = {
+    'INITIALIZING',
+    'UPLOADING',
+    'PROCESSING_UPLOAD',
+    'PROCESSING_DOWNLOAD',
+}
+
+
+def _tiktok_config():
+    return {
+        'client_key': os.getenv('TIKTOK_CLIENT_KEY', '').strip(),
+        'client_secret': os.getenv('TIKTOK_CLIENT_SECRET', '').strip(),
+        'redirect_uri': os.getenv('TIKTOK_REDIRECT_URI', '').strip(),
+        'encryption_secret': (
+            os.getenv('TIKTOK_TOKEN_ENCRYPTION_KEY', '').strip()
+            or (_configured_flask_secret or '')
+        ),
+    }
+
+
+def _tiktok_missing_config():
+    config = _tiktok_config()
+    missing = []
+    if not config['client_key']:
+        missing.append('TIKTOK_CLIENT_KEY')
+    if not config['client_secret']:
+        missing.append('TIKTOK_CLIENT_SECRET')
+    if not config['redirect_uri']:
+        missing.append('TIKTOK_REDIRECT_URI')
+    if not _configured_flask_secret:
+        missing.append('FLASK_SECRET_KEY')
+    if not config['encryption_secret']:
+        missing.append('TIKTOK_TOKEN_ENCRYPTION_KEY')
+    return missing
+
+
+def _tiktok_cipher():
+    return TokenCipher(_tiktok_config()['encryption_secret'])
+
+
+def _as_utc(value):
+    if value is None:
+        return None
+    if value.tzinfo is None:
+        return value.replace(tzinfo=timezone.utc)
+    return value.astimezone(timezone.utc)
+
+
+def _store_tiktok_tokens(token_data):
+    required = ('open_id', 'access_token', 'refresh_token', 'expires_in', 'refresh_expires_in')
+    missing = [key for key in required if token_data.get(key) in (None, '')]
+    if missing:
+        raise TikTokAPIError(
+            f"TikTok token response omitted: {', '.join(missing)}",
+            code='invalid_token_response',
+        )
+
+    cipher = _tiktok_cipher()
+    now = datetime.now(timezone.utc)
+    account = TikTokAccount.query.order_by(TikTokAccount.id.asc()).first()
+    if account is None:
+        account = TikTokAccount(open_id=token_data['open_id'])
+        db.session.add(account)
+
+    account.open_id = token_data['open_id']
+    account.access_token_encrypted = cipher.encrypt(token_data['access_token'])
+    account.refresh_token_encrypted = cipher.encrypt(token_data['refresh_token'])
+    account.scope = token_data.get('scope') or account.scope
+    account.access_token_expires_at = now + timedelta(seconds=int(token_data['expires_in']))
+    account.refresh_token_expires_at = now + timedelta(seconds=int(token_data['refresh_expires_in']))
+    account.updated_at = now
+    db.session.commit()
+    return account
+
+
+def _connected_tiktok_account():
+    return TikTokAccount.query.order_by(TikTokAccount.id.asc()).first()
+
+
+def _tiktok_access_token():
+    """Return a valid access token, refreshing it five minutes before expiry."""
+    account = _connected_tiktok_account()
+    if account is None:
+        raise TikTokAPIError('Connect a TikTok account first', code='not_connected')
+
+    config = _tiktok_config()
+    cipher = _tiktok_cipher()
+    now = datetime.now(timezone.utc)
+    expiry = _as_utc(account.access_token_expires_at)
+    if expiry and expiry > now + timedelta(minutes=5):
+        return cipher.decrypt(account.access_token_encrypted), account
+
+    refresh_expiry = _as_utc(account.refresh_token_expires_at)
+    if refresh_expiry and refresh_expiry <= now:
+        raise TikTokAPIError('TikTok connection expired; reconnect the account', code='refresh_expired')
+
+    refreshed = tiktok_refresh_access_token(
+        client_key=config['client_key'],
+        client_secret=config['client_secret'],
+        refresh_token=cipher.decrypt(account.refresh_token_encrypted),
+    )
+    account = _store_tiktok_tokens(refreshed)
+    return _tiktok_cipher().decrypt(account.access_token_encrypted), account
+
+
+def _refresh_creator_info():
+    access_token, account = _tiktok_access_token()
+    creator = tiktok_query_creator_info(access_token)
+    account.creator_username = creator.get('creator_username')
+    account.creator_nickname = creator.get('creator_nickname')
+    account.creator_avatar_url = creator.get('creator_avatar_url')
+    account.updated_at = datetime.now(timezone.utc)
+    db.session.commit()
+    return access_token, account, creator
+
+
+def _tiktok_error_response(error, default_status=502):
+    status = error.status_code if error.status_code and 400 <= error.status_code < 500 else default_status
+    return jsonify({'error': str(error), 'tiktok_error': error.to_dict()}), status
+
+
+def _video_file_for_article(article):
+    if not article.video_path:
+        raise ValueError('Generate a video before posting to TikTok')
+
+    videos_dir = os.path.realpath(os.path.join(app.root_path, 'static', 'videos'))
+    video_path = os.path.realpath(os.path.join(videos_dir, article.video_path))
+    if os.path.commonpath([videos_dir, video_path]) != videos_dir:
+        raise ValueError('Invalid video path')
+    if not os.path.isfile(video_path):
+        raise ValueError('Generated video file is missing')
+    if not video_path.lower().endswith('.mp4'):
+        raise ValueError('TikTok posting currently supports MP4 videos only')
+    return video_path
+
+
+def _video_duration_seconds(video_path):
+    from moviepy.editor import VideoFileClip
+
+    clip = VideoFileClip(video_path, audio=False)
+    try:
+        return float(clip.duration)
+    finally:
+        clip.close()
 
 
 # ============================================================
@@ -1153,6 +1334,262 @@ def generate_substack_endpoint(article_id):
     except Exception as e:
         logger.error("Substack post generation failed for article %s: %s", article_id, e, exc_info=True)
         return jsonify({'error': 'Failed to generate Substack post'}), 500
+
+
+@app.route('/api/tiktok/status', methods=['GET'])
+def tiktok_connection_status():
+    """Return safe connection metadata; OAuth tokens are never serialized."""
+    missing = _tiktok_missing_config()
+    account = _connected_tiktok_account()
+    payload = {
+        'configured': not missing,
+        'missing_config': missing,
+        'connected': account is not None,
+        'public_posting_enabled': os.getenv('TIKTOK_ALLOW_PUBLIC_POSTS', 'false').lower() == 'true',
+    }
+    if account:
+        payload.update(account.to_public_dict())
+    return jsonify(payload)
+
+
+@app.route('/api/tiktok/oauth/start', methods=['GET'])
+def tiktok_oauth_start():
+    """Start TikTok Login Kit authorization with a signed CSRF state."""
+    missing = _tiktok_missing_config()
+    if missing:
+        return jsonify({'error': f"TikTok is not configured: {', '.join(missing)}"}), 503
+
+    config = _tiktok_config()
+    state = secrets.token_urlsafe(32)
+    session['tiktok_oauth_state'] = state
+    session['tiktok_oauth_issued_at'] = int(datetime.now(timezone.utc).timestamp())
+    authorize_query = urlencode({
+        'client_key': config['client_key'],
+        'response_type': 'code',
+        'scope': ','.join(TIKTOK_SCOPES),
+        'redirect_uri': config['redirect_uri'],
+        'state': state,
+    })
+    authorize_url = f"{TIKTOK_AUTH_URL}?{authorize_query}"
+    return redirect(authorize_url)
+
+
+@app.route('/api/tiktok/oauth/callback', methods=['GET'])
+def tiktok_oauth_callback():
+    """Validate TikTok's callback, exchange the code, and store encrypted tokens."""
+    expected_state = session.pop('tiktok_oauth_state', None)
+    issued_at = session.pop('tiktok_oauth_issued_at', None)
+    returned_state = request.args.get('state', '')
+    now_ts = int(datetime.now(timezone.utc).timestamp())
+
+    if (
+        not expected_state
+        or not returned_state
+        or not secrets.compare_digest(expected_state, returned_state)
+        or not issued_at
+        or now_ts - int(issued_at) > 600
+    ):
+        logger.warning('Rejected TikTok OAuth callback with invalid or expired state')
+        return redirect('/?tiktok=error&reason=invalid_state')
+
+    if request.args.get('error'):
+        logger.warning('TikTok OAuth denied: %s', request.args.get('error'))
+        return redirect('/?tiktok=error&reason=authorization_denied')
+
+    code = request.args.get('code', '')
+    if not code:
+        return redirect('/?tiktok=error&reason=missing_code')
+
+    try:
+        config = _tiktok_config()
+        token_data = tiktok_exchange_code(
+            client_key=config['client_key'],
+            client_secret=config['client_secret'],
+            code=code,
+            redirect_uri=config['redirect_uri'],
+        )
+        _store_tiktok_tokens(token_data)
+        try:
+            _refresh_creator_info()
+        except TikTokAPIError as creator_error:
+            # The OAuth connection is still valid. Creator data will be retried
+            # when the user opens the posting dialog.
+            logger.warning('Connected TikTok but creator info lookup failed: %s', creator_error)
+        return redirect('/?tiktok=connected')
+    except (TikTokAPIError, ValueError) as error:
+        logger.error('TikTok OAuth callback failed: %s', error)
+        return redirect('/?tiktok=error&reason=token_exchange_failed')
+
+
+@app.route('/api/tiktok/disconnect', methods=['POST'])
+def tiktok_disconnect():
+    """Revoke the access token when possible, then remove local credentials."""
+    account = _connected_tiktok_account()
+    if account is None:
+        return jsonify({'message': 'TikTok is already disconnected'})
+
+    try:
+        config = _tiktok_config()
+        access_token = _tiktok_cipher().decrypt(account.access_token_encrypted)
+        tiktok_revoke_access_token(
+            client_key=config['client_key'],
+            client_secret=config['client_secret'],
+            access_token=access_token,
+        )
+    except (TikTokAPIError, ValueError) as error:
+        logger.warning('TikTok token revocation failed; removing local token anyway: %s', error)
+
+    db.session.delete(account)
+    db.session.commit()
+    return jsonify({'message': 'TikTok disconnected'})
+
+
+@app.route('/api/tiktok/creator-info', methods=['POST'])
+def tiktok_creator_info():
+    """Fetch the latest creator settings required by TikTok's posting UX."""
+    if _tiktok_missing_config():
+        return jsonify({'error': 'TikTok is not configured'}), 503
+    try:
+        _, account, creator = _refresh_creator_info()
+        return jsonify({
+            'account': account.to_public_dict(),
+            'creator': creator,
+            'public_posting_enabled': os.getenv('TIKTOK_ALLOW_PUBLIC_POSTS', 'false').lower() == 'true',
+        })
+    except TikTokAPIError as error:
+        return _tiktok_error_response(error)
+    except ValueError as error:
+        return jsonify({'error': str(error)}), 500
+
+
+@app.route('/api/articles/<int:article_id>/tiktok/publish', methods=['POST'])
+def tiktok_publish_article(article_id):
+    """Upload a generated video through TikTok's Direct Post API."""
+    article = db.session.get(Article, article_id)
+    if not article:
+        return jsonify({'error': 'Article not found'}), 404
+
+    payload = request.get_json(silent=True) or {}
+    if payload.get('consent') is not True:
+        return jsonify({'error': 'TikTok music usage consent is required'}), 400
+
+    try:
+        video_path = _video_file_for_article(article)
+    except ValueError as error:
+        return jsonify({'error': str(error)}), 400
+
+    if article.tiktok_publish_status in TIKTOK_PENDING_STATUSES:
+        return jsonify({'error': 'This video already has a TikTok post in progress'}), 409
+
+    title = str(payload.get('title') or '').strip()
+    if not title:
+        return jsonify({'error': 'Enter a TikTok caption'}), 400
+    if len(title) > 2_200:
+        return jsonify({'error': 'TikTok caption must be 2,200 characters or fewer'}), 400
+
+    privacy_level = str(payload.get('privacy_level') or '').strip()
+    if not privacy_level:
+        return jsonify({'error': 'Select a TikTok privacy setting'}), 400
+
+    allow_public = os.getenv('TIKTOK_ALLOW_PUBLIC_POSTS', 'false').lower() == 'true'
+    if not allow_public and privacy_level != 'SELF_ONLY':
+        return jsonify({
+            'error': 'This unaudited integration is locked to Only you (SELF_ONLY) posts'
+        }), 400
+
+    brand_content = payload.get('brand_content_toggle') is True
+    brand_organic = payload.get('brand_organic_toggle') is True
+    if brand_content and privacy_level == 'SELF_ONLY':
+        return jsonify({
+            'error': 'TikTok does not allow branded content posts with Only you privacy'
+        }), 400
+
+    article.tiktok_publish_status = 'INITIALIZING'
+    article.tiktok_publish_error = None
+    db.session.commit()
+
+    try:
+        access_token, _, creator = _refresh_creator_info()
+        privacy_options = creator.get('privacy_level_options') or []
+        if privacy_level not in privacy_options:
+            raise ValueError('That privacy setting is not available for this TikTok account')
+
+        duration = _video_duration_seconds(video_path)
+        max_duration = int(creator.get('max_video_post_duration_sec') or 0)
+        if max_duration and duration > max_duration:
+            raise ValueError(
+                f'This video is {duration:.1f}s; the connected account allows up to {max_duration}s'
+            )
+
+        allow_comment = payload.get('allow_comment') is True and not creator.get('comment_disabled', False)
+        allow_duet = payload.get('allow_duet') is True and not creator.get('duet_disabled', False)
+        allow_stitch = payload.get('allow_stitch') is True and not creator.get('stitch_disabled', False)
+
+        upload_plan = make_upload_plan(os.path.getsize(video_path))
+        initialized = initialize_video_post(
+            access_token=access_token,
+            title=title,
+            privacy_level=privacy_level,
+            disable_comment=not allow_comment,
+            disable_duet=not allow_duet,
+            disable_stitch=not allow_stitch,
+            brand_content_toggle=brand_content,
+            brand_organic_toggle=brand_organic,
+            upload_plan=upload_plan,
+        )
+
+        article.tiktok_publish_id = initialized['publish_id']
+        article.tiktok_publish_status = 'UPLOADING'
+        db.session.commit()
+
+        upload_video_file(initialized['upload_url'], video_path, upload_plan)
+        article.tiktok_publish_status = 'PROCESSING_UPLOAD'
+        db.session.commit()
+
+        return jsonify({
+            'message': 'Video uploaded to TikTok for processing',
+            'article': article.to_dict(),
+            'publish_id': article.tiktok_publish_id,
+        }), 202
+    except (TikTokAPIError, ValueError) as error:
+        logger.error('TikTok publish failed for article %s: %s', article_id, error)
+        article.tiktok_publish_status = 'FAILED'
+        article.tiktok_publish_error = str(error)
+        db.session.commit()
+        if isinstance(error, TikTokAPIError):
+            return _tiktok_error_response(error)
+        return jsonify({'error': str(error)}), 400
+    except Exception as error:
+        logger.error('Unexpected TikTok publish failure for article %s: %s', article_id, error, exc_info=True)
+        article.tiktok_publish_status = 'FAILED'
+        article.tiktok_publish_error = 'Unexpected upload failure'
+        db.session.commit()
+        return jsonify({'error': 'Unexpected TikTok upload failure'}), 500
+
+
+@app.route('/api/articles/<int:article_id>/tiktok/status', methods=['POST'])
+def tiktok_article_publish_status(article_id):
+    """Refresh one article's Direct Post status from TikTok."""
+    article = db.session.get(Article, article_id)
+    if not article:
+        return jsonify({'error': 'Article not found'}), 404
+    if not article.tiktok_publish_id:
+        return jsonify({'error': 'This article has not been sent to TikTok'}), 400
+
+    try:
+        access_token, _ = _tiktok_access_token()
+        status_data = fetch_publish_status(access_token, article.tiktok_publish_id)
+        status = status_data.get('status') or article.tiktok_publish_status or 'UNKNOWN'
+        article.tiktok_publish_status = status
+        article.tiktok_publish_error = status_data.get('fail_reason') or None
+        if status == 'PUBLISH_COMPLETE' and not article.tiktok_published_at:
+            article.tiktok_published_at = datetime.now(timezone.utc)
+        db.session.commit()
+        return jsonify({'article': article.to_dict(), 'tiktok': status_data})
+    except TikTokAPIError as error:
+        article.tiktok_publish_error = str(error)
+        db.session.commit()
+        return _tiktok_error_response(error)
 
 
 @app.route('/api/styles', methods=['GET'])

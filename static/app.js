@@ -14,6 +14,7 @@ let searchQuery = '';
 let initialLoadDone = false;
 let availableStyles = [];       // loaded from /api/styles
 let selectedStyleByArticle = {}; // { [articleId]: 'manga' } — user override
+let tiktokConnection = { configured: false, connected: false };
 
 // ============================================
 // API Functions
@@ -56,11 +57,71 @@ function articlesChanged(prev, next) {
             prev[i].status !== next[i].status ||
             prev[i].video_path !== next[i].video_path ||
             prev[i].carousel_dir !== next[i].carousel_dir ||
+            prev[i].tiktok_publish_status !== next[i].tiktok_publish_status ||
+            prev[i].tiktok_publish_error !== next[i].tiktok_publish_error ||
             prev[i].tldr !== next[i].tldr) {
             return true;
         }
     }
     return false;
+}
+
+async function loadTikTokStatus() {
+    try {
+        const response = await fetch(`${API_BASE}/api/tiktok/status`);
+        tiktokConnection = await response.json();
+        renderTikTokConnection();
+    } catch (error) {
+        console.warn('Failed to load TikTok connection status', error);
+    }
+}
+
+function renderTikTokConnection() {
+    const container = document.getElementById('tiktok-connection');
+    const label = document.getElementById('tiktok-connection-label');
+    const button = document.getElementById('tiktok-connect-btn');
+    if (!container || !label || !button) return;
+
+    container.classList.toggle('connected', Boolean(tiktokConnection.connected));
+    if (tiktokConnection.connected) {
+        const accountName = tiktokConnection.creator_nickname || tiktokConnection.creator_username || 'Connected';
+        label.textContent = accountName;
+        button.textContent = 'Disconnect';
+        button.disabled = false;
+        button.onclick = disconnectTikTok;
+    } else if (!tiktokConnection.configured) {
+        label.textContent = 'TikTok setup needed';
+        button.textContent = 'Connect';
+        button.disabled = true;
+        button.title = `Missing: ${(tiktokConnection.missing_config || []).join(', ')}`;
+        button.onclick = connectTikTok;
+    } else {
+        label.textContent = 'TikTok not connected';
+        button.textContent = 'Connect';
+        button.disabled = false;
+        button.onclick = connectTikTok;
+    }
+}
+
+function connectTikTok() {
+    if (!tiktokConnection.configured) {
+        showToast(`TikTok setup is missing: ${(tiktokConnection.missing_config || []).join(', ')}`, 'error');
+        return;
+    }
+    window.location.href = '/api/tiktok/oauth/start';
+}
+
+async function disconnectTikTok() {
+    if (!confirm('Disconnect this TikTok account from Clipper?')) return;
+    try {
+        const response = await fetch('/api/tiktok/disconnect', { method: 'POST' });
+        const data = await response.json();
+        if (!response.ok) throw new Error(data.error || 'Disconnect failed');
+        showToast('TikTok disconnected', 'success');
+        await loadTikTokStatus();
+    } catch (error) {
+        showToast(error.message || 'Failed to disconnect TikTok', 'error');
+    }
 }
 
 async function scrapeUrl(event) {
@@ -352,6 +413,204 @@ function closeQrModal() {
 }
 
 // ============================================
+// TikTok Direct Post
+// ============================================
+
+function formatTikTokStatus(status) {
+    const labels = {
+        INITIALIZING: 'Preparing upload',
+        UPLOADING: 'Uploading video',
+        PROCESSING_UPLOAD: 'Processing upload',
+        PROCESSING_DOWNLOAD: 'Processing video',
+        PUBLISH_COMPLETE: 'Published',
+        FAILED: 'Failed',
+        SEND_TO_USER_INBOX: 'Sent to TikTok inbox'
+    };
+    return labels[status] || (status || 'Unknown').replaceAll('_', ' ').toLowerCase();
+}
+
+function closeTikTokModal() {
+    const modal = document.getElementById('tiktok-modal');
+    if (modal) {
+        modal.classList.remove('active');
+        setTimeout(() => modal.remove(), 200);
+    }
+}
+
+function suggestedTikTokCaption(article) {
+    const hashtags = (article.hashtags || []).join(' ');
+    return `${article.title}${hashtags ? `\n\n${hashtags}` : ''}`.slice(0, 2200);
+}
+
+async function openTikTokPostDialog(event, articleId) {
+    if (event) event.stopPropagation();
+    if (!tiktokConnection.connected) {
+        if (tiktokConnection.configured) {
+            showToast('Connect your TikTok account first', 'info');
+            connectTikTok();
+        } else {
+            showToast('TikTok app credentials still need to be configured', 'error');
+        }
+        return;
+    }
+
+    const article = articles.find(item => item.id === articleId);
+    if (!article || !article.video_path) return;
+    showToast('Loading the latest TikTok account settings…', 'info');
+
+    try {
+        const response = await fetch('/api/tiktok/creator-info', { method: 'POST' });
+        const data = await response.json();
+        if (!response.ok) throw new Error(data.error || 'Could not load TikTok creator settings');
+        renderTikTokPostDialog(article, data.creator, data.account, data.public_posting_enabled);
+    } catch (error) {
+        showToast(error.message || 'Could not open TikTok posting', 'error');
+    }
+}
+
+function renderTikTokPostDialog(article, creator, account, publicPostingEnabled) {
+    closeTikTokModal();
+    const modal = document.createElement('div');
+    modal.id = 'tiktok-modal';
+    modal.className = 'tiktok-modal-overlay';
+    modal.onclick = (event) => { if (event.target === modal) closeTikTokModal(); };
+
+    const privacyLabels = {
+        PUBLIC_TO_EVERYONE: 'Everyone',
+        MUTUAL_FOLLOW_FRIENDS: 'Friends',
+        FOLLOWER_OF_CREATOR: 'Followers',
+        SELF_ONLY: 'Only you'
+    };
+    const privacyOptions = creator.privacy_level_options || [];
+    const creatorName = creator.creator_nickname || creator.creator_username || account.creator_nickname || 'TikTok creator';
+    const avatar = creator.creator_avatar_url
+        ? `<img src="${escapeHtml(creator.creator_avatar_url)}" alt="" class="tiktok-creator-avatar">`
+        : '<div class="tiktok-creator-avatar placeholder">♪</div>';
+
+    modal.innerHTML = `
+        <div class="tiktok-modal-content">
+            <button class="qr-modal-close" onclick="closeTikTokModal()">&times;</button>
+            <div class="tiktok-modal-heading">
+                <div class="tiktok-mark">♪</div>
+                <div>
+                    <h3>Post video to TikTok</h3>
+                    <p>Review every setting before uploading.</p>
+                </div>
+            </div>
+            <div class="tiktok-creator-card">
+                ${avatar}
+                <div>
+                    <strong>${escapeHtml(creatorName)}</strong>
+                    <span>${creator.creator_username ? '@' + escapeHtml(creator.creator_username) : 'Connected account'}</span>
+                </div>
+            </div>
+            <form id="tiktok-post-form" onsubmit="submitTikTokPost(event, ${article.id})">
+                <label class="tiktok-field">
+                    <span>Caption</span>
+                    <textarea id="tiktok-caption" maxlength="2200" required>${escapeHtml(suggestedTikTokCaption(article))}</textarea>
+                    <small><span id="tiktok-caption-count">${suggestedTikTokCaption(article).length}</span>/2200</small>
+                </label>
+                <label class="tiktok-field">
+                    <span>Who can watch this video?</span>
+                    <select id="tiktok-privacy" required>
+                        <option value="" selected disabled>Select privacy</option>
+                        ${privacyOptions.map(option => {
+                            const locked = !publicPostingEnabled && option !== 'SELF_ONLY';
+                            return `<option value="${escapeHtml(option)}" ${locked ? 'disabled' : ''}>${escapeHtml(privacyLabels[option] || option)}${locked ? ' · requires TikTok audit' : ''}</option>`;
+                        }).join('')}
+                    </select>
+                    ${!publicPostingEnabled ? '<small>Unaudited TikTok apps can post privately only.</small>' : ''}
+                </label>
+                <fieldset class="tiktok-fieldset">
+                    <legend>Allow people to</legend>
+                    <label><input type="checkbox" id="tiktok-comments" ${creator.comment_disabled ? 'disabled' : ''}> Comment</label>
+                    <label><input type="checkbox" id="tiktok-duet" ${creator.duet_disabled ? 'disabled' : ''}> Duet</label>
+                    <label><input type="checkbox" id="tiktok-stitch" ${creator.stitch_disabled ? 'disabled' : ''}> Stitch</label>
+                    <small>Nothing is enabled by default. Disabled options follow your TikTok settings.</small>
+                </fieldset>
+                <fieldset class="tiktok-fieldset">
+                    <legend>Content disclosure</legend>
+                    <label><input type="checkbox" id="tiktok-own-brand"> Promotes my own brand or business</label>
+                    <label><input type="checkbox" id="tiktok-branded-content"> Paid partnership or third-party brand</label>
+                </fieldset>
+                <label class="tiktok-consent">
+                    <input type="checkbox" id="tiktok-consent" required>
+                    <span>By posting, I agree to TikTok's <a href="https://www.tiktok.com/legal/page/global/music-usage-confirmation/en" target="_blank" rel="noopener">Music Usage Confirmation</a>.</span>
+                </label>
+                <div class="tiktok-modal-actions">
+                    <button type="button" class="btn btn-action" onclick="closeTikTokModal()">Cancel</button>
+                    <button type="submit" class="btn btn-action btn-tiktok" id="tiktok-submit">Upload privately</button>
+                </div>
+            </form>
+        </div>
+    `;
+    document.body.appendChild(modal);
+    const caption = document.getElementById('tiktok-caption');
+    caption.addEventListener('input', () => {
+        document.getElementById('tiktok-caption-count').textContent = caption.value.length;
+    });
+    requestAnimationFrame(() => modal.classList.add('active'));
+}
+
+async function submitTikTokPost(event, articleId) {
+    event.preventDefault();
+    const submit = document.getElementById('tiktok-submit');
+    const privacy = document.getElementById('tiktok-privacy').value;
+    if (!privacy) {
+        showToast('Choose a TikTok privacy setting', 'error');
+        return;
+    }
+
+    submit.disabled = true;
+    submit.textContent = 'Uploading…';
+    try {
+        const response = await fetch(`/api/articles/${articleId}/tiktok/publish`, {
+            method: 'POST',
+            headers: { 'Content-Type': 'application/json' },
+            body: JSON.stringify({
+                title: document.getElementById('tiktok-caption').value,
+                privacy_level: privacy,
+                allow_comment: document.getElementById('tiktok-comments').checked,
+                allow_duet: document.getElementById('tiktok-duet').checked,
+                allow_stitch: document.getElementById('tiktok-stitch').checked,
+                brand_organic_toggle: document.getElementById('tiktok-own-brand').checked,
+                brand_content_toggle: document.getElementById('tiktok-branded-content').checked,
+                consent: document.getElementById('tiktok-consent').checked
+            })
+        });
+        const data = await response.json();
+        if (!response.ok) throw new Error(data.error || 'TikTok upload failed');
+
+        const index = articles.findIndex(article => article.id === articleId);
+        if (index !== -1) articles[index] = data.article;
+        closeTikTokModal();
+        renderArticles();
+        showToast('Video uploaded. TikTok is processing it privately.', 'success');
+    } catch (error) {
+        showToast(error.message || 'TikTok upload failed', 'error');
+        submit.disabled = false;
+        submit.textContent = 'Upload privately';
+    }
+}
+
+async function refreshTikTokPublishStatus(event, articleId, quiet = false) {
+    if (event) event.stopPropagation();
+    try {
+        const response = await fetch(`/api/articles/${articleId}/tiktok/status`, { method: 'POST' });
+        const data = await response.json();
+        if (!response.ok) throw new Error(data.error || 'Could not refresh TikTok status');
+        const index = articles.findIndex(article => article.id === articleId);
+        if (index !== -1) articles[index] = data.article;
+        renderArticles();
+        if (!quiet && data.article.tiktok_publish_status === 'PUBLISH_COMPLETE') {
+            showToast('TikTok post is complete', 'success');
+        }
+    } catch (error) {
+        if (!quiet) showToast(error.message || 'Could not refresh TikTok status', 'error');
+    }
+}
+
+// ============================================
 // Search / Filter
 // ============================================
 
@@ -502,29 +761,38 @@ function renderArticleCard(article) {
 }
 
 function getStatusBadges(article) {
+    let tiktokBadge = '';
+    if (article.tiktok_publish_status === 'PUBLISH_COMPLETE') {
+        tiktokBadge = '<span class="badge badge-tiktok">TikTok Posted</span>';
+    } else if (['INITIALIZING', 'UPLOADING', 'PROCESSING_UPLOAD', 'PROCESSING_DOWNLOAD'].includes(article.tiktok_publish_status)) {
+        tiktokBadge = '<span class="badge badge-processing">TikTok Processing</span>';
+    } else if (article.tiktok_publish_status === 'FAILED') {
+        tiktokBadge = '<span class="badge badge-failed">TikTok Failed</span>';
+    }
+
     // Single current-state pill. Priority: failed > processing > completed > scraped.
     if (article.status === 'failed') {
-        return '<span class="badge badge-failed">Failed</span>';
+        return '<span class="badge badge-failed">Failed</span>' + tiktokBadge;
     }
     if (article.status === 'generating_video') {
-        return '<span class="badge badge-processing">Generating Video</span>';
+        return '<span class="badge badge-processing">Generating Video</span>' + tiktokBadge;
     }
     if (article.status === 'generating_carousel') {
-        return '<span class="badge badge-processing">Generating Carousel</span>';
+        return '<span class="badge badge-processing">Generating Carousel</span>' + tiktokBadge;
     }
     if (article.status === 'summarizing') {
-        return '<span class="badge badge-processing">Summarizing</span>';
+        return '<span class="badge badge-processing">Summarizing</span>' + tiktokBadge;
     }
     if (article.video_path) {
-        return '<span class="badge badge-video">Video Ready</span>';
+        return '<span class="badge badge-video">Video Ready</span>' + tiktokBadge;
     }
     if (article.carousel_dir) {
-        return '<span class="badge badge-carousel">Carousel Ready</span>';
+        return '<span class="badge badge-carousel">Carousel Ready</span>' + tiktokBadge;
     }
     if (article.tldr) {
-        return '<span class="badge badge-summarized">Summarized</span>';
+        return '<span class="badge badge-summarized">Summarized</span>' + tiktokBadge;
     }
-    return '<span class="badge badge-scraped">Scraped</span>';
+    return '<span class="badge badge-scraped">Scraped</span>' + tiktokBadge;
 }
 
 function renderStylePicker(article) {
@@ -631,7 +899,21 @@ function renderSummary(article) {
                         onclick="showQrModal(${article.id}, '${escapeHtml(article.title)}', 'video')">
                     📱 Send to Phone
                 </button>
+                <button class="btn btn-action btn-tiktok"
+                        onclick="openTikTokPostDialog(event, ${article.id})"
+                        ${['INITIALIZING', 'UPLOADING', 'PROCESSING_UPLOAD', 'PROCESSING_DOWNLOAD'].includes(article.tiktok_publish_status) ? 'disabled' : ''}>
+                    ${article.tiktok_publish_status === 'PUBLISH_COMPLETE' ? '✓ Posted to TikTok' : 'Post to TikTok'}
+                </button>
             </div>
+            ${article.tiktok_publish_status ? `
+                <div class="tiktok-post-state ${article.tiktok_publish_status === 'FAILED' ? 'failed' : ''}">
+                    TikTok: ${escapeHtml(formatTikTokStatus(article.tiktok_publish_status))}
+                    ${article.tiktok_publish_error ? ` · ${escapeHtml(article.tiktok_publish_error)}` : ''}
+                    ${article.tiktok_publish_id && article.tiktok_publish_status !== 'PUBLISH_COMPLETE' ? `
+                        <button onclick="refreshTikTokPublishStatus(event, ${article.id})">Check status</button>
+                    ` : ''}
+                </div>
+            ` : ''}
         ` : ''}
 
         ${article.carousel_dir ? `
@@ -1006,8 +1288,18 @@ document.addEventListener('DOMContentLoaded', () => {
 
     syncHookToggle();
     loadStyles();
+    loadTikTokStatus();
     handleBookmarkletHash();
     fetchArticles();
+
+    const query = new URLSearchParams(window.location.search);
+    if (query.get('tiktok') === 'connected') {
+        showToast('TikTok account connected', 'success');
+        history.replaceState(null, '', window.location.pathname + window.location.hash);
+    } else if (query.get('tiktok') === 'error') {
+        showToast('TikTok connection failed. Check the app configuration and try again.', 'error');
+        history.replaceState(null, '', window.location.pathname + window.location.hash);
+    }
 
     // Poll for status updates when articles are processing
     setInterval(() => {
@@ -1017,5 +1309,9 @@ document.addEventListener('DOMContentLoaded', () => {
         if (hasProcessing) {
             fetchArticles();
         }
+
+        articles
+            .filter(article => ['INITIALIZING', 'UPLOADING', 'PROCESSING_UPLOAD', 'PROCESSING_DOWNLOAD'].includes(article.tiktok_publish_status))
+            .forEach(article => refreshTikTokPublishStatus(null, article.id, true));
     }, 5000);
 });
