@@ -80,10 +80,12 @@ CAPTION_UPPERCASE=true
 VIDEO_CRF=26
 ```
 
-`CAPTION_UPPERCASE=true` uppercases caption cues and removes only trailing
-commas/periods (question marks and exclamation points are kept). Set it to
-`false` to preserve Whisper's letter case. `VIDEO_CRF=26` controls H.264
-quality and file size; lower values increase both.
+`CAPTION_UPPERCASE=true` uppercases every cue consistently. Cue grouping keeps
+numbers with their units, avoids ending on articles/prepositions, and removes
+trailing sentence punctuation consistently. Each currently spoken word is
+highlighted karaoke-style. Set the flag to `false` to preserve Whisper's
+letter case. `VIDEO_CRF=26` controls H.264 quality and file size; lower values
+increase both.
 
 Code that needs a clean render without word captions can call
 `generate_video(..., captions=False)`. The opening headline remains enabled.
@@ -106,7 +108,8 @@ already stored in the Article table, then sends the complete unseen batch to
 Groq once for 0–100 viral scoring based on wow-factor, visual potential, broad
 appeal, curiosity gap, and fit for a 60-second @60s.science2 TikTok.
 
-Manual discovery is always available in Discord:
+Manual discovery is always available from the dashboard's **Find today's
+stories** button or Discord:
 
 ```text
 !discover
@@ -148,6 +151,19 @@ instead of stills — toggle it per-run in the dashboard, or set a default:
 
 Any failure of the video hook silently falls back to the image hook.
 
+When real motion is enabled, Clipper can also animate selected high-impact body
+scenes. `MAX_VIDEO_CLIPS_PER_VIDEO=3` caps the hook and body clips together;
+the estimated motion cost is logged before rendering and any failed clip falls
+back to its existing still/Ken Burns scene.
+
+## Music Bed
+
+Three CC0 procedural loops are bundled in `static/audio/music/`. With
+`MUSIC_ENABLED=true` (the default), one is mixed beneath narration at about
+-22 dBFS during speech and -12 dBFS in gaps, using the existing Whisper word
+timings for ducking. Music fades in for 0.5 seconds and out over the final
+second. Missing or invalid audio always falls back to voice-only rendering.
+
 ## Substack Companion Posts
 
 `POST /api/articles/<id>/substack` (or the dashboard button) generates a
@@ -174,11 +190,89 @@ SESSION_COOKIE_SECURE=true
 ```
 
 In the TikTok Developer Portal, add Login Kit and Content Posting API, register
-the exact static HTTPS redirect URI above, and request `user.info.basic` plus
-`video.publish`. The dashboard fetches creator settings before every upload,
-requires an explicit privacy selection and music-usage consent, and leaves
-comments, Duet, and Stitch off by default. Until TikTok audits the client,
-Clipper locks uploads to `SELF_ONLY` (Only you).
+the exact static HTTPS redirect URI above, and enable `user.info.basic` plus
+`video.publish`. Those two scopes are sufficient to connect and post.
+
+Performance feedback is optional. After adding Display API and enabling both
+`video.list` and `user.info.stats` for this exact TikTok app, set
+`TIKTOK_REQUEST_METRICS_SCOPES=true` and click **Reconnect** once. Leave that
+flag false until the scopes are available: TikTok rejects the entire Login Kit
+request when it contains an unavailable scope. Clipper refreshes
+view/like/comment/share counters on a schedule and feeds top/bottom performers
+back into story scoring. TikTok's Display API does not expose watch time, so
+that field remains empty rather than being estimated.
+
+Publishing is manual-only. Generating a video never starts an upload: review
+the finished video, choose **Post**, select the destination(s), and confirm.
+Until TikTok audits the client, Clipper enforces `SELF_ONLY` (Only you). TikTok
+also requires the connected TikTok account itself to be **Private** while the
+client is unaudited.
+
+## Manual multi-platform publishing
+
+Finished videos use one **Post** picker. Each connected destination is opt-in
+for that video, and each result is stored independently. One destination
+failing does not prevent the others from completing.
+
+Instagram Reels uses Meta's pull-based Content Publishing API. Clipper creates a
+short-lived HMAC-signed URL under `/public-media/`; the supplied `Caddyfile`
+allows only that signed route through without Basic Auth. Everything else stays
+protected. Configure the Oracle/Caddy HTTPS origin and Meta callback:
+
+```env
+PUBLIC_BASE_URL=https://clipper.example.com
+PUBLIC_MEDIA_SIGNING_KEY=a-long-random-secret
+INSTAGRAM_APP_ID=your-meta-app-id
+INSTAGRAM_APP_SECRET=your-meta-app-secret
+INSTAGRAM_REDIRECT_URI=https://clipper.example.com/api/instagram/oauth/callback
+```
+
+The Instagram account must be Business or Creator and linked to a Facebook
+Page. The Meta app needs `instagram_basic` and `instagram_content_publish`, plus
+App Review before posting for users outside the app's test roles. Meta limits
+the account to 50 published posts per rolling 24 hours. Long-lived tokens last
+roughly 60 days; Clipper refreshes them near expiry and displays an expiry
+warning in the header.
+
+Facebook Reels publishes to a managed Facebook Page with Meta's
+start/upload/finish flow:
+
+```env
+FACEBOOK_APP_ID=your-facebook-app-id
+FACEBOOK_APP_SECRET=your-facebook-app-secret
+FACEBOOK_REDIRECT_URI=https://clipper.example.com/api/facebook/oauth/callback
+FACEBOOK_GRAPH_VERSION=v23.0
+```
+
+The Page connection needs `pages_show_list`, `pages_manage_posts`, and
+`pages_read_engagement`. App Review is required before people outside the Meta
+app's roles can publish. Clipper stores the Page access token with the existing
+encrypted `PublisherAccount` store, polls processing Reels to a terminal state,
+and leaves each other selected destination independent if Facebook fails.
+
+YouTube Shorts uses `videos.insert` with a resumable upload and the
+`youtube.upload` scope:
+
+```env
+YOUTUBE_CLIENT_ID=your-google-oauth-client-id
+YOUTUBE_CLIENT_SECRET=your-google-oauth-client-secret
+YOUTUBE_REDIRECT_URI=https://clipper.example.com/api/youtube/oauth/callback
+```
+
+Publish the Google OAuth consent screen: refresh tokens from projects left in
+Testing expire after seven days. Unverified upload projects are restricted to
+private videos until Google completes verification. YouTube's current default
+granular Video Uploads quota is 100 uploads per day.
+
+The intended operational defaults are explicit in `.env.example`:
+
+```env
+DISCOVERY_ENABLED=true
+MUSIC_ENABLED=true
+MAX_VIDEO_CLIPS_PER_VIDEO=3
+TIKTOK_ALLOW_PUBLIC_POSTS=false
+TIKTOK_REQUEST_METRICS_SCOPES=false
+```
 
 ## Quick Start
 
@@ -190,9 +284,9 @@ cp .env.example .env
 # 2. Run with Docker
 docker compose up -d
 
-# 3. Or run locally
+# 3. Or run locally (dashboard and scheduler)
 pip install -r requirements.txt
-python discord_bot.py
+python app.py
 ```
 
 ## Manual Caption Test
@@ -223,6 +317,18 @@ With no Pexels key, gradient backgrounds are used. The resulting MP4 in
 `static/videos/` should have a headline for roughly 2.5 seconds and large,
 word-synced white captions with black outlines in the safe lower third.
 
+To list the legacy pre-caption videos, then safely re-render them only after
+reviewing the dry run:
+
+```bash
+python scripts/rerender_stale_videos.py
+python scripts/rerender_stale_videos.py --execute
+```
+
+The script keeps the database unchanged unless a complete replacement exists
+and tries progressively smaller encodes when needed to stay under Discord's
+25 MB upload limit.
+
 ## Deploy to Oracle Cloud Free Tier
 
 ```bash
@@ -240,3 +346,21 @@ word-synced white captions with black outlines in the safe lower third.
 - **PEXELS_API_KEY** — stock photo alternative to AI images
 - **MISTRAL_API_KEY** — fallback summarizer
 - **GEMINI_API_KEY** — Gemini summarizer fallback and primary TTS in `auto` mode; Kokoro is used without it
+
+## Generation budget indicator
+
+The header's **API budget** pill uses the ordinary `FAL_KEY` and
+`OPENROUTER_API_KEY` to show both providers' real remaining balances. It also
+shows the smaller limiting balance, an estimate of standard videos remaining,
+and amber/red warnings controlled by:
+
+```env
+BUDGET_LOW_USD=5
+BUDGET_CRITICAL_USD=1
+```
+
+Optional admin/management keys remain supported as overrides, but they are not
+required. Failed or changed provider responses display “unavailable” rather
+than a misleading zero, and no credential fragments or raw provider bodies are
+returned to the browser. Groq and Gemini expose authoritative spend through
+their own dashboards, so Clipper labels them as configured and links out.

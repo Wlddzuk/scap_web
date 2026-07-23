@@ -23,6 +23,20 @@ REVOKE_URL = "https://open.tiktokapis.com/v2/oauth/revoke/"
 CREATOR_INFO_URL = "https://open.tiktokapis.com/v2/post/publish/creator_info/query/"
 PUBLISH_INIT_URL = "https://open.tiktokapis.com/v2/post/publish/video/init/"
 PUBLISH_STATUS_URL = "https://open.tiktokapis.com/v2/post/publish/status/fetch/"
+VIDEO_LIST_URL = "https://open.tiktokapis.com/v2/video/list/"
+USER_INFO_URL = "https://open.tiktokapis.com/v2/user/info/"
+
+VIDEO_METRIC_FIELDS = (
+    "id",
+    "create_time",
+    "title",
+    "video_description",
+    "duration",
+    "view_count",
+    "like_count",
+    "comment_count",
+    "share_count",
+)
 
 MIN_CHUNK_SIZE = 5_000_000
 MAX_CHUNK_SIZE = 64_000_000
@@ -54,6 +68,17 @@ class TikTokAPIError(RuntimeError):
             "message": str(self),
             "log_id": self.log_id,
         }
+
+
+def _request(request_call, *args, **kwargs) -> requests.Response:
+    """Normalize transport failures without exposing request internals."""
+    try:
+        return request_call(*args, **kwargs)
+    except requests.RequestException as exc:
+        raise TikTokAPIError(
+            "TikTok could not be reached",
+            code="network_error",
+        ) from exc
 
 
 class TokenCipher:
@@ -114,7 +139,8 @@ def _json_response(response: requests.Response) -> dict[str, Any]:
 def exchange_code(
     *, client_key: str, client_secret: str, code: str, redirect_uri: str
 ) -> dict[str, Any]:
-    response = requests.post(
+    response = _request(
+        requests.post,
         TOKEN_URL,
         headers={"Content-Type": "application/x-www-form-urlencoded"},
         data={
@@ -132,7 +158,8 @@ def exchange_code(
 def refresh_access_token(
     *, client_key: str, client_secret: str, refresh_token: str
 ) -> dict[str, Any]:
-    response = requests.post(
+    response = _request(
+        requests.post,
         TOKEN_URL,
         headers={"Content-Type": "application/x-www-form-urlencoded"},
         data={
@@ -149,7 +176,8 @@ def refresh_access_token(
 def revoke_access_token(
     *, client_key: str, client_secret: str, access_token: str
 ) -> None:
-    response = requests.post(
+    response = _request(
+        requests.post,
         REVOKE_URL,
         headers={"Content-Type": "application/x-www-form-urlencoded"},
         data={
@@ -163,7 +191,8 @@ def revoke_access_token(
 
 
 def _authorized_post(url: str, access_token: str, payload: dict[str, Any]) -> dict[str, Any]:
-    response = requests.post(
+    response = _request(
+        requests.post,
         url,
         headers={
             "Authorization": f"Bearer {access_token}",
@@ -273,7 +302,8 @@ def upload_video_file(upload_url: str, video_path: str, upload_plan: UploadPlan)
             end = start + chunk_length - 1
             chunk = _read_chunk(video_file, chunk_length)
 
-            response = requests.put(
+            response = _request(
+                requests.put,
                 upload_url,
                 headers={
                     "Content-Type": "video/mp4",
@@ -304,3 +334,50 @@ def fetch_publish_status(access_token: str, publish_id: str) -> dict[str, Any]:
         {"publish_id": publish_id},
     )
     return payload.get("data") or {}
+
+
+def list_user_videos(
+    access_token: str,
+    *,
+    max_count: int = 20,
+    cursor: int | None = None,
+) -> dict[str, Any]:
+    """Return a creator's recent videos and public engagement counters.
+
+    The Display API caps each page at 20 videos. Watch time is intentionally
+    not requested because TikTok's public ``video.list`` contract does not
+    expose it.
+    """
+    if not 1 <= max_count <= 20:
+        raise ValueError("TikTok video list max_count must be between 1 and 20")
+
+    body: dict[str, Any] = {"max_count": max_count}
+    if cursor is not None:
+        body["cursor"] = cursor
+    response = _request(
+        requests.post,
+        VIDEO_LIST_URL,
+        params={"fields": ",".join(VIDEO_METRIC_FIELDS)},
+        headers={
+            "Authorization": f"Bearer {access_token}",
+            "Content-Type": "application/json; charset=UTF-8",
+        },
+        json=body,
+        timeout=30,
+    )
+    return _json_response(response).get("data") or {}
+
+
+def query_user_stats(access_token: str) -> dict[str, Any]:
+    """Return account-level totals granted by ``user.info.stats``."""
+    response = _request(
+        requests.get,
+        USER_INFO_URL,
+        params={
+            "fields": "open_id,display_name,follower_count,following_count,likes_count,video_count"
+        },
+        headers={"Authorization": f"Bearer {access_token}"},
+        timeout=30,
+    )
+    payload = _json_response(response)
+    return (payload.get("data") or {}).get("user") or {}

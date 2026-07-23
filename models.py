@@ -42,12 +42,21 @@ class Article(db.Model):
 
     # Video output
     video_path = db.Column(db.String(512), nullable=True)
+    # Unique ownership token for one background render attempt. This prevents
+    # a timed-out worker from overwriting a later retry that is still running.
+    video_generation_token = db.Column(db.String(64), nullable=True)
 
     # TikTok Direct Post state
     tiktok_publish_id = db.Column(db.String(256), nullable=True)
     tiktok_publish_status = db.Column(db.String(64), nullable=True)
     tiktok_publish_error = db.Column(db.Text, nullable=True)
     tiktok_published_at = db.Column(db.DateTime, nullable=True)
+    # Legacy nullable columns retained because Clipper's SQLite migration is
+    # additive-only. New releases never write approval requests; startup
+    # maintenance clears old rows safely.
+    tiktok_approval_message_id = db.Column(db.String(64), nullable=True)
+    tiktok_approval_requested_at = db.Column(db.DateTime, nullable=True)
+    pending_publish_request = db.Column(db.Text, nullable=True)
 
     # Carousel output
     carousel_dir = db.Column(db.String(512), nullable=True)   # e.g. "42"
@@ -91,15 +100,174 @@ class Article(db.Model):
             'tiktok_publish_status': self.tiktok_publish_status,
             'tiktok_publish_error': self.tiktok_publish_error,
             'tiktok_published_at': self.tiktok_published_at.isoformat() if self.tiktok_published_at else None,
+            'platform_posts': [post.to_dict() for post in self.platform_posts],
             'carousel_dir': self.carousel_dir,
             'carousel_audio': self.carousel_audio,
             'substack_post': self.substack_post,
+            'video_metrics': self.video_metrics.to_dict() if self.video_metrics else None,
         }
 
         if include_full_content:
             result['full_content'] = self.content
 
         return result
+
+
+class PlatformPost(db.Model):
+    """One durable publish attempt/state per article and destination."""
+
+    __tablename__ = 'platform_posts'
+    __table_args__ = (
+        db.UniqueConstraint(
+            'article_id',
+            'platform',
+            name='uq_platform_posts_article_platform',
+        ),
+    )
+
+    id = db.Column(db.Integer, primary_key=True)
+    article_id = db.Column(
+        db.Integer,
+        db.ForeignKey('articles.id', ondelete='CASCADE'),
+        nullable=False,
+        index=True,
+    )
+    platform = db.Column(db.String(32), nullable=False, index=True)
+    external_id = db.Column(db.String(512), nullable=True)
+    status = db.Column(db.String(64), nullable=False, default='QUEUED')
+    error = db.Column(db.Text, nullable=True)
+    permalink = db.Column(db.String(2048), nullable=True)
+    published_at = db.Column(db.DateTime, nullable=True)
+    created_at = db.Column(
+        db.DateTime,
+        default=lambda: datetime.now(timezone.utc),
+        nullable=False,
+    )
+    updated_at = db.Column(
+        db.DateTime,
+        default=lambda: datetime.now(timezone.utc),
+        onupdate=lambda: datetime.now(timezone.utc),
+        nullable=False,
+    )
+
+    article = db.relationship(
+        'Article',
+        backref=db.backref(
+            'platform_posts',
+            cascade='all, delete-orphan',
+            order_by='PlatformPost.platform',
+        ),
+    )
+
+    def to_dict(self):
+        return {
+            'platform': self.platform,
+            'status': self.status,
+            'external_id': self.external_id,
+            'error': self.error,
+            'permalink': self.permalink,
+            'published_at': self.published_at.isoformat() if self.published_at else None,
+            'created_at': self.created_at.isoformat() if self.created_at else None,
+            'updated_at': self.updated_at.isoformat() if self.updated_at else None,
+        }
+
+
+class PublisherAccount(db.Model):
+    """Encrypted OAuth credentials for non-TikTok publishing providers."""
+
+    __tablename__ = 'publisher_accounts'
+
+    id = db.Column(db.Integer, primary_key=True)
+    platform = db.Column(db.String(32), unique=True, nullable=False, index=True)
+    external_user_id = db.Column(db.String(256), nullable=True)
+    username = db.Column(db.String(256), nullable=True)
+    access_token_encrypted = db.Column(db.Text, nullable=False)
+    refresh_token_encrypted = db.Column(db.Text, nullable=True)
+    scope = db.Column(db.String(1024), nullable=True)
+    access_token_expires_at = db.Column(db.DateTime, nullable=True)
+    refresh_token_expires_at = db.Column(db.DateTime, nullable=True)
+    connected_at = db.Column(
+        db.DateTime,
+        default=lambda: datetime.now(timezone.utc),
+        nullable=False,
+    )
+    updated_at = db.Column(
+        db.DateTime,
+        default=lambda: datetime.now(timezone.utc),
+        onupdate=lambda: datetime.now(timezone.utc),
+        nullable=False,
+    )
+
+    def to_public_dict(self):
+        """Serialize only safe metadata; encrypted token fields stay private."""
+        return {
+            'connected': True,
+            'external_user_id': self.external_user_id,
+            'username': self.username,
+            'scope': self.scope.split() if self.scope else [],
+            'access_token_expires_at': (
+                self.access_token_expires_at.isoformat()
+                if self.access_token_expires_at else None
+            ),
+            'refresh_token_expires_at': (
+                self.refresh_token_expires_at.isoformat()
+                if self.refresh_token_expires_at else None
+            ),
+            'connected_at': self.connected_at.isoformat() if self.connected_at else None,
+        }
+
+
+class VideoMetrics(db.Model):
+    """Latest performance snapshot for a TikTok video created from an article.
+
+    TikTok's Display API exposes view and engagement counts, but it does not
+    currently expose watch time. ``watch_time`` is therefore nullable so the
+    schema is ready if/when that metric becomes available without inventing a
+    value in the meantime.
+    """
+
+    __tablename__ = 'video_metrics'
+
+    id = db.Column(db.Integer, primary_key=True)
+    article_id = db.Column(
+        db.Integer,
+        db.ForeignKey('articles.id', ondelete='CASCADE'),
+        nullable=False,
+        unique=True,
+        index=True,
+    )
+    tiktok_video_id = db.Column(db.String(128), nullable=False, unique=True, index=True)
+    views = db.Column(db.BigInteger, nullable=False, default=0)
+    likes = db.Column(db.BigInteger, nullable=False, default=0)
+    comments = db.Column(db.BigInteger, nullable=False, default=0)
+    shares = db.Column(db.BigInteger, nullable=False, default=0)
+    watch_time = db.Column(db.Float, nullable=True)
+    fetched_at = db.Column(
+        db.DateTime,
+        nullable=True,
+    )
+
+    article = db.relationship(
+        'Article',
+        backref=db.backref(
+            'video_metrics',
+            uselist=False,
+            cascade='all, delete-orphan',
+            single_parent=True,
+        ),
+    )
+
+    def to_dict(self):
+        return {
+            'article_id': self.article_id,
+            'tiktok_video_id': self.tiktok_video_id,
+            'views': self.views,
+            'likes': self.likes,
+            'comments': self.comments,
+            'shares': self.shares,
+            'watch_time': self.watch_time,
+            'fetched_at': self.fetched_at.isoformat() if self.fetched_at else None,
+        }
 
 
 class TikTokAccount(db.Model):

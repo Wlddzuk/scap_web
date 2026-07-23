@@ -17,8 +17,13 @@ import feedparser
 import requests
 from bs4 import BeautifulSoup
 
-from app import app, db, scrape_url_content
-from models import Article
+from app import (
+    app,
+    db,
+    scrape_url_content,
+    validate_url,
+)
+from models import Article, VideoMetrics
 from summarizer import summarize_article
 from video_generator import generate_video, get_groq_client
 
@@ -32,12 +37,39 @@ FEEDS = {
 }
 REDDIT_URL = "https://www.reddit.com/r/science/top.json?t=day&limit=25"
 USER_AGENT = "ClipperStoryFinder/1.0 (+https://github.com/clipper; science-video-discovery)"
+BROWSER_HEADERS = {
+    "User-Agent": (
+        "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) "
+        "AppleWebKit/537.36 (KHTML, like Gecko) "
+        "Chrome/126.0.0.0 Safari/537.36"
+    ),
+    "Accept": (
+        "text/html,application/xhtml+xml,application/xml;q=0.9,"
+        "image/avif,image/webp,*/*;q=0.8"
+    ),
+    "Accept-Language": "en-US,en;q=0.9",
+}
 NETWORK_TIMEOUT = 15
+PREFLIGHT_TIMEOUT = (3.05, 6)
 SCORING_TIMEOUT = 60
 MAX_FEED_ITEMS = 10
 MAX_REDDIT_ITEMS = 10
+MIN_RSS_FALLBACK_CHARS = 200
 TRACKING_QUERY_PREFIXES = ("utm_",)
 TRACKING_QUERY_KEYS = {"fbclid", "gclid", "mc_cid", "mc_eid"}
+
+PIPELINE_FAILURE_MESSAGES = {
+    "scrape": "Scrape failed: the source article could not be read.",
+    "summarize": "Summary failed: the story could not be summarized.",
+    "render": "Video render failed: the video could not be created.",
+}
+SCRAPE_FAILURE_MESSAGES = {
+    "source_blocked": (
+        "Scrape failed: the source blocked automated access and its feed "
+        "summary was too short to use."
+    ),
+    "not_enough_text": "Scrape failed: the source did not contain enough readable text.",
+}
 
 
 @dataclass
@@ -52,9 +84,27 @@ class StoryCandidate:
     reddit_score: int = 0
     viral_score: Optional[float] = None
     score_reason: str = ""
+    use_rss_fallback: bool = False
 
     def to_dict(self) -> dict:
         return asdict(self)
+
+
+class CandidateReachabilityError(RuntimeError):
+    """A classified discovery pre-flight failure safe to reason about."""
+
+    def __init__(self, reason: str, status_code: int | None = None):
+        super().__init__(reason)
+        self.reason = reason
+        self.status_code = status_code
+
+
+class CandidateScrapeError(RuntimeError):
+    """A scrape-stage failure with a stable, non-provider-specific reason."""
+
+    def __init__(self, reason: str):
+        super().__init__(reason)
+        self.reason = reason
 
 
 def _request_with_retry(url: str, **kwargs) -> requests.Response:
@@ -106,6 +156,126 @@ def _canonical_url(url: str) -> str:
         )
     except (TypeError, ValueError):
         return ""
+
+
+def _candidate_domain(candidate: StoryCandidate) -> str:
+    key = _canonical_url(candidate.url)
+    return (urlsplit(key).hostname or "").lower() if key else ""
+
+
+def _has_usable_rss_summary(candidate: StoryCandidate) -> bool:
+    return (
+        candidate.source != "Reddit r/science"
+        and len(_plain_text(candidate.summary, limit=10_000))
+        >= MIN_RSS_FALLBACK_CHARS
+    )
+
+
+def _preflight_candidate(candidate: StoryCandidate) -> None:
+    """Confirm that an article can be fetched without downloading its body.
+
+    A streamed GET is used instead of HEAD because several publisher CDNs
+    reject HEAD even though their article pages are readable. At most one
+    transient retry is attempted, and no response body is consumed.
+    """
+    try:
+        url = validate_url(candidate.url)
+    except ValueError as exc:
+        raise CandidateReachabilityError("invalid_url") from exc
+
+    last_error: Exception | None = None
+    for attempt in range(2):
+        response = None
+        try:
+            response = requests.get(
+                url,
+                headers=BROWSER_HEADERS,
+                timeout=PREFLIGHT_TIMEOUT,
+                allow_redirects=True,
+                stream=True,
+            )
+            if response.status_code == 403:
+                error = requests.HTTPError(
+                    "article source returned HTTP 403",
+                    response=response,
+                )
+                raise CandidateReachabilityError("source_blocked", 403) from error
+            response.raise_for_status()
+            if response.url != url:
+                validate_url(response.url)
+            return
+        except CandidateReachabilityError:
+            raise
+        except ValueError as exc:
+            raise CandidateReachabilityError("unsafe_redirect") from exc
+        except requests.RequestException as exc:
+            last_error = exc
+            status_code = getattr(getattr(exc, "response", None), "status_code", None)
+            # Retrying a caller/auth/policy response is wasteful. Reserve the
+            # one retry for transport problems and server-side failures.
+            if status_code is not None and status_code < 500:
+                break
+            if attempt == 0:
+                time.sleep(0.25)
+        finally:
+            if response is not None:
+                response.close()
+
+    status_code = getattr(getattr(last_error, "response", None), "status_code", None)
+    raise CandidateReachabilityError("unreachable", status_code) from last_error
+
+
+def preflight_candidates(
+    candidates: Iterable[StoryCandidate],
+) -> list[StoryCandidate]:
+    """Keep only candidates that can reach the scrape/summarize pipeline.
+
+    When a publisher blocks the first article with HTTP 403, the domain is not
+    contacted again during this discovery run. Feed summaries that are long
+    enough remain eligible because the selected-story worker can summarize
+    them directly; short summaries are removed before ranking.
+    """
+    candidates = list(candidates)
+    usable: list[StoryCandidate] = []
+    blocked_domains: set[str] = set()
+
+    for candidate in candidates:
+        domain = _candidate_domain(candidate)
+        if domain in blocked_domains:
+            if _has_usable_rss_summary(candidate):
+                candidate.use_rss_fallback = True
+                usable.append(candidate)
+            continue
+
+        try:
+            _preflight_candidate(candidate)
+            usable.append(candidate)
+        except CandidateReachabilityError as exc:
+            if exc.reason == "source_blocked" and domain:
+                blocked_domains.add(domain)
+                logger.warning(
+                    "[Discovery] %s blocks article scraping (HTTP 403); "
+                    "suppressing further checks for this domain in this run",
+                    domain,
+                    exc_info=True,
+                )
+                if _has_usable_rss_summary(candidate):
+                    candidate.use_rss_fallback = True
+                    usable.append(candidate)
+            else:
+                logger.warning(
+                    "[Discovery] Dropping unreachable candidate %s (%s)",
+                    candidate.url,
+                    exc.reason,
+                    exc_info=True,
+                )
+
+    logger.info(
+        "[Discovery] %d/%d candidates passed article reachability pre-flight",
+        len(usable),
+        len(candidates),
+    )
+    return usable
 
 
 def _existing_url_keys() -> set[str]:
@@ -212,7 +382,7 @@ def collect_candidates() -> list[StoryCandidate]:
         "[Discovery] %d unseen candidates after database/run deduplication",
         len(unseen),
     )
-    return unseen
+    return preflight_candidates(unseen)
 
 
 def _parse_scores(payload: str, candidates: list[StoryCandidate]) -> dict[int, dict]:
@@ -249,6 +419,114 @@ def _parse_scores(payload: str, candidates: list[StoryCandidate]) -> dict[int, d
     return parsed
 
 
+def _as_utc(value: datetime) -> datetime:
+    """Normalize SQLite's naive datetimes to UTC for age comparisons."""
+    if value.tzinfo is None:
+        return value.replace(tzinfo=timezone.utc)
+    return value.astimezone(timezone.utc)
+
+
+def _performance_min_age_hours() -> float:
+    """Return the minimum observation window before a post can teach scoring."""
+    try:
+        return max(1.0, float(os.getenv("TIKTOK_PERFORMANCE_MIN_AGE_HOURS", "24")))
+    except (TypeError, ValueError):
+        return 24.0
+
+
+def _performance_examples(
+    limit: int = 3,
+    *,
+    now: datetime | None = None,
+    min_age_hours: float | None = None,
+) -> dict[str, list[dict]]:
+    """Return compact top/bottom examples for the story-scoring prompt.
+
+    The feedback is deliberately evidence-only: mapped-but-unfetched rows and
+    newly published videos are excluded. Mature posts are ranked by views per
+    day so raw lifetime totals do not automatically favor the oldest upload.
+    """
+    try:
+        with app.app_context():
+            rows = (
+                db.session.query(VideoMetrics, Article)
+                .join(Article, Article.id == VideoMetrics.article_id)
+                .filter(
+                    VideoMetrics.fetched_at.isnot(None),
+                    Article.tiktok_publish_status == "PUBLISH_COMPLETE",
+                    Article.tiktok_published_at.isnot(None),
+                )
+                .all()
+            )
+    except Exception:
+        logger.error("[Discovery] Could not load performance feedback", exc_info=True)
+        return {"top_performers": [], "bottom_performers": []}
+
+    reference_time = _as_utc(now or datetime.now(timezone.utc))
+    maturity_hours = (
+        _performance_min_age_hours()
+        if min_age_hours is None
+        else max(1.0, float(min_age_hours))
+    )
+    mature_rows = []
+    for metrics, article in rows:
+        published_at = _as_utc(article.tiktok_published_at)
+        fetched_at = min(_as_utc(metrics.fetched_at), reference_time)
+        # Judge maturity at the moment represented by the counters. A stale
+        # zero-view snapshot fetched one hour after posting must not become
+        # "mature" merely because the calendar later passed 24 hours.
+        age_hours = (fetched_at - published_at).total_seconds() / 3600
+        if age_hours < maturity_hours:
+            continue
+        views = int(metrics.views or 0)
+        engagements = (
+            int(metrics.likes or 0)
+            + int(metrics.comments or 0)
+            + int(metrics.shares or 0)
+        )
+        age_days = max(age_hours / 24, 1 / 24)
+        mature_rows.append(
+            {
+                "metrics": metrics,
+                "article": article,
+                "age_days": age_days,
+                "views_per_day": views / age_days,
+                "engagement_rate": engagements / views if views else 0,
+            }
+        )
+
+    if len(mature_rows) < 2:
+        return {"top_performers": [], "bottom_performers": []}
+
+    def compact(row):
+        metrics = row["metrics"]
+        article = row["article"]
+        views = int(metrics.views or 0)
+        return {
+            "title": article.title[:180],
+            "source": article.site_name or "unknown",
+            "views": views,
+            "age_days": round(row["age_days"], 1),
+            "views_per_day": round(row["views_per_day"], 1),
+            "engagement_rate": round(row["engagement_rate"], 4),
+        }
+
+    ranked = sorted(
+        mature_rows,
+        key=lambda row: (
+            row["views_per_day"],
+            row["engagement_rate"],
+            int(row["metrics"].views or 0),
+        ),
+        reverse=True,
+    )
+    sample_size = min(limit, max(1, len(ranked) // 2))
+    return {
+        "top_performers": [compact(row) for row in ranked[:sample_size]],
+        "bottom_performers": [compact(row) for row in reversed(ranked[-sample_size:])],
+    }
+
+
 def score_candidates(candidates: Iterable[StoryCandidate]) -> list[StoryCandidate]:
     """Score every candidate in one batched Groq request, retrying once."""
     candidates = list(candidates)
@@ -277,16 +555,23 @@ def score_candidates(candidates: Iterable[StoryCandidate]) -> list[StoryCandidat
         }
         for index, candidate in enumerate(candidates)
     ]
+    performance_feedback = _performance_examples()
     system_prompt = (
         "You are the story editor for @60s.science2, a Gen-Z science TikTok "
         "channel. Score every supplied candidate from 0 to 100 using wow-factor, "
         "visual-ness, broad appeal, curiosity gap, and fit for a compelling "
         "60-second video. Return strict JSON only with exactly this schema: "
         '{"scores":[{"id":0,"score":87,"reason":"brief reason"}]}. '
+        "The supplied historical examples include only mature posts and are "
+        "ranked by age-normalized views per day. Use them as a weak signal, not "
+        "a rule; topic novelty and current story quality still matter most. "
         "Return every id exactly once. Do not add keys or markdown."
     )
     user_prompt = "Score this complete candidate batch:\n" + json.dumps(
-        compact_candidates,
+        {
+            "historical_performance": performance_feedback,
+            "candidates": compact_candidates,
+        },
         ensure_ascii=False,
         separators=(",", ":"),
     )
@@ -348,21 +633,85 @@ def format_shortlist(candidates: Iterable[StoryCandidate], limit: int = 8) -> st
     return "\n".join(lines) or "No unseen candidates were available."
 
 
-def _scrape_with_retry(url: str) -> dict:
-    last_error = None
+def _rss_scrape_payload(candidate: StoryCandidate) -> dict:
+    """Build the normal scrape contract from a sufficiently detailed feed summary."""
+    content = _plain_text(candidate.summary, limit=10_000)
+    if not _has_usable_rss_summary(candidate):
+        raise CandidateScrapeError("source_blocked")
+    return {
+        "url": candidate.url,
+        "title": candidate.title,
+        "content": content,
+        "hero_image": None,
+        "site_name": candidate.source,
+        "content_source": "rss_summary",
+    }
+
+
+def _is_forbidden_response(error: Exception) -> bool:
+    response = getattr(error, "response", None)
+    return getattr(response, "status_code", None) == 403
+
+
+def _scrape_with_retry(candidate: StoryCandidate) -> dict:
+    if candidate.use_rss_fallback:
+        return _rss_scrape_payload(candidate)
+
+    last_error: Exception | None = None
     for attempt in range(2):
         try:
-            return scrape_url_content(url)
+            return scrape_url_content(candidate.url)
         except Exception as exc:
             last_error = exc
+            if _is_forbidden_response(exc):
+                if _has_usable_rss_summary(candidate):
+                    logger.info(
+                        "[Discovery] Using RSS summary because %s returned HTTP 403",
+                        _candidate_domain(candidate) or candidate.source,
+                    )
+                    return _rss_scrape_payload(candidate)
+                raise CandidateScrapeError("source_blocked") from exc
             if attempt == 0:
                 time.sleep(1)
-    raise last_error
+    raise CandidateScrapeError("unreachable") from last_error
+
+
+def _pipeline_failure_message(stage: str, reason: str = "") -> str:
+    if stage == "scrape" and reason in SCRAPE_FAILURE_MESSAGES:
+        return SCRAPE_FAILURE_MESSAGES[reason]
+    return PIPELINE_FAILURE_MESSAGES.get(
+        stage,
+        "Video pipeline failed before it could finish.",
+    )
+
+
+def _pipeline_failure_result(
+    candidate: StoryCandidate,
+    stage: str,
+    article_id: int | None,
+    reason: str = "",
+) -> dict:
+    message = _pipeline_failure_message(stage, reason)
+    return {
+        "status": "failed",
+        "url": candidate.url,
+        "title": candidate.title,
+        "article_id": article_id,
+        "failure_stage": stage,
+        "failure_code": reason or None,
+        # ``pipeline_error`` is explicit for the discovery UI; ``error`` is
+        # retained for existing callers of run_discovery(). Both are safe,
+        # deliberately generic messages rather than upstream response text.
+        "pipeline_error": message,
+        "error": message,
+    }
 
 
 def _process_candidate(candidate: StoryCandidate) -> dict:
     """Run one selected story through the existing persisted video pipeline."""
     article_id = None
+    stage = "scrape"
+    failure_reason = ""
     try:
         with app.app_context():
             existing = Article.query.filter_by(url=candidate.url).first()
@@ -375,9 +724,9 @@ def _process_candidate(candidate: StoryCandidate) -> dict:
                     "reason": "already exists",
                 }
 
-        scraped = _scrape_with_retry(candidate.url)
+        scraped = _scrape_with_retry(candidate)
         if not scraped.get("content") or len(scraped["content"]) < 100:
-            raise ValueError("Could not extract at least 100 characters of article content")
+            raise CandidateScrapeError("not_enough_text")
 
         with app.app_context():
             existing = Article.query.filter_by(url=scraped["url"]).first()
@@ -402,6 +751,7 @@ def _process_candidate(candidate: StoryCandidate) -> dict:
             db.session.commit()
             article_id = article.id
 
+            stage = "summarize"
             summary = summarize_article(article.title, article.content)
             article.tldr = summary["tldr"]
             article.bullets = json.dumps(summary["bullets"])
@@ -428,6 +778,7 @@ def _process_candidate(candidate: StoryCandidate) -> dict:
             article_style = article.style
             article_emotion = article.dominant_emotion
 
+        stage = "render"
         video_path = generate_video(
             article_id=article_id,
             title=title,
@@ -453,8 +804,11 @@ def _process_candidate(candidate: StoryCandidate) -> dict:
                 "viral_score": article.viral_score,
             }
     except Exception as exc:
+        if isinstance(exc, CandidateScrapeError):
+            failure_reason = exc.reason
         logger.error(
-            "[Discovery] Pipeline failed for %s: %s",
+            "[Discovery] %s stage failed for %s: %s",
+            stage,
             candidate.url,
             exc,
             exc_info=True,
@@ -465,13 +819,12 @@ def _process_candidate(candidate: StoryCandidate) -> dict:
                 if article:
                     article.status = "failed"
                     db.session.commit()
-        return {
-            "status": "failed",
-            "url": candidate.url,
-            "title": candidate.title,
-            "article_id": article_id,
-            "error": str(exc)[:300],
-        }
+        return _pipeline_failure_result(
+            candidate,
+            stage,
+            article_id,
+            failure_reason,
+        )
 
 
 def run_discovery(

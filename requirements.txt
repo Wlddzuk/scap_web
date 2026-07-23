@@ -38,3 +38,6 @@ cryptography>=42.0.0,<47.0.0
 
 # Production server
 gunicorn>=21.2.0
+
+# In-process daily story discovery (single owner guarded across app workers)
+APScheduler>=3.10.4,<4.0.0

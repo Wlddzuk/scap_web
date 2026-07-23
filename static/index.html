@@ -4,8 +4,8 @@
 <head>
     <meta charset="UTF-8">
     <meta name="viewport" content="width=device-width, initial-scale=1.0">
-    <title>Clipper | Article to TikTok Video</title>
-    <link rel="stylesheet" href="/static/styles.css">
+    <title>Clipper | Article to Short Video</title>
+    <link rel="stylesheet" href="/static/styles.css?v=20260723b">
     <link
         href="https://fonts.googleapis.com/css2?family=Inter:wght@400;500;600&family=Space+Grotesk:wght@600;700&display=swap"
         rel="stylesheet">
@@ -27,10 +27,65 @@
                         <span class="stat" id="video-count">0 videos</span>
                         <span class="stat" id="carousel-count">0 carousels</span>
                     </div>
-                    <div class="tiktok-connection" id="tiktok-connection">
-                        <span class="tiktok-dot"></span>
-                        <span id="tiktok-connection-label">TikTok not connected</span>
-                        <button class="tiktok-connect-btn" id="tiktok-connect-btn" onclick="connectTikTok()">Connect</button>
+                    <div class="generation-budget" id="generation-budget">
+                        <button
+                            type="button"
+                            class="generation-budget-trigger"
+                            id="generation-budget-trigger"
+                            aria-expanded="false"
+                            aria-controls="generation-budget-panel"
+                            onclick="toggleGenerationBudget(event)"
+                        >
+                            <span class="generation-budget-dot" id="generation-budget-dot"></span>
+                            <span id="generation-budget-label">API budget</span>
+                            <span class="generation-budget-chevron" aria-hidden="true">&#9662;</span>
+                        </button>
+                        <div class="generation-budget-panel hidden" id="generation-budget-panel" role="dialog" aria-label="Generation budget">
+                            <div class="generation-budget-panel-head">
+                                <div>
+                                    <strong>Generation budget</strong>
+                                    <span id="generation-budget-updated">Checking providers&hellip;</span>
+                                </div>
+                                <button type="button" class="generation-budget-refresh" onclick="refreshGenerationBudget(event)" aria-label="Refresh API balances">&#8635;</button>
+                            </div>
+                            <div id="generation-budget-summary" class="generation-budget-summary">Loading current balances&hellip;</div>
+                            <div id="generation-budget-providers" class="generation-budget-providers"></div>
+                            <div id="generation-budget-estimate" class="generation-budget-estimate"></div>
+                        </div>
+                    </div>
+                    <div class="platform-connections" aria-label="Publishing connections">
+                        <div class="platform-connection tiktok" id="platform-connection-tiktok">
+                            <span class="platform-connection-dot" aria-hidden="true"></span>
+                            <span class="platform-connection-copy">
+                                <strong>TikTok</strong>
+                                <small id="platform-connection-tiktok-label">Not connected</small>
+                            </span>
+                            <button class="platform-connect-btn" id="platform-connection-tiktok-btn" onclick="connectPlatform('tiktok')">Connect</button>
+                        </div>
+                        <div class="platform-connection instagram" id="platform-connection-instagram">
+                            <span class="platform-connection-dot" aria-hidden="true"></span>
+                            <span class="platform-connection-copy">
+                                <strong>Instagram</strong>
+                                <small id="platform-connection-instagram-label">Not connected</small>
+                            </span>
+                            <button class="platform-connect-btn" id="platform-connection-instagram-btn" onclick="connectPlatform('instagram')">Connect</button>
+                        </div>
+                        <div class="platform-connection youtube" id="platform-connection-youtube">
+                            <span class="platform-connection-dot" aria-hidden="true"></span>
+                            <span class="platform-connection-copy">
+                                <strong>YouTube</strong>
+                                <small id="platform-connection-youtube-label">Not connected</small>
+                            </span>
+                            <button class="platform-connect-btn" id="platform-connection-youtube-btn" onclick="connectPlatform('youtube')">Connect</button>
+                        </div>
+                        <div class="platform-connection facebook" id="platform-connection-facebook">
+                            <span class="platform-connection-dot" aria-hidden="true"></span>
+                            <span class="platform-connection-copy">
+                                <strong>Facebook</strong>
+                                <small id="platform-connection-facebook-label">Not connected</small>
+                            </span>
+                            <button class="platform-connect-btn" id="platform-connection-facebook-btn" onclick="connectPlatform('facebook')">Connect</button>
+                        </div>
                     </div>
                 </div>
             </div>
@@ -41,7 +96,7 @@
             <!-- URL Scraper Form -->
             <div class="url-scraper-form">
                 <h3>Paste an article URL</h3>
-                <p>Turn any article into a TikTok-ready video with AI</p>
+                <p>Turn any article into a short-form video with AI</p>
                 <form id="url-form" onsubmit="scrapeUrl(event)">
                     <div class="url-input-group">
                         <input type="url" id="url-input" placeholder="https://example.com/article..." required>
@@ -59,6 +114,27 @@
                     </span>
                 </label>
             </div>
+
+            <!-- Science Story Discovery -->
+            <section class="discovery-panel" aria-labelledby="discovery-title">
+                <div class="discovery-heading">
+                    <div>
+                        <span class="discovery-eyebrow">Daily science radar</span>
+                        <h2 id="discovery-title">Find the next story</h2>
+                        <p>Scan trusted science feeds and rank the strongest ideas for a 60-second video.</p>
+                    </div>
+                    <button type="button" class="btn btn-primary discovery-run-btn" id="discovery-run-btn"
+                        onclick="runStoryDiscovery()">
+                        Find today&rsquo;s stories
+                    </button>
+                </div>
+                <div class="discovery-status" id="discovery-status" role="status" aria-live="polite">
+                    Ready to scan today&rsquo;s science stories.
+                </div>
+                <div class="discovery-candidates hidden" id="discovery-candidates" aria-label="Ranked story shortlist">
+                    <!-- Ranked candidates are rendered by static/app.js -->
+                </div>
+            </section>
 
             <!-- Progress Banner (shows during processing) -->
             <div class="progress-banner-container">
@@ -121,7 +197,7 @@
     <div class="glow-bg glow-2"></div>
 
     <script src="/static/anime.min.js"></script>
-    <script src="/static/app.js"></script>
+    <script src="/static/app.js?v=20260723b"></script>
 </body>
 
 </html>

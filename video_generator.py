@@ -19,6 +19,7 @@ from groq import Groq
 import numpy as np
 from moviepy.editor import (
     AudioFileClip,
+    CompositeAudioClip,
     CompositeVideoClip,
     ImageClip,
     VideoClip,
@@ -26,6 +27,7 @@ from moviepy.editor import (
     concatenate_videoclips,
     vfx,
 )
+from moviepy.audio.fx import all as afx
 from PIL import Image, ImageDraw, ImageFont
 import requests
 from dotenv import load_dotenv
@@ -64,6 +66,62 @@ HOOK_VIDEO_MODEL = os.getenv("HOOK_VIDEO_MODEL", "").strip()
 HOOK_VIDEO_ASPECT = os.getenv("HOOK_VIDEO_ASPECT", "9:16")
 DEFAULT_HOOK_VIDEO_MODEL = "fal-ai/ltx-video"  # used when UI toggle is on and env is empty
 
+
+def _bounded_int_env(name: str, default: int, minimum: int, maximum: int) -> int:
+    """Read a bounded integer setting without letting bad env values break startup."""
+    try:
+        return max(minimum, min(maximum, int(os.getenv(name, str(default)))))
+    except (TypeError, ValueError):
+        return default
+
+
+# This cap applies to every generated motion clip, including the hook. Keeping
+# the default at three holds the estimated motion spend below the work-order's
+# $0.60/video ceiling while still allowing two body scenes after a video hook.
+_REQUESTED_MAX_VIDEO_CLIPS_PER_VIDEO = _bounded_int_env(
+    "MAX_VIDEO_CLIPS_PER_VIDEO", 3, 0, 12
+)
+FAL_VIDEO_TIMEOUT_SECONDS = _bounded_int_env(
+    "FAL_VIDEO_TIMEOUT_SECONDS", 180, 30, 900
+)
+FAL_IMAGE_TIMEOUT_SECONDS = _bounded_int_env(
+    "FAL_IMAGE_TIMEOUT_SECONDS", 120, 30, 900
+)
+try:
+    VIDEO_CLIP_ESTIMATED_COST_USD = max(
+        0.0, float(os.getenv("VIDEO_CLIP_ESTIMATED_COST_USD", "0.18"))
+    )
+except (TypeError, ValueError):
+    VIDEO_CLIP_ESTIMATED_COST_USD = 0.18
+
+BASE_VIDEO_ESTIMATED_COST_USD = 0.05
+MAX_VIDEO_ESTIMATED_COST_USD = 0.60
+ABSOLUTE_MAX_VIDEO_CLIPS_PER_VIDEO = 3
+
+
+def _effective_motion_clip_cap(
+    requested: int,
+    estimated_cost_per_clip: float,
+    base_cost: float = BASE_VIDEO_ESTIMATED_COST_USD,
+    max_total_cost: float = MAX_VIDEO_ESTIMATED_COST_USD,
+) -> int:
+    """Enforce both the three-clip cap and the configured dollar ceiling."""
+    count_cap = min(
+        ABSOLUTE_MAX_VIDEO_CLIPS_PER_VIDEO,
+        max(0, int(requested)),
+    )
+    if estimated_cost_per_clip <= 0:
+        return count_cap
+    remaining_budget = max(0.0, float(max_total_cost) - float(base_cost))
+    budget_cap = int(math.floor((remaining_budget + 1e-9) / estimated_cost_per_clip))
+    return min(count_cap, max(0, budget_cap))
+
+
+MAX_VIDEO_CLIPS_PER_VIDEO = _effective_motion_clip_cap(
+    _REQUESTED_MAX_VIDEO_CLIPS_PER_VIDEO,
+    VIDEO_CLIP_ESTIMATED_COST_USD,
+)
+
 # Body image count (reduced from 20 for speed)
 NUM_BODY_IMAGES = 14
 
@@ -85,8 +143,20 @@ CAPTION_STROKE_WIDTH = 7
 CAPTION_SIDE_MARGIN = 80
 CAPTION_SAFE_BOTTOM = 1500
 CAPTION_POP_DURATION = 0.1
+CAPTION_ACTIVE_COLOR = (255, 216, 77, 255)
 HEADLINE_DURATION = 2.5
 WHISPER_MODELS = {"tiny", "base"}
+
+# Audio settings. Each bundled track is peak-normalized at mix time before these
+# target gains are applied, while the narration gain reserves summing headroom.
+MUSIC_DIR = Path(__file__).resolve().parent / "static" / "audio" / "music"
+MUSIC_DUCKED_DB = -22.0
+MUSIC_GAP_DB = -12.0
+MUSIC_FADE_IN_SECONDS = 0.5
+MUSIC_FADE_OUT_SECONDS = 1.0
+MUSIC_DUCK_ATTACK_SECONDS = 0.08
+MUSIC_DUCK_RELEASE_SECONDS = 0.18
+NARRATION_MIX_GAIN = 0.74
 
 _WHISPER_MODEL = None
 _WHISPER_MODEL_NAME = None
@@ -121,7 +191,9 @@ def generate_image_fal(prompt: str, retry_count: int = RETRY_ATTEMPTS) -> Image.
                     "image_size": "portrait_16_9",
                     "num_images": 1,
                     "num_inference_steps": 4
-                }
+                },
+                timeout=FAL_IMAGE_TIMEOUT_SECONDS,
+                start_timeout=min(30, FAL_IMAGE_TIMEOUT_SECONDS),
             )
 
             if result and "images" in result and result["images"]:
@@ -140,8 +212,12 @@ def generate_image_fal(prompt: str, retry_count: int = RETRY_ATTEMPTS) -> Image.
     return create_gradient_background()
 
 
-def generate_hook_video_fal(prompt: str, model: str) -> str | None:
-    """Generate a short AI video clip via FAL. Returns local mp4 path, or None on failure.
+def generate_motion_video_fal(
+    prompt: str,
+    model: str,
+    log_label: str = "MotionVideo",
+) -> str | None:
+    """Generate a short AI motion clip via FAL, with a bounded wait.
 
     Caller is responsible for unlinking the returned path. We write to the system
     temp dir (not static/) so failures don't leak public files.
@@ -150,14 +226,17 @@ def generate_hook_video_fal(prompt: str, model: str) -> str | None:
     import tempfile
 
     if not os.getenv("FAL_KEY"):
-        logger.info("[HookVideo] No FAL_KEY, skipping video hook")
+        logger.info(f"[{log_label}] No FAL_KEY, skipping motion clip")
         return None
 
+    local_path = None
     try:
-        logger.info(f"[HookVideo] Generating via {model}: {prompt[:80]}...")
+        logger.info(f"[{log_label}] Generating via {model}: {prompt[:80]}...")
         result = fal_client.run(
             model,
             arguments={"prompt": prompt, "aspect_ratio": HOOK_VIDEO_ASPECT},
+            timeout=FAL_VIDEO_TIMEOUT_SECONDS,
+            start_timeout=min(30, FAL_VIDEO_TIMEOUT_SECONDS),
         )
 
         video_url = None
@@ -171,10 +250,13 @@ def generate_hook_video_fal(prompt: str, model: str) -> str | None:
                 video_url = result["url"]
 
         if not video_url:
-            logger.info(f"[HookVideo] No video URL in response keys={list(result) if isinstance(result, dict) else type(result)}")
+            logger.info(
+                f"[{log_label}] No video URL in response keys="
+                f"{list(result) if isinstance(result, dict) else type(result)}"
+            )
             return None
 
-        fd, local_path = tempfile.mkstemp(suffix=".mp4", prefix="hook_")
+        fd, local_path = tempfile.mkstemp(suffix=".mp4", prefix="clipper_motion_")
         os.close(fd)
         response = requests.get(video_url, timeout=120, stream=True)
         response.raise_for_status()
@@ -182,11 +264,21 @@ def generate_hook_video_fal(prompt: str, model: str) -> str | None:
             for chunk in response.iter_content(chunk_size=65536):
                 f.write(chunk)
 
-        logger.info(f"[HookVideo] Saved: {local_path}")
+        logger.info(f"[{log_label}] Saved: {local_path}")
         return local_path
     except Exception as e:
-        logger.info(f"[HookVideo] Failed: {e}")
+        logger.info(f"[{log_label}] Failed: {e}")
+        if local_path:
+            try:
+                Path(local_path).unlink(missing_ok=True)
+            except OSError:
+                pass
         return None
+
+
+def generate_hook_video_fal(prompt: str, model: str) -> str | None:
+    """Backward-compatible hook wrapper around the shared motion generator."""
+    return generate_motion_video_fal(prompt, model, log_label="HookVideo")
 
 
 def load_hook_video_clip(video_path: str, target_duration: float):
@@ -465,62 +557,185 @@ def transcribe_word_timestamps(
     return []
 
 
-def group_words_for_captions(words: list, min_words: int = 2, max_words: int = 4) -> list:
-    """Group timed words into short TikTok-style caption cues."""
-    if not words:
+_CAPTION_WEAK_END_WORDS = {
+    "a", "about", "above", "across", "after", "against", "along", "among",
+    "an", "around", "as", "at", "before", "behind", "below", "beneath",
+    "beside", "between", "beyond", "by", "despite", "down", "during",
+    "except", "for", "from", "in", "inside", "into", "like", "near", "of",
+    "off", "on", "onto", "out", "outside", "over", "past", "since", "the",
+    "through", "throughout", "to", "toward", "under", "until", "up", "upon",
+    "with", "within", "without",
+}
+_CAPTION_NUMBER_MAGNITUDES = {
+    "hundred", "thousand", "million", "billion", "trillion", "quadrillion",
+}
+_CAPTION_COMPOUND_UNIT_PREFIXES = {"light", "square", "cubic"}
+_CAPTION_MEASUREMENT_UNITS = {
+    "%", "percent", "percentage", "second", "seconds", "minute", "minutes", "hour", "hours",
+    "day", "days", "week", "weeks", "month", "months", "year", "years",
+    "light-year", "light-years",
+    "meter", "meters", "metre", "metres", "kilometer", "kilometers",
+    "kilometre", "kilometres", "mile", "miles", "gram", "grams", "kilogram",
+    "kilograms", "ton", "tons", "tonne", "tonnes", "degree", "degrees",
+    "celsius", "fahrenheit", "kelvin", "byte", "bytes", "kilobyte", "kilobytes",
+    "megabyte", "megabytes", "gigabyte", "gigabytes", "terabyte", "terabytes",
+    "watt", "watts", "volt", "volts", "hertz", "hz", "khz", "mhz", "ghz",
+    "mm", "cm", "m", "km", "mg", "g", "kg", "mph", "kph", "°c", "°f",
+}
+_CAPTION_NUMBER_UNITS = (
+    _CAPTION_NUMBER_MAGNITUDES
+    | _CAPTION_COMPOUND_UNIT_PREFIXES
+    | _CAPTION_MEASUREMENT_UNITS
+)
+
+
+def _caption_token_key(text: str) -> str:
+    """Normalize a spoken token for phrase-boundary decisions."""
+    return str(text).strip().strip("\"'“”‘’()[]{}.,!?;:").lower()
+
+
+def _caption_token_is_number(text: str) -> bool:
+    token = _caption_token_key(text).replace(",", "")
+    return bool(
+        re.fullmatch(
+            r"(?:about|over|under|nearly)?[~≈<>+\-]?[$£€]?\d+(?:\.\d+)?"
+            r"(?:e[+\-]?\d+)?(?:%|°[cf]?)?",
+            token,
+            flags=re.IGNORECASE,
+        )
+    )
+
+
+def _caption_boundary_allowed(words: list, boundary: int) -> bool:
+    """Return whether a cue may end immediately before ``boundary``."""
+    if boundary <= 0 or boundary >= len(words):
+        return True
+    left = _caption_token_key(words[boundary - 1].get("text", ""))
+    right = _caption_token_key(words[boundary].get("text", ""))
+    if left in _CAPTION_WEAK_END_WORDS:
+        return False
+    if _caption_token_is_number(left) and right in _CAPTION_NUMBER_UNITS:
+        return False
+    # Keep a complete quantity together, not just its first two tokens. Without
+    # this, "11 billion years" merely moves the bad break from 11|billion to
+    # billion|years. Punctuation on the magnitude still permits a natural break
+    # for standalone values such as "the estimate was 11 billion, but ...".
+    if left in _CAPTION_NUMBER_MAGNITUDES:
+        left_source = str(words[boundary - 1].get("text", "")).strip()
+        previous = (
+            _caption_token_key(words[boundary - 2].get("text", ""))
+            if boundary >= 2
+            else ""
+        )
+        if (
+            (_caption_token_is_number(previous) or previous in _CAPTION_NUMBER_MAGNITUDES)
+            and not re.search(r"[,.!?;:]$", left_source)
+        ):
+            return False
+    if left in _CAPTION_COMPOUND_UNIT_PREFIXES and right in _CAPTION_MEASUREMENT_UNITS:
+        lookback = [
+            _caption_token_key(word.get("text", ""))
+            for word in words[max(0, boundary - 4):boundary - 1]
+        ]
+        if any(_caption_token_is_number(token) for token in lookback):
+            return False
+    return True
+
+
+def _caption_group_ranges(words: list, min_words: int, max_words: int) -> list:
+    """Choose phrase-safe cue ranges using a small global optimization.
+
+    The dynamic program avoids fixing one boundary only to create a one-word
+    flash later. Normal cues remain 2--4 words, while a rare five-word cue is
+    preferred over breaking a number/unit pair or ending on a preposition.
+    """
+    count = len(words)
+    if not count:
         return []
 
-    grouped_words = []
-    current = []
+    # dp[end] = (cost, preceding boundary list)
+    dp = [(float("inf"), None)] * (count + 1)
+    dp[0] = (0.0, [])
 
-    for index, word in enumerate(words):
-        current.append(word)
-        next_word = words[index + 1] if index + 1 < len(words) else None
-        pause_after = (
-            max(0.0, float(next_word["start"]) - float(word["end"]))
-            if next_word
-            else 0.0
-        )
-        punctuation_break = bool(re.search(r"[.!?,;:]$", str(word["text"])))
+    for end in range(1, count + 1):
+        for start in range(0, end):
+            previous_cost, previous_ranges = dp[start]
+            if previous_ranges is None or not _caption_boundary_allowed(words, start):
+                continue
+            if end < count and not _caption_boundary_allowed(words, end):
+                continue
 
-        should_break = len(current) >= max_words or (
-            len(current) >= min_words and (punctuation_break or pause_after >= 0.35)
-        )
-        if should_break:
-            grouped_words.append(current)
-            current = []
+            length = end - start
+            if min_words <= length <= max_words:
+                length_cost = {2: 0.35, 3: 0.0, 4: 0.2}.get(length, 0.2)
+            elif length == 1:
+                length_cost = 9.0
+            else:
+                length_cost = 4.0 + (abs(length - max_words) * 2.0)
 
-    if current:
-        grouped_words.append(current)
+            # A modest per-cue cost avoids over-fragmenting everything into
+            # two-word flashes. Pauses/punctuation remain preferred boundaries.
+            cost = previous_cost + 1.0 + length_cost
+            if end < count:
+                current = words[end - 1]
+                following = words[end]
+                pause = max(
+                    0.0,
+                    float(following.get("start", 0.0)) - float(current.get("end", 0.0)),
+                )
+                if re.search(r"[.!?,;:]$", str(current.get("text", ""))):
+                    cost -= 0.8
+                elif pause >= 0.35:
+                    cost -= 0.55
 
-    # Avoid a one-word final flash by merging it or borrowing one word from a
-    # full preceding group. A one-word transcript is the only unavoidable case.
-    if len(grouped_words) > 1 and len(grouped_words[-1]) < min_words:
-        previous = grouped_words[-2]
-        final = grouped_words[-1]
-        if len(previous) + len(final) <= max_words:
-            previous.extend(final)
-            grouped_words.pop()
-        else:
-            final.insert(0, previous.pop())
+            if cost < dp[end][0]:
+                dp[end] = (cost, [*previous_ranges, (start, end)])
+
+    ranges = dp[count][1]
+    return ranges if ranges is not None else [(0, count)]
+
+
+def group_words_for_captions(words: list, min_words: int = 2, max_words: int = 4) -> list:
+    """Group timed words into phrase-safe, karaoke-ready caption cues."""
+    if not words:
+        return []
+    min_words = max(1, int(min_words))
+    max_words = max(min_words, int(max_words))
+    uppercase_captions = os.getenv("CAPTION_UPPERCASE", "true").strip().lower() in {
+        "1", "true", "yes", "on",
+    }
 
     groups = []
-    uppercase_captions = os.getenv("CAPTION_UPPERCASE", "true").strip().lower() in {
-        "1",
-        "true",
-        "yes",
-        "on",
-    }
-    for group in grouped_words:
-        caption_text = " ".join(str(word["text"]).strip() for word in group)
-        caption_text = re.sub(r"[,.]+$", "", caption_text.strip())
-        if uppercase_captions:
-            caption_text = caption_text.upper()
+    for start_index, end_index in _caption_group_ranges(words, min_words, max_words):
+        source_words = words[start_index:end_index]
+        display_words = []
+        for source in source_words:
+            text = str(source.get("text", "")).strip()
+            if uppercase_captions:
+                text = text.upper()
+            display_words.append(
+                {
+                    "text": text,
+                    "start": max(0.0, float(source.get("start", 0.0))),
+                    "end": max(
+                        max(0.0, float(source.get("start", 0.0))) + 0.05,
+                        float(source.get("end", 0.0)),
+                    ),
+                }
+            )
+
+        # Caption builds now use one punctuation rule: sentence punctuation is
+        # removed only at the end of a cue, while interior punctuation remains.
+        display_words[-1]["text"] = re.sub(
+            r"[,.!?;:]+$", "", display_words[-1]["text"]
+        )
+        caption_text = " ".join(word["text"] for word in display_words).strip()
         groups.append(
             {
                 "text": caption_text,
-                "start": max(0.0, float(group[0]["start"])),
-                "end": max(float(group[0]["start"]) + 0.05, float(group[-1]["end"])),
+                "start": display_words[0]["start"],
+                "end": max(display_words[0]["start"] + 0.05, display_words[-1]["end"]),
+                "words": display_words,
             }
         )
     return groups
@@ -614,6 +829,117 @@ def render_text_overlay(
     return image
 
 
+def _caption_word_lines(
+    draw: ImageDraw.ImageDraw,
+    words: list,
+    font,
+    max_width: int,
+    stroke_width: int,
+) -> list:
+    """Wrap caption word indexes while keeping their timing identity."""
+    lines = []
+    current = []
+    for index, word in enumerate(words):
+        candidate = [*current, index]
+        text = " ".join(words[i] for i in candidate)
+        bbox = draw.textbbox((0, 0), text, font=font, stroke_width=stroke_width)
+        if current and bbox[2] - bbox[0] > max_width:
+            lines.append(current)
+            current = [index]
+        else:
+            current = candidate
+    if current:
+        lines.append(current)
+    return lines
+
+
+def render_caption_overlay(
+    words: list,
+    max_width: int,
+    active_index: int = None,
+    active_only: bool = False,
+    font_size: int = CAPTION_FONT_SIZE,
+    min_font_size: int = CAPTION_MIN_FONT_SIZE,
+    stroke_width: int = CAPTION_STROKE_WIDTH,
+    padding: int = 18,
+) -> Image.Image:
+    """Render one caption cue, optionally tinting only its active word."""
+    words = [clean_text(str(word)) for word in words if clean_text(str(word))]
+    if not words:
+        return Image.new("RGBA", (1, 1), (0, 0, 0, 0))
+
+    measurement = Image.new("RGBA", (max_width, 800), (0, 0, 0, 0))
+    measure_draw = ImageDraw.Draw(measurement)
+    inner_width = max(1, max_width - (padding * 2))
+    chosen_font = None
+    chosen_size = min_font_size
+    lines = []
+    for size in range(font_size, min_font_size - 1, -4):
+        chosen_size = size
+        chosen_font = _load_caption_font(size)
+        lines = _caption_word_lines(
+            measure_draw, words, chosen_font, inner_width, stroke_width
+        )
+        widest = max(
+            measure_draw.textbbox(
+                (0, 0),
+                " ".join(words[i] for i in line),
+                font=chosen_font,
+                stroke_width=stroke_width,
+            )[2]
+            for line in lines
+        )
+        if widest <= inner_width:
+            break
+
+    line_height = int(math.ceil(chosen_size * 1.22)) + (stroke_width * 2)
+    line_widths = [
+        float(
+            measure_draw.textlength(
+                " ".join(words[i] for i in line), font=chosen_font
+            )
+        )
+        for line in lines
+    ]
+    image_width = int(min(max_width, max(line_widths) + (padding * 2) + (stroke_width * 2)))
+    image_height = max(1, (padding * 2) + (line_height * len(lines)))
+    image = Image.new("RGBA", (image_width, image_height), (0, 0, 0, 0))
+    draw = ImageDraw.Draw(image)
+
+    for line_number, line in enumerate(lines):
+        line_text = " ".join(words[i] for i in line)
+        y = padding + (line_number * line_height)
+        if not active_only:
+            draw.text(
+                (image_width / 2, y),
+                line_text,
+                font=chosen_font,
+                fill=(255, 255, 255, 255),
+                anchor="ma",
+                stroke_width=stroke_width,
+                stroke_fill=(0, 0, 0, 255),
+            )
+
+        if active_index is not None and active_index in line:
+            active_position = line.index(active_index)
+            prefix = " ".join(words[i] for i in line[:active_position])
+            prefix_with_space = f"{prefix} " if prefix else ""
+            active_x = (
+                (image_width - line_widths[line_number]) / 2
+                + float(measure_draw.textlength(prefix_with_space, font=chosen_font))
+            )
+            draw.text(
+                (active_x, y),
+                words[active_index],
+                font=chosen_font,
+                fill=CAPTION_ACTIVE_COLOR,
+                anchor="la",
+                stroke_width=stroke_width,
+                stroke_fill=(0, 0, 0, 255),
+            )
+    return image
+
+
 def _caption_pop_scale(t: float) -> float:
     """Scale a caption from 90% to 100% over its first 100ms."""
     progress = min(1.0, max(0.0, t) / CAPTION_POP_DURATION)
@@ -621,28 +947,195 @@ def _caption_pop_scale(t: float) -> float:
 
 
 def create_caption_clips(caption_groups: list) -> list:
-    """Create transparent PIL caption clips positioned in the safe lower third."""
+    """Create lower-third cues plus per-word karaoke highlight overlays."""
     clips = []
     max_width = VIDEO_WIDTH - (CAPTION_SIDE_MARGIN * 2)
     for group in caption_groups:
-        duration = max(0.05, float(group["end"]) - float(group["start"]))
-        image = render_text_overlay(
-            group["text"],
+        group_start = float(group["start"])
+        group_end = float(group["end"])
+        duration = max(0.05, group_end - group_start)
+        timed_words = group.get("words") or []
+        if not timed_words:
+            # Backward compatibility for callers/tests that construct legacy
+            # groups without word metadata.
+            texts = str(group.get("text", "")).split()
+            slice_duration = duration / max(1, len(texts))
+            timed_words = [
+                {
+                    "text": text,
+                    "start": group_start + (index * slice_duration),
+                    "end": group_start + ((index + 1) * slice_duration),
+                }
+                for index, text in enumerate(texts)
+            ]
+        word_texts = [str(word["text"]) for word in timed_words]
+        image = render_caption_overlay(
+            word_texts,
             max_width=max_width,
-            font_size=CAPTION_FONT_SIZE,
-            min_font_size=CAPTION_MIN_FONT_SIZE,
-            stroke_width=CAPTION_STROKE_WIDTH,
         )
         top = max(0, CAPTION_SAFE_BOTTOM - image.height)
         clip = (
             ImageClip(np.array(image), transparent=True)
-            .set_start(float(group["start"]))
+            .set_start(group_start)
             .set_duration(duration)
             .set_position(("center", top))
             .fx(vfx.resize, _caption_pop_scale)
         )
         clips.append(clip)
+
+        for word_index, word in enumerate(timed_words):
+            active_start = max(group_start, float(word["start"]))
+            active_end = min(group_end, float(word["end"]))
+            if active_end <= active_start:
+                continue
+            active_image = render_caption_overlay(
+                word_texts,
+                max_width=max_width,
+                active_index=word_index,
+                active_only=True,
+            )
+            pop_offset = max(0.0, active_start - group_start)
+            active_clip = (
+                ImageClip(np.array(active_image), transparent=True)
+                .set_start(active_start)
+                .set_duration(max(0.05, active_end - active_start))
+                .set_position(("center", top))
+                .fx(
+                    vfx.resize,
+                    lambda t, offset=pop_offset: _caption_pop_scale(t + offset),
+                )
+            )
+            clips.append(active_clip)
     return clips
+
+
+def _env_flag(name: str, default: bool = False) -> bool:
+    fallback = "true" if default else "false"
+    return os.getenv(name, fallback).strip().lower() in {"1", "true", "yes", "on"}
+
+
+def _speech_intervals(timed_words: list, duration: float) -> list:
+    """Merge Whisper word timings into speech intervals for music ducking."""
+    raw = []
+    for word in timed_words or []:
+        start = max(0.0, float(word.get("start", 0.0)) - 0.035)
+        end = min(duration, max(start + 0.05, float(word.get("end", start))) + 0.035)
+        raw.append((start, end))
+    if not raw:
+        # The safe fallback is to assume continuous speech. A failed Whisper
+        # model must never leave gap-level music competing with the narration.
+        return [(0.0, max(0.05, duration))]
+
+    merged = []
+    for start, end in sorted(raw):
+        if merged and start <= merged[-1][1] + 0.12:
+            merged[-1] = (merged[-1][0], max(merged[-1][1], end))
+        else:
+            merged.append((start, end))
+    return merged
+
+
+def _music_gain_for_time(t, speech_intervals: list):
+    """Return a scalar/vector sidechain envelope for MoviePy audio frames."""
+    times = np.asarray(t, dtype=float)
+    gap_gain = 10 ** (MUSIC_GAP_DB / 20.0)
+    ducked_gain = 10 ** (MUSIC_DUCKED_DB / 20.0)
+    gains = np.full(times.shape, gap_gain, dtype=float)
+
+    for start, end in speech_intervals:
+        inside = (times >= start) & (times <= end)
+        gains = np.where(inside, np.minimum(gains, ducked_gain), gains)
+
+        attack_start = max(0.0, start - MUSIC_DUCK_ATTACK_SECONDS)
+        attack = (times >= attack_start) & (times < start)
+        if start > attack_start:
+            attack_progress = (times - attack_start) / (start - attack_start)
+            attack_gain = gap_gain + ((ducked_gain - gap_gain) * attack_progress)
+            gains = np.where(attack, np.minimum(gains, attack_gain), gains)
+
+        release_end = end + MUSIC_DUCK_RELEASE_SECONDS
+        release = (times > end) & (times <= release_end)
+        if release_end > end:
+            release_progress = (times - end) / (release_end - end)
+            release_gain = ducked_gain + ((gap_gain - ducked_gain) * release_progress)
+            gains = np.where(release, np.minimum(gains, release_gain), gains)
+
+    if np.ndim(t) == 0:
+        return float(gains)
+    return gains
+
+
+def create_music_mix(
+    narration_audio,
+    timed_words: list,
+    duration: float,
+    article_id: int,
+    music_dir: Path = MUSIC_DIR,
+):
+    """Mix a deterministic bundled music loop under narration.
+
+    Returns ``(audio_clip, resources)``. On any missing/invalid music asset the
+    original narration is returned unchanged so music can never fail a render.
+    """
+    tracks = sorted(
+        path
+        for path in Path(music_dir).glob("*")
+        if path.suffix.lower() in {".wav", ".mp3", ".m4a", ".flac", ".ogg"}
+    )
+    if not tracks:
+        logger.warning("[Music] No bundled music tracks found; continuing voice-only")
+        return narration_audio, []
+
+    resources = []
+    try:
+        track_path = tracks[int(article_id) % len(tracks)]
+        source = AudioFileClip(str(track_path))
+        resources.append(source)
+        if not source.duration or source.duration <= 0.05:
+            raise ValueError("music track is empty")
+
+        peak = float(source.max_volume())
+        if not math.isfinite(peak) or peak <= 1e-6:
+            raise ValueError("music track is silent")
+        normalized = source.volumex(1.0 / peak)
+        resources.append(normalized)
+        looped = normalized.fx(afx.audio_loop, duration=duration)
+        resources.append(looped)
+        intervals = _speech_intervals(timed_words, duration)
+
+        def apply_envelope(get_frame, frame_time):
+            frame = np.asarray(get_frame(frame_time))
+            gains = _music_gain_for_time(frame_time, intervals)
+            if np.ndim(gains) and frame.ndim > 1:
+                gains = np.asarray(gains)[:, None]
+            return frame * gains
+
+        music = looped.fl(apply_envelope, keep_duration=True)
+        music = music.fx(
+            afx.audio_fadein, min(MUSIC_FADE_IN_SECONDS, duration)
+        ).fx(
+            afx.audio_fadeout, min(MUSIC_FADE_OUT_SECONDS, duration)
+        )
+        resources.append(music)
+        voice = narration_audio.volumex(NARRATION_MIX_GAIN)
+        resources.append(voice)
+        mixed = CompositeAudioClip([voice, music]).set_duration(duration)
+        resources.append(mixed)
+        logger.info(
+            "[Music] Mixed '%s' at %.0f dB speech / %.0f dB gaps",
+            track_path.name,
+            MUSIC_DUCKED_DB,
+            MUSIC_GAP_DB,
+        )
+        return mixed, resources
+    except Exception as exc:
+        logger.warning("[Music] Mix failed; continuing voice-only: %s", exc)
+        for resource in reversed(resources):
+            try:
+                resource.close()
+            except Exception:
+                pass
+        return narration_audio, []
 
 
 def create_headline_clip(title: str, duration: float):
@@ -988,6 +1481,118 @@ def create_hook_clips(
     return clips
 
 
+_HIGH_IMPACT_EMOTIONS = {
+    "awe", "amazing", "curiosity", "dramatic", "exciting", "excitement",
+    "fear", "hope", "shock", "surprise", "urgent", "wonder",
+}
+
+
+def select_motion_scene_indexes(scenes: list, limit: int) -> list:
+    """Choose deterministic high-impact body scenes by emotion and position."""
+    if limit <= 0 or len(scenes or []) <= 1:
+        return []
+
+    final_index = len(scenes) - 1
+    position_peaks = {
+        max(1, round(final_index * 0.33)),
+        max(1, round(final_index * 0.66)),
+        final_index,
+    }
+    ranked = []
+    for index, scene in enumerate(scenes):
+        if index == 0:
+            continue  # the hook already visualizes the opening scene
+        emotion = _caption_token_key(scene.get("emotion", ""))
+        score = 100 if any(term in emotion for term in _HIGH_IMPACT_EMOTIONS) else 0
+        if index in position_peaks:
+            score += 35
+        if re.search(r"[!?]", str(scene.get("speech", ""))):
+            score += 10
+        # Stable tie-break: spread motion across the story before preferring
+        # later scenes, instead of bunching every clip at the start.
+        distance_to_peak = min(abs(index - peak) for peak in position_peaks)
+        score -= distance_to_peak
+        ranked.append((score, index))
+
+    selected = [index for _score, index in sorted(ranked, key=lambda item: (-item[0], item[1]))[:limit]]
+    return sorted(selected)
+
+
+def create_body_motion_clips(
+    scenes: list,
+    durations: list,
+    style_key: str,
+    video_model: str,
+    clip_limit: int,
+) -> dict:
+    """Generate selected body motion clips, returning ``{scene_index: clip}``.
+
+    Every failure is represented by an absent dict entry; callers retain their
+    already-generated still and Ken Burns fallback.
+    """
+    indexes = select_motion_scene_indexes(scenes, clip_limit)
+    if not indexes:
+        return {}
+
+    logger.info(
+        "[Cost] Planning %d body motion clip(s), estimated $%.2f",
+        len(indexes),
+        len(indexes) * VIDEO_CLIP_ESTIMATED_COST_USD,
+    )
+
+    def build_clip(index: int):
+        scene = scenes[index]
+        visual = (scene.get("visual") or scene.get("speech") or "science discovery").strip()
+        motion_prompt = (
+            f"{visual}, meaningful subject motion, cinematic camera movement, "
+            "natural parallax, vertical 9:16, no text no words"
+        )
+        if style_key:
+            try:
+                from visual_styles import apply_style
+                motion_prompt = apply_style(motion_prompt, style_key, is_hook=False)
+            except Exception as exc:
+                logger.info(f"[BodyVideo] Style application failed for scene {index}: {exc}")
+
+        local_mp4 = generate_motion_video_fal(
+            motion_prompt,
+            video_model,
+            log_label=f"BodyVideo:{index}",
+        )
+        if not local_mp4:
+            return index, None
+        try:
+            target_duration = durations[index] if index < len(durations) else DEFAULT_CHUNK_DURATION
+            clip = load_hook_video_clip(local_mp4, target_duration)
+            clip._scap_temp_path = local_mp4
+            return index, clip
+        except Exception as exc:
+            logger.info(
+                f"[BodyVideo] Scene {index} clip load failed: {exc}; using still"
+            )
+            try:
+                Path(local_mp4).unlink(missing_ok=True)
+            except OSError:
+                pass
+            return index, None
+
+    generated = {}
+    with ThreadPoolExecutor(max_workers=min(3, len(indexes))) as executor:
+        futures = {executor.submit(build_clip, index): index for index in indexes}
+        for future in as_completed(futures):
+            index = futures[future]
+            try:
+                result_index, clip = future.result()
+                if clip is not None:
+                    generated[result_index] = clip
+                    logger.info(f"[BodyVideo] Using motion for scene {result_index}")
+                else:
+                    logger.info(f"[BodyVideo] Scene {result_index} fell back to still")
+            except Exception as exc:
+                logger.info(f"[BodyVideo] Scene {index} failed: {exc}; using still")
+    return generated
+
+
 def create_clip(image: Image.Image, duration: float, zoom_factor: float = 0.03) -> VideoClip:
     """Create a centered Ken Burns zoom while keeping every frame 1080x1920."""
     source = resize_and_crop_image(image.convert("RGB"), VIDEO_WIDTH, VIDEO_HEIGHT)
@@ -1079,6 +1684,7 @@ def generate_video(
     base_video = None
     clips = []
     overlay_clips = []
+    music_resources = []
     actual_audio_path = None
     use_scenes = bool(scenes)
 
@@ -1099,14 +1705,18 @@ def generate_video(
         audio_duration = float(audio.duration)
         logger.info(f"Audio duration: {audio_duration:.1f}s")
 
-        # Step 2: Word-level caption timings
+        # Step 2: Word-level timings power both captions and music ducking, so
+        # Whisper runs only once even when both features are enabled.
+        music_enabled = _env_flag("MUSIC_ENABLED", True)
+        timed_words = []
         caption_groups = []
-        if captions:
-            logger.info("Step 2: Transcribing word-synced captions...")
+        if captions or music_enabled:
+            logger.info("Step 2: Transcribing word timings...")
             timed_words = transcribe_word_timestamps(
                 actual_audio_path,
                 script_text=narration_text,
             )
+        if captions:
             caption_groups = group_words_for_captions(timed_words)
             logger.info("[Captions] Created %d caption groups", len(caption_groups))
 
@@ -1116,11 +1726,25 @@ def generate_video(
         # (legacy path included) so the AI video clip is generated with the SAME
         # style preset as the body images — otherwise the hook looks alien next
         # to the rest of the video.
-        will_use_video_hook = (
+        will_use_video_motion = (
             use_video_hook is True
             or (use_video_hook is None and bool(HOOK_VIDEO_MODEL))
-        ) and image_source != "stock"
-        if (use_scenes or will_use_video_hook) and not style_key:
+        ) and image_source != "stock" and MAX_VIDEO_CLIPS_PER_VIDEO > 0
+        video_model = (
+            HOOK_VIDEO_MODEL or DEFAULT_HOOK_VIDEO_MODEL
+            if use_video_hook is True
+            else HOOK_VIDEO_MODEL
+        )
+        if will_use_video_motion:
+            max_motion_cost = MAX_VIDEO_CLIPS_PER_VIDEO * VIDEO_CLIP_ESTIMATED_COST_USD
+            logger.info(
+                "[Cost] Motion cap=%d clip(s); estimated max motion $%.2f, "
+                "estimated max video total $%.2f",
+                MAX_VIDEO_CLIPS_PER_VIDEO,
+                max_motion_cost,
+                BASE_VIDEO_ESTIMATED_COST_USD + max_motion_cost,
+            )
+        if (use_scenes or will_use_video_motion) and not style_key:
             from visual_styles import auto_pick_style
             style_key = auto_pick_style(title, script)
             logger.info(f"[Video] Auto-picked style: {style_key}")
@@ -1142,7 +1766,7 @@ def generate_video(
             image_source=image_source,
             style_key=style_key,
             opening_visual=opening_visual,
-            use_video_hook=use_video_hook,
+            use_video_hook=(use_video_hook if MAX_VIDEO_CLIPS_PER_VIDEO > 0 else False),
         )
         clips.extend(hook_clips)
         logger.info(f"Hook: {hook_len:.1f}s")
@@ -1153,10 +1777,25 @@ def generate_video(
 
         if use_scenes:
             durations = compute_scene_durations(scenes, remaining)
+            generated_hook_count = sum(
+                1 for clip in hook_clips if getattr(clip, "_scap_temp_path", None)
+            )
+            remaining_motion_slots = max(
+                0, MAX_VIDEO_CLIPS_PER_VIDEO - generated_hook_count
+            )
+            body_motion_clips = {}
+            if will_use_video_motion and video_model and remaining_motion_slots:
+                body_motion_clips = create_body_motion_clips(
+                    scenes,
+                    durations,
+                    style_key,
+                    video_model,
+                    remaining_motion_slots,
+                )
             for i, scene in enumerate(scenes):
                 img = themed_images[i] if i < len(themed_images) else themed_images[-1]
                 dur = durations[i] if i < len(durations) else DEFAULT_CHUNK_DURATION
-                clips.append(create_clip(img, dur))
+                clips.append(body_motion_clips.get(i) or create_clip(img, dur))
         else:
             chunks = chunk_text(script)
             durations = compute_durations(chunks, remaining)
@@ -1196,7 +1835,15 @@ def generate_video(
                 size=(VIDEO_WIDTH, VIDEO_HEIGHT),
             ).set_duration(audio_duration)
 
-        main_video = main_video.set_audio(audio)
+        final_audio = audio
+        if music_enabled:
+            final_audio, music_resources = create_music_mix(
+                narration_audio=audio,
+                timed_words=timed_words,
+                duration=audio_duration,
+                article_id=article_id,
+            )
+        main_video = main_video.set_audio(final_audio)
         logger.info(f"Final duration: {main_video.duration:.1f}s")
 
         # Step 8: Render
@@ -1225,10 +1872,19 @@ def generate_video(
         return str(output_path)
 
     except Exception as e:
+        try:
+            output_path.unlink(missing_ok=True)
+        except OSError:
+            logger.warning("Could not remove partial video output: %s", output_path)
         logger.error(f"Video generation failed: {e}", exc_info=True)
         raise
 
     finally:
+        for resource in reversed(music_resources):
+            try:
+                resource.close()
+            except Exception:
+                pass
         for resource in [audio, main_video, base_video]:
             try:
                 if resource:

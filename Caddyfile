@@ -7,8 +7,19 @@
 # Then replace BCRYPT_HASH_HERE with the output.
 
 YOUR_DOMAIN {
-    basicauth /* {
-        walid BCRYPT_HASH_HERE
+    route {
+        # Instagram's servers must fetch a Reel from a public HTTPS URL. This
+        # path bypasses Basic Auth, but Flask still requires a short-lived HMAC
+        # signature and serves only sanitized files from static/videos.
+        handle /public-media/* {
+            reverse_proxy clipper:5050
+        }
+
+        handle {
+            basicauth /* {
+                walid BCRYPT_HASH_HERE
+            }
+            reverse_proxy clipper:5050
+        }
     }
-    reverse_proxy clipper:5050
 }
