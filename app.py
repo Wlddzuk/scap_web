@@ -7,9 +7,13 @@ import logging
 import ipaddress
 import socket
 import secrets
+import hashlib
+import hmac
+import time
+from concurrent.futures import ThreadPoolExecutor, as_completed
 from datetime import datetime, timezone, timedelta
-from urllib.parse import urlparse, urlencode
-from threading import Thread
+from urllib.parse import urlparse, urlencode, quote
+from threading import Event, Lock, Thread
 import shutil
 import zipfile
 from io import BytesIO
@@ -19,10 +23,19 @@ from werkzeug.utils import secure_filename
 from dotenv import load_dotenv
 import requests
 from bs4 import BeautifulSoup
+from sqlalchemy.orm import selectinload
+from discovery_web import discovery_bp, ensure_discovery_scheduler
 
 load_dotenv()
 
-from models import db, Article, TikTokAccount
+from models import (
+    db,
+    Article,
+    PlatformPost,
+    PublisherAccount,
+    TikTokAccount,
+    VideoMetrics,
+)
 from summarizer import summarize_article
 from video_generator import generate_video
 from carousel_generator import generate_carousel
@@ -40,6 +53,21 @@ from tiktok_service import (
     upload_video_file,
     fetch_publish_status,
 )
+from performance_metrics import (
+    ensure_metrics_scheduler,
+    record_public_post_id,
+    refresh_video_metrics,
+)
+from generation_budget import get_generation_budget
+from publishers import (
+    FacebookPublisher,
+    InstagramPublisher,
+    PublishResult,
+    PublisherError,
+    TikTokPublisher,
+    YouTubePublisher,
+)
+from publishers.base import request_with_retries, response_json
 
 # Configure logging
 logging.basicConfig(
@@ -104,7 +132,16 @@ def scrape_url_content(url):
     url = validate_url(url)
 
     headers = {
-        'User-Agent': 'Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36'
+        'User-Agent': (
+            'Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) '
+            'AppleWebKit/537.36 (KHTML, like Gecko) '
+            'Chrome/126.0.0.0 Safari/537.36'
+        ),
+        'Accept': (
+            'text/html,application/xhtml+xml,application/xml;q=0.9,'
+            'image/avif,image/webp,*/*;q=0.8'
+        ),
+        'Accept-Language': 'en-US,en;q=0.9',
     }
 
     response = requests.get(url, headers=headers, timeout=15, allow_redirects=True)
@@ -205,6 +242,10 @@ CORS(app, resources={
     }
 })
 
+# Story discovery lives in a blueprint so its scheduler and transient shortlist
+# state stay isolated from the article/video routes in this module.
+app.register_blueprint(discovery_bp)
+
 # Database configuration
 db_path = os.getenv('DATABASE_URI', f'sqlite:///{os.path.abspath("instance/database.db")}')
 app.config['SQLALCHEMY_DATABASE_URI'] = db_path
@@ -214,7 +255,7 @@ db.init_app(app)
 
 
 def _migrate_schema():
-    """Idempotent SQLite migration: add new columns if they don't exist yet."""
+    """Idempotent SQLite migration for additive columns and metrics table."""
     from sqlalchemy import text, inspect
 
     new_cols = [
@@ -227,13 +268,23 @@ def _migrate_schema():
         ("carousel_audio", "VARCHAR(512)"),
         ("carousel_generated_at", "DATETIME"),
         ("viral_score", "FLOAT"),
+        ("video_generation_token", "VARCHAR(64)"),
         ("tiktok_publish_id", "VARCHAR(256)"),
         ("tiktok_publish_status", "VARCHAR(64)"),
         ("tiktok_publish_error", "TEXT"),
         ("tiktok_published_at", "DATETIME"),
+        ("tiktok_approval_message_id", "VARCHAR(64)"),
+        ("tiktok_approval_requested_at", "DATETIME"),
+        ("pending_publish_request", "TEXT"),
     ]
 
     with app.app_context():
+        # ``create_all`` normally creates this first, while this explicit,
+        # check-first call keeps the no-Alembic migration contract visible and
+        # safe for existing SQLite installs.
+        VideoMetrics.__table__.create(bind=db.engine, checkfirst=True)
+        PlatformPost.__table__.create(bind=db.engine, checkfirst=True)
+        PublisherAccount.__table__.create(bind=db.engine, checkfirst=True)
         inspector = inspect(db.engine)
         if "articles" not in inspector.get_table_names():
             return
@@ -243,6 +294,35 @@ def _migrate_schema():
                 if col_name not in existing:
                     conn.execute(text(f"ALTER TABLE articles ADD COLUMN {col_name} {col_type}"))
                     logger.info(f"Schema migrated: added articles.{col_name}")
+
+            # Existing installs already contain two real TikTok posts in the
+            # legacy Article columns. Copy them into the platform-neutral table
+            # once without deleting the compatibility fields.
+            conn.execute(text("""
+                INSERT INTO platform_posts (
+                    article_id, platform, external_id, status, error,
+                    published_at, created_at, updated_at
+                )
+                SELECT
+                    a.id, 'tiktok', a.tiktok_publish_id,
+                    CASE
+                        WHEN a.tiktok_publish_status = 'PUBLISH_COMPLETE'
+                            THEN 'PUBLISHED'
+                        ELSE COALESCE(a.tiktok_publish_status, 'UNKNOWN')
+                    END,
+                    a.tiktok_publish_error, a.tiktok_published_at,
+                    COALESCE(a.tiktok_published_at, CURRENT_TIMESTAMP),
+                    CURRENT_TIMESTAMP
+                FROM articles AS a
+                WHERE (
+                    a.tiktok_publish_id IS NOT NULL
+                    OR a.tiktok_publish_status IS NOT NULL
+                )
+                AND NOT EXISTS (
+                    SELECT 1 FROM platform_posts AS p
+                    WHERE p.article_id = a.id AND p.platform = 'tiktok'
+                )
+            """))
 
 
 with app.app_context():
@@ -313,13 +393,231 @@ validate_api_keys()
 # TikTok connection helpers
 # ============================================================
 
-TIKTOK_SCOPES = ('user.info.basic', 'video.publish')
-TIKTOK_PENDING_STATUSES = {
+TIKTOK_POSTING_SCOPES = (
+    'user.info.basic',
+    'video.publish',
+)
+TIKTOK_METRICS_SCOPES = (
+    'video.list',
+    'user.info.stats',
+)
+TIKTOK_REMOTE_PENDING_STATUSES = {
     'INITIALIZING',
     'UPLOADING',
     'PROCESSING_UPLOAD',
     'PROCESSING_DOWNLOAD',
 }
+
+# ``AWAITING_APPROVAL`` is a retired auto-publish state. It remains readable
+# only so installations upgraded from the old Discord approval workflow can
+# reclaim those rows safely through the cancel endpoint.
+LEGACY_RECLAIMABLE_PUBLISH_STATUSES = {'AWAITING_APPROVAL'}
+TIKTOK_PENDING_STATUSES = (
+    TIKTOK_REMOTE_PENDING_STATUSES | LEGACY_RECLAIMABLE_PUBLISH_STATUSES
+)
+ACTIVE_PLATFORM_POST_STATUSES = {
+    'INITIALIZING',
+    'UPLOADING',
+    'PROCESSING_UPLOAD',
+    'PROCESSING_DOWNLOAD',
+    'PROCESSING_CONTAINER',
+}
+TIKTOK_GENERIC_PUBLISH_ERROR = 'TikTok could not publish this video'
+TIKTOK_SAFE_ERROR_MESSAGES = {
+    'unaudited_client_can_only_post_to_private_accounts': (
+        'TikTok requires this unaudited app to post from a TikTok account that '
+        'is set to Private. Turn on Private account in TikTok, then retry with '
+        'Only you (SELF_ONLY).'
+    ),
+    'spam_risk_too_many_posts': (
+        "This TikTok account has reached its 24-hour API posting cap. Try again "
+        'after the cap resets, or post from the TikTok app.'
+    ),
+    'spam_risk_too_many_pending_share': (
+        'This TikTok account has too many pending API uploads. Complete or wait '
+        'for those uploads, then try again later.'
+    ),
+    'reached_active_user_cap': (
+        "This TikTok app has reached its 24-hour active-user publishing cap. "
+        'Try again after the cap resets.'
+    ),
+    'spam_risk_user_banned_from_posting': (
+        'TikTok has blocked this account from creating new posts. Check the '
+        'account in TikTok; retrying from Clipper will not fix it.'
+    ),
+    'rate_limit_exceeded': (
+        'TikTok is receiving too many requests. Wait a few minutes and try again.'
+    ),
+    'privacy_level_option_mismatch': (
+        'That privacy option is no longer available for this TikTok account. '
+        'Reopen the posting window and choose one of the current options.'
+    ),
+    'scope_not_authorized': (
+        'TikTok posting permission is missing. Reconnect the TikTok account and '
+        'approve the posting permission.'
+    ),
+    'access_token_invalid': 'Reconnect your TikTok account and try again.',
+    'not_connected': 'Connect your TikTok account and try again.',
+    'refresh_expired': 'Reconnect your TikTok account and try again.',
+}
+
+
+def _env_flag(name, default=False):
+    """Read a conventional boolean environment variable."""
+    fallback = 'true' if default else 'false'
+    return os.getenv(name, fallback).strip().lower() in {'1', 'true', 'yes', 'on'}
+
+
+def _tiktok_requested_scopes():
+    """Return only scopes that the configured TikTok app can request.
+
+    TikTok rejects the complete Login Kit request when even one scope is not
+    enabled for the developer app. Posting therefore uses its two required
+    scopes by default. Operators can opt into the Display API metrics scopes
+    after TikTok has enabled those products/scopes for their app.
+    """
+    scopes = list(TIKTOK_POSTING_SCOPES)
+    if _env_flag('TIKTOK_REQUEST_METRICS_SCOPES', False):
+        scopes.extend(TIKTOK_METRICS_SCOPES)
+    return tuple(scopes)
+
+
+class TikTokPublishRequestError(ValueError):
+    """A caller-correctable publish request error with an HTTP status."""
+
+    def __init__(self, message, status_code=400):
+        super().__init__(message)
+        self.status_code = status_code
+
+
+def _cancel_reclaimable_publish_state(article, *, require_state=True):
+    """Clear only retired local approval state; never cancel a remote upload."""
+    blockers = []
+    if article.tiktok_publish_status in TIKTOK_REMOTE_PENDING_STATUSES:
+        blockers.append(('tiktok', article.tiktok_publish_status))
+    elif (
+        article.tiktok_publish_status in LEGACY_RECLAIMABLE_PUBLISH_STATUSES
+        and article.tiktok_publish_id
+    ):
+        blockers.append(('tiktok', article.tiktok_publish_status))
+
+    for post in article.platform_posts:
+        if post.status in ACTIVE_PLATFORM_POST_STATUSES:
+            blockers.append((post.platform, post.status))
+        elif (
+            post.status in LEGACY_RECLAIMABLE_PUBLISH_STATUSES
+            and post.external_id
+        ):
+            blockers.append((post.platform, post.status))
+
+    if blockers:
+        blocker_text = ', '.join(
+            f'{platform}: {status}' for platform, status in blockers
+        )
+        raise TikTokPublishRequestError(
+            f'Cannot cancel because a remote publish may be in flight '
+            f'({blocker_text}). An active remote upload cannot be cancelled '
+            'safely; wait for it to finish or refresh its status.',
+            409,
+        )
+
+    cancelled_platforms = []
+    reclaimed = False
+    if (
+        article.tiktok_publish_status in LEGACY_RECLAIMABLE_PUBLISH_STATUSES
+        and not article.tiktok_publish_id
+    ):
+        article.tiktok_publish_status = None
+        article.tiktok_publish_error = None
+        cancelled_platforms.append('tiktok')
+        reclaimed = True
+
+    for post in article.platform_posts:
+        if (
+            post.status in LEGACY_RECLAIMABLE_PUBLISH_STATUSES
+            and not post.external_id
+        ):
+            post.status = 'CANCELLED'
+            post.error = None
+            post.updated_at = datetime.now(timezone.utc)
+            if post.platform not in cancelled_platforms:
+                cancelled_platforms.append(post.platform)
+            reclaimed = True
+
+    if not reclaimed:
+        if require_state:
+            raise TikTokPublishRequestError(
+                'Nothing is awaiting approval for this video. Refresh the '
+                'article before trying to cancel again.',
+                409,
+            )
+        return []
+
+    # These nullable columns remain in the additive SQLite schema solely for
+    # safe upgrades from the retired Discord approval workflow.
+    article.tiktok_approval_message_id = None
+    article.tiktok_approval_requested_at = None
+    article.pending_publish_request = None
+    db.session.commit()
+    return cancelled_platforms
+
+
+def _clear_legacy_awaiting_approvals():
+    """Idempotent startup repair for approval rows created by old releases."""
+    repaired_articles = 0
+    repaired_platforms = 0
+    with app.app_context():
+        candidate_ids = {
+            article_id
+            for (article_id,) in db.session.query(Article.id).filter(
+                Article.tiktok_publish_status == 'AWAITING_APPROVAL',
+                Article.tiktok_publish_id.is_(None),
+            ).all()
+        }
+        candidate_ids.update(
+            article_id
+            for (article_id,) in db.session.query(PlatformPost.article_id).filter(
+                PlatformPost.status == 'AWAITING_APPROVAL',
+                PlatformPost.external_id.is_(None),
+            ).all()
+        )
+        for article_id in sorted(candidate_ids):
+            article = db.session.get(Article, article_id)
+            if not article:
+                continue
+            try:
+                cancelled = _cancel_reclaimable_publish_state(
+                    article,
+                    require_state=False,
+                )
+            except TikTokPublishRequestError:
+                logger.warning(
+                    'Skipped legacy approval cleanup for article %s because '
+                    'another publish is active',
+                    article_id,
+                )
+                db.session.rollback()
+                continue
+            if cancelled:
+                repaired_articles += 1
+                repaired_platforms += len(cancelled)
+
+    if repaired_articles:
+        logger.info(
+            'Cleared retired approval state for %s article(s), %s platform(s)',
+            repaired_articles,
+            repaired_platforms,
+        )
+    return {
+        'articles': repaired_articles,
+        'platforms': repaired_platforms,
+    }
+
+
+try:
+    _clear_legacy_awaiting_approvals()
+except Exception:
+    logger.error('Legacy approval-state cleanup failed', exc_info=True)
 
 
 def _tiktok_config():
@@ -393,6 +691,14 @@ def _connected_tiktok_account():
     return TikTokAccount.query.order_by(TikTokAccount.id.asc()).first()
 
 
+def _tiktok_granted_scopes(account):
+    return {
+        scope
+        for scope in re.split(r'[,\s]+', account.scope or '')
+        if scope
+    }
+
+
 def _tiktok_access_token():
     """Return a valid access token, refreshing it five minutes before expiry."""
     account = _connected_tiktok_account()
@@ -430,14 +736,41 @@ def _refresh_creator_info():
     return access_token, account, creator
 
 
+def _safe_tiktok_error_message(error, fallback):
+    """Translate known TikTok codes without exposing raw upstream details."""
+    return TIKTOK_SAFE_ERROR_MESSAGES.get(error.code, fallback)
+
+
+def _log_tiktok_api_error(context, error, *, level=logging.ERROR, exc_info=False):
+    """Log every TikTok correlation field needed for support/debugging."""
+    logger.log(
+        level,
+        '%s: code=%s status=%s log_id=%s message=%s',
+        context,
+        error.code,
+        error.status_code,
+        error.log_id,
+        str(error),
+        exc_info=exc_info,
+    )
+
+
 def _tiktok_error_response(error, default_status=502):
     status = error.status_code if error.status_code and 400 <= error.status_code < 500 else default_status
-    return jsonify({'error': str(error), 'tiktok_error': error.to_dict()}), status
+    _log_tiktok_api_error('TikTok API request failed', error, exc_info=True)
+    message = _safe_tiktok_error_message(
+        error,
+        'TikTok could not complete the request. Please try again.',
+    )
+    return jsonify({
+        'error': message,
+        'tiktok_error': {'code': error.code, 'log_id': error.log_id},
+    }), status
 
 
 def _video_file_for_article(article):
     if not article.video_path:
-        raise ValueError('Generate a video before posting to TikTok')
+        raise ValueError('Generate a video before publishing')
 
     videos_dir = os.path.realpath(os.path.join(app.root_path, 'static', 'videos'))
     video_path = os.path.realpath(os.path.join(videos_dir, article.video_path))
@@ -446,7 +779,7 @@ def _video_file_for_article(article):
     if not os.path.isfile(video_path):
         raise ValueError('Generated video file is missing')
     if not video_path.lower().endswith('.mp4'):
-        raise ValueError('TikTok posting currently supports MP4 videos only')
+        raise ValueError('Publishing currently supports MP4 videos only')
     return video_path
 
 
@@ -458,6 +791,1131 @@ def _video_duration_seconds(video_path):
         return float(clip.duration)
     finally:
         clip.close()
+
+
+def suggested_tiktok_caption(article):
+    """Build the same title + hashtag caption used by the dashboard."""
+    hashtags = []
+    if article.hashtags:
+        try:
+            parsed = json.loads(article.hashtags)
+            if isinstance(parsed, list):
+                hashtags = [str(tag) for tag in parsed if str(tag).strip()]
+        except (json.JSONDecodeError, TypeError):
+            pass
+    hashtag_text = ' '.join(hashtags)
+    caption = article.title
+    if hashtag_text:
+        caption += f'\n\n{hashtag_text}'
+    return caption[:2_200]
+
+
+def _make_tiktok_publisher():
+    """Build an adapter while retaining patchable legacy client symbols."""
+    return TikTokPublisher(
+        access_context=_refresh_creator_info,
+        duration_seconds=_video_duration_seconds,
+        make_upload_plan=make_upload_plan,
+        initialize_video_post=initialize_video_post,
+        upload_video_file=upload_video_file,
+        fetch_publish_status=fetch_publish_status,
+        status_access_token=_tiktok_access_token,
+        allow_public=_env_flag('TIKTOK_ALLOW_PUBLIC_POSTS', False),
+    )
+
+
+def _mirror_legacy_tiktok_post(article):
+    """Keep PlatformPost and the historical Article columns in sync."""
+    post = PlatformPost.query.filter_by(
+        article_id=article.id,
+        platform='tiktok',
+    ).first()
+    if post is None:
+        post = PlatformPost(article_id=article.id, platform='tiktok')
+        db.session.add(post)
+    post.external_id = article.tiktok_publish_id
+    post.status = (
+        'PUBLISHED'
+        if article.tiktok_publish_status == 'PUBLISH_COMPLETE'
+        else (article.tiktok_publish_status or 'UNKNOWN')
+    )
+    post.error = article.tiktok_publish_error
+    post.published_at = article.tiktok_published_at
+    post.updated_at = datetime.now(timezone.utc)
+    return post
+
+
+def _publish_conflict_message(status):
+    if status in LEGACY_RECLAIMABLE_PUBLISH_STATUSES:
+        return (
+            f'This video is blocked by the retired {status} state. '
+            'Choose Cancel pending post, then retry.'
+        )
+    return (
+        f'This video already has a TikTok post in progress ({status}). '
+        'Wait for it to finish or refresh its status; an active remote upload '
+        'cannot be cancelled safely.'
+    )
+
+
+def publish_article_to_tiktok(article_id, payload):
+    """Validate and upload one article through TikTok Direct Post.
+
+    Publishing is always initiated by an explicit owner request. It must be
+    called inside a Flask app context.
+    """
+    article = db.session.get(Article, article_id)
+    if not article:
+        raise TikTokPublishRequestError('Article not found', 404)
+
+    payload = payload or {}
+    if payload.get('consent') is not True:
+        raise TikTokPublishRequestError('TikTok music usage consent is required')
+
+    try:
+        video_path = _video_file_for_article(article)
+    except ValueError as error:
+        raise TikTokPublishRequestError(str(error)) from error
+
+    current_status = article.tiktok_publish_status
+    if current_status in TIKTOK_PENDING_STATUSES:
+        raise TikTokPublishRequestError(
+            _publish_conflict_message(current_status),
+            409,
+        )
+
+    title = str(payload.get('title') or '').strip()
+    if not title:
+        raise TikTokPublishRequestError('Enter a TikTok caption')
+    if len(title) > 2_200:
+        raise TikTokPublishRequestError('TikTok caption must be 2,200 characters or fewer')
+
+    privacy_level = str(payload.get('privacy_level') or '').strip()
+    if not privacy_level:
+        raise TikTokPublishRequestError('Select a TikTok privacy setting')
+
+    allow_public = _env_flag('TIKTOK_ALLOW_PUBLIC_POSTS', False)
+    if not allow_public and privacy_level != 'SELF_ONLY':
+        raise TikTokPublishRequestError(
+            'This unaudited integration is locked to Only you (SELF_ONLY) posts'
+        )
+
+    brand_content = payload.get('brand_content_toggle') is True
+    brand_organic = payload.get('brand_organic_toggle') is True
+    if brand_content and privacy_level == 'SELF_ONLY':
+        raise TikTokPublishRequestError(
+            'TikTok does not allow branded content posts with Only you privacy'
+        )
+
+    # Compare-and-swap every allowed starting state. This protects two manual
+    # requests from both initializing and uploading the same video.
+    claim = Article.query.filter(Article.id == article_id)
+    if current_status is None:
+        claim = claim.filter(Article.tiktok_publish_status.is_(None))
+    else:
+        claim = claim.filter(Article.tiktok_publish_status == current_status)
+    claimed = claim.update(
+        {
+            Article.tiktok_publish_status: 'INITIALIZING',
+            Article.tiktok_publish_error: None,
+        },
+        synchronize_session=False,
+    )
+    db.session.commit()
+    if claimed != 1:
+        db.session.expire_all()
+        latest_status = (
+            db.session.get(Article, article_id).tiktok_publish_status
+            or 'UNKNOWN'
+        )
+        raise TikTokPublishRequestError(
+            _publish_conflict_message(latest_status),
+            409,
+        )
+    article = db.session.get(Article, article_id)
+
+    try:
+        result = _make_tiktok_publisher().publish(article, video_path, payload)
+        article.tiktok_publish_id = result.external_id
+        article.tiktok_publish_status = result.status
+        article.tiktok_publish_error = result.error
+        _mirror_legacy_tiktok_post(article)
+        db.session.commit()
+        start_tiktok_status_poller()
+        return {
+            'message': 'Video uploaded to TikTok for processing',
+            'article': article.to_dict(),
+            'publish_id': article.tiktok_publish_id,
+        }
+    except (TikTokAPIError, PublisherError, ValueError) as error:
+        if isinstance(error, TikTokAPIError):
+            _log_tiktok_api_error(
+                f'TikTok publish failed for article {article_id}',
+                error,
+                exc_info=True,
+            )
+        else:
+            logger.error(
+                'TikTok publish failed for article %s: %s',
+                article_id,
+                error,
+                exc_info=True,
+            )
+        article.tiktok_publish_status = 'FAILED'
+        article.tiktok_publish_error = (
+            _safe_tiktok_error_message(error, TIKTOK_GENERIC_PUBLISH_ERROR)
+            if isinstance(error, TikTokAPIError)
+            else (
+                error.public_message
+                if isinstance(error, PublisherError)
+                else str(error)
+            )
+        )
+        _mirror_legacy_tiktok_post(article)
+        db.session.commit()
+        if isinstance(error, TikTokAPIError):
+            raise
+        if isinstance(error, PublisherError):
+            raise TikTokPublishRequestError(
+                error.public_message,
+                error.status_code or 400,
+            ) from error
+        raise TikTokPublishRequestError(str(error)) from error
+    except Exception as error:
+        logger.error(
+            'Unexpected TikTok publish failure for article %s: %s',
+            article_id,
+            error,
+            exc_info=True,
+        )
+        article.tiktok_publish_status = 'FAILED'
+        article.tiktok_publish_error = 'Unexpected upload failure'
+        _mirror_legacy_tiktok_post(article)
+        db.session.commit()
+        raise
+
+
+def refresh_tiktok_publish_status(article):
+    """Fetch and persist TikTok's current state for one submitted article."""
+    if not article.tiktok_publish_id:
+        raise TikTokPublishRequestError('This article has not been sent to TikTok')
+
+    access_token, _ = _tiktok_access_token()
+    status_data = fetch_publish_status(access_token, article.tiktok_publish_id)
+    status = status_data.get('status') or article.tiktok_publish_status or 'UNKNOWN'
+    fail_reason = status_data.get('fail_reason')
+    article.tiktok_publish_status = status
+    article.tiktok_publish_error = TIKTOK_GENERIC_PUBLISH_ERROR if fail_reason else None
+    if fail_reason:
+        logger.error(
+            'TikTok reported a publish failure for article %s: %s',
+            article.id,
+            fail_reason,
+        )
+    if status == 'PUBLISH_COMPLETE' and not article.tiktok_published_at:
+        article.tiktok_published_at = datetime.now(timezone.utc)
+    record_public_post_id(article, status_data)
+    _mirror_legacy_tiktok_post(article)
+    db.session.commit()
+    public_status = dict(status_data)
+    if fail_reason:
+        public_status['fail_reason'] = TIKTOK_GENERIC_PUBLISH_ERROR
+    return public_status
+
+
+def poll_tiktok_publish_statuses_once():
+    """Advance all in-flight Direct Posts once; transient failures retry later."""
+    articles = Article.query.filter(
+        Article.tiktok_publish_id.isnot(None),
+        Article.tiktok_publish_status.in_(TIKTOK_REMOTE_PENDING_STATUSES),
+    ).all()
+    for article in articles:
+        try:
+            refresh_tiktok_publish_status(article)
+        except (TikTokAPIError, TikTokPublishRequestError, ValueError):
+            db.session.rollback()
+            logger.warning(
+                'TikTok status poll failed for article %s; will retry',
+                article.id,
+                exc_info=True,
+            )
+        except Exception:
+            db.session.rollback()
+            logger.error(
+                'Unexpected TikTok status poll failure for article %s; will retry',
+                article.id,
+                exc_info=True,
+            )
+
+
+_tiktok_poller_lock = Lock()
+_tiktok_poller_stop = Event()
+_tiktok_poller_thread = None
+
+
+def _tiktok_status_poller_loop():
+    try:
+        interval = max(5, int(os.getenv('TIKTOK_STATUS_POLL_SECONDS', '15')))
+    except ValueError:
+        interval = 15
+    while not _tiktok_poller_stop.is_set():
+        with app.app_context():
+            try:
+                poll_tiktok_publish_statuses_once()
+            except Exception:
+                db.session.rollback()
+                logger.error('TikTok status poller iteration failed; will retry', exc_info=True)
+            finally:
+                db.session.remove()
+        _tiktok_poller_stop.wait(interval)
+
+
+def start_tiktok_status_poller():
+    """Start one process-local daemon that tracks TikTok processing state."""
+    global _tiktok_poller_thread
+    if app.config.get('TESTING'):
+        return False
+    with _tiktok_poller_lock:
+        if _tiktok_poller_thread and _tiktok_poller_thread.is_alive():
+            return False
+        _tiktok_poller_stop.clear()
+        _tiktok_poller_thread = Thread(
+            target=_tiktok_status_poller_loop,
+            name='tiktok-status-poller',
+            daemon=True,
+        )
+        _tiktok_poller_thread.start()
+        return True
+
+
+def refresh_tiktok_metrics_once():
+    """Pull current video/account counters for the connected creator."""
+    access_token, _ = _tiktok_access_token()
+    return refresh_video_metrics(
+        access_token,
+        caption_builder=suggested_tiktok_caption,
+    )
+
+
+@app.before_request
+def _ensure_tiktok_background_services():
+    """Lazily start background work in the serving process, never reloader parent."""
+    start_tiktok_status_poller()
+    for (article_id,) in db.session.query(PlatformPost.article_id).filter_by(
+        platform='instagram',
+        status='PROCESSING_CONTAINER',
+    ).all():
+        _start_instagram_container_poller(article_id)
+    for (article_id,) in db.session.query(PlatformPost.article_id).filter_by(
+        platform='facebook',
+        status='PROCESSING_UPLOAD',
+    ).all():
+        _start_facebook_reel_poller(article_id)
+    account = _connected_tiktok_account()
+    has_metrics_scopes = account is not None and {
+        'video.list',
+        'user.info.stats',
+    } <= _tiktok_granted_scopes(account)
+    if has_metrics_scopes:
+        ensure_metrics_scheduler(app, refresh_tiktok_metrics_once)
+
+# ============================================================
+# Multi-platform publishing and OAuth helpers
+# ============================================================
+
+SUPPORTED_PUBLISH_PLATFORMS = ('tiktok', 'instagram', 'youtube', 'facebook')
+
+
+def _oauth_encryption_secret():
+    return (
+        os.getenv('OAUTH_TOKEN_ENCRYPTION_KEY', '').strip()
+        or os.getenv('TIKTOK_TOKEN_ENCRYPTION_KEY', '').strip()
+        or (_configured_flask_secret or '')
+    )
+
+
+def _oauth_cipher():
+    return TokenCipher(_oauth_encryption_secret())
+
+
+def _publisher_account(platform):
+    return PublisherAccount.query.filter_by(platform=platform).first()
+
+
+def _store_publisher_account(
+    platform,
+    *,
+    access_token,
+    refresh_token=None,
+    expires_in=None,
+    refresh_expires_in=None,
+    external_user_id=None,
+    username=None,
+    scope=None,
+):
+    if not access_token:
+        raise PublisherError(
+            f'{platform.title()} did not return an access token',
+            code='invalid_token_response',
+        )
+    now = datetime.now(timezone.utc)
+    cipher = _oauth_cipher()
+    account = _publisher_account(platform)
+    if account is None:
+        account = PublisherAccount(platform=platform)
+        db.session.add(account)
+    account.external_user_id = external_user_id or account.external_user_id
+    account.username = username or account.username
+    account.access_token_encrypted = cipher.encrypt(access_token)
+    if refresh_token:
+        account.refresh_token_encrypted = cipher.encrypt(refresh_token)
+    account.scope = scope or account.scope
+    if expires_in is not None:
+        account.access_token_expires_at = now + timedelta(seconds=int(expires_in))
+    if refresh_expires_in is not None:
+        account.refresh_token_expires_at = now + timedelta(
+            seconds=int(refresh_expires_in)
+        )
+    account.updated_at = now
+    db.session.commit()
+    return account
+
+
+def _instagram_config():
+    return {
+        'app_id': os.getenv('INSTAGRAM_APP_ID', '').strip(),
+        'app_secret': os.getenv('INSTAGRAM_APP_SECRET', '').strip(),
+        'redirect_uri': os.getenv('INSTAGRAM_REDIRECT_URI', '').strip(),
+        'graph_version': os.getenv('INSTAGRAM_GRAPH_VERSION', 'v23.0').strip() or 'v23.0',
+    }
+
+
+def _facebook_config():
+    return {
+        'app_id': os.getenv('FACEBOOK_APP_ID', '').strip(),
+        'app_secret': os.getenv('FACEBOOK_APP_SECRET', '').strip(),
+        'redirect_uri': os.getenv('FACEBOOK_REDIRECT_URI', '').strip(),
+        'graph_version': os.getenv('FACEBOOK_GRAPH_VERSION', 'v23.0').strip() or 'v23.0',
+    }
+
+
+def _youtube_config():
+    return {
+        'client_id': os.getenv('YOUTUBE_CLIENT_ID', '').strip(),
+        'client_secret': os.getenv('YOUTUBE_CLIENT_SECRET', '').strip(),
+        'redirect_uri': os.getenv('YOUTUBE_REDIRECT_URI', '').strip(),
+    }
+
+
+def _public_media_missing_config():
+    missing = []
+    public_base = os.getenv('PUBLIC_BASE_URL', '').strip().rstrip('/')
+    parsed = urlparse(public_base)
+    if parsed.scheme != 'https' or not parsed.netloc:
+        missing.append('PUBLIC_BASE_URL (HTTPS)')
+    if not (
+        os.getenv('PUBLIC_MEDIA_SIGNING_KEY', '').strip()
+        or _oauth_encryption_secret()
+    ):
+        missing.append('PUBLIC_MEDIA_SIGNING_KEY')
+    return missing
+
+
+def _instagram_missing_config():
+    config = _instagram_config()
+    missing = [
+        env_name
+        for key, env_name in (
+            ('app_id', 'INSTAGRAM_APP_ID'),
+            ('app_secret', 'INSTAGRAM_APP_SECRET'),
+            ('redirect_uri', 'INSTAGRAM_REDIRECT_URI'),
+        )
+        if not config[key]
+    ]
+    if not _oauth_encryption_secret():
+        missing.append('OAUTH_TOKEN_ENCRYPTION_KEY')
+    return missing + _public_media_missing_config()
+
+
+def _facebook_missing_config():
+    config = _facebook_config()
+    missing = [
+        env_name
+        for key, env_name in (
+            ('app_id', 'FACEBOOK_APP_ID'),
+            ('app_secret', 'FACEBOOK_APP_SECRET'),
+            ('redirect_uri', 'FACEBOOK_REDIRECT_URI'),
+        )
+        if not config[key]
+    ]
+    if not _oauth_encryption_secret():
+        missing.append('OAUTH_TOKEN_ENCRYPTION_KEY')
+    return missing
+
+
+def _youtube_missing_config():
+    config = _youtube_config()
+    missing = [
+        env_name
+        for key, env_name in (
+            ('client_id', 'YOUTUBE_CLIENT_ID'),
+            ('client_secret', 'YOUTUBE_CLIENT_SECRET'),
+            ('redirect_uri', 'YOUTUBE_REDIRECT_URI'),
+        )
+        if not config[key]
+    ]
+    if not _oauth_encryption_secret():
+        missing.append('OAUTH_TOKEN_ENCRYPTION_KEY')
+    return missing
+
+
+def _signed_public_video_url(filename, *, lifetime_seconds=None):
+    """Create a short-lived HTTPS URL Instagram can fetch without Basic Auth."""
+    missing = _public_media_missing_config()
+    if missing:
+        raise PublisherError(
+            'Public HTTPS video delivery is not configured',
+            code='public_media_not_configured',
+            status_code=503,
+        )
+    lifetime = lifetime_seconds or int(
+        os.getenv('PUBLIC_MEDIA_URL_TTL_SECONDS', '21600')
+    )
+    expires = int(time.time()) + max(900, lifetime)
+    signing_key = (
+        os.getenv('PUBLIC_MEDIA_SIGNING_KEY', '').strip()
+        or _oauth_encryption_secret()
+    )
+    message = f'{filename}:{expires}'.encode('utf-8')
+    signature = hmac.new(
+        signing_key.encode('utf-8'),
+        message,
+        hashlib.sha256,
+    ).hexdigest()
+    base = os.getenv('PUBLIC_BASE_URL', '').strip().rstrip('/')
+    return (
+        f'{base}/public-media/{quote(filename, safe="/")}'
+        f'?expires={expires}&sig={signature}'
+    )
+
+
+def _instagram_access_token():
+    account = _publisher_account('instagram')
+    if account is None:
+        raise PublisherError(
+            'Connect Instagram first', code='not_connected', status_code=409
+        )
+    cipher = _oauth_cipher()
+    token = cipher.decrypt(account.access_token_encrypted)
+    expiry = _as_utc(account.access_token_expires_at)
+    now = datetime.now(timezone.utc)
+    if not expiry or expiry > now + timedelta(days=7):
+        return token, account
+
+    config = _instagram_config()
+    response = request_with_retries(
+        requests.get,
+        f"https://graph.facebook.com/{config['graph_version']}/oauth/access_token",
+        params={
+            'grant_type': 'fb_exchange_token',
+            'client_id': config['app_id'],
+            'client_secret': config['app_secret'],
+            'fb_exchange_token': token,
+        },
+    )
+    payload = response_json(response, platform='Instagram')
+    account = _store_publisher_account(
+        'instagram',
+        access_token=payload.get('access_token'),
+        expires_in=payload.get('expires_in') or 5_184_000,
+        external_user_id=account.external_user_id,
+        username=account.username,
+        scope=account.scope,
+    )
+    return _oauth_cipher().decrypt(account.access_token_encrypted), account
+
+
+def _youtube_access_token():
+    account = _publisher_account('youtube')
+    if account is None:
+        raise PublisherError(
+            'Connect YouTube first', code='not_connected', status_code=409
+        )
+    cipher = _oauth_cipher()
+    expiry = _as_utc(account.access_token_expires_at)
+    now = datetime.now(timezone.utc)
+    if expiry and expiry > now + timedelta(minutes=5):
+        return cipher.decrypt(account.access_token_encrypted), account
+    if not account.refresh_token_encrypted:
+        raise PublisherError(
+            'Reconnect YouTube to restore upload access',
+            code='refresh_token_missing',
+            status_code=409,
+        )
+    config = _youtube_config()
+    response = request_with_retries(
+        requests.post,
+        'https://oauth2.googleapis.com/token',
+        data={
+            'client_id': config['client_id'],
+            'client_secret': config['client_secret'],
+            'refresh_token': cipher.decrypt(account.refresh_token_encrypted),
+            'grant_type': 'refresh_token',
+        },
+    )
+    payload = response_json(response, platform='YouTube')
+    account = _store_publisher_account(
+        'youtube',
+        access_token=payload.get('access_token'),
+        refresh_token=cipher.decrypt(account.refresh_token_encrypted),
+        expires_in=payload.get('expires_in') or 3_600,
+        external_user_id=account.external_user_id,
+        username=account.username,
+        scope=account.scope,
+    )
+    return _oauth_cipher().decrypt(account.access_token_encrypted), account
+
+
+def _facebook_access_token():
+    account = _publisher_account('facebook')
+    if account is None:
+        raise PublisherError(
+            'Connect Facebook first', code='not_connected', status_code=409
+        )
+    expiry = _as_utc(account.access_token_expires_at)
+    if expiry and expiry <= datetime.now(timezone.utc):
+        raise PublisherError(
+            'Reconnect Facebook to restore Page publishing access',
+            code='access_token_expired',
+            status_code=409,
+        )
+    return _oauth_cipher().decrypt(account.access_token_encrypted), account
+
+
+def _expiry_metadata(account, *, warning_days):
+    if account is None or not account.access_token_expires_at:
+        return {'days_until_expiry': None, 'expiry_warning': False, 'expired': False}
+    seconds = (
+        _as_utc(account.access_token_expires_at) - datetime.now(timezone.utc)
+    ).total_seconds()
+    return {
+        'days_until_expiry': max(0, int(seconds // 86_400)),
+        'expiry_warning': seconds <= warning_days * 86_400,
+        'expired': seconds <= 0,
+    }
+
+
+def _publisher_status_payload():
+    instagram = _publisher_account('instagram')
+    facebook = _publisher_account('facebook')
+    youtube = _publisher_account('youtube')
+    tiktok = _connected_tiktok_account()
+    tiktok_missing = _tiktok_missing_config()
+    tiktok_payload = {
+        'configured': not tiktok_missing,
+        'missing_config': tiktok_missing,
+        'connected': tiktok is not None,
+        'public_posting_enabled': _env_flag('TIKTOK_ALLOW_PUBLIC_POSTS', False),
+        'oauth_start_url': '/api/tiktok/oauth/start',
+        'disconnect_url': '/api/tiktok/disconnect',
+    }
+    if tiktok:
+        tiktok_payload.update(tiktok.to_public_dict())
+        tiktok_payload.update(_expiry_metadata(tiktok, warning_days=7))
+        granted = _tiktok_granted_scopes(tiktok)
+        missing_posting = [
+            scope for scope in TIKTOK_POSTING_SCOPES if scope not in granted
+        ]
+        tiktok_payload.update({
+            'posting_authorized': not missing_posting,
+            'missing_posting_scopes': missing_posting,
+            'needs_reconsent': bool(missing_posting),
+        })
+
+    instagram_missing = _instagram_missing_config()
+    instagram_payload = {
+        'configured': not instagram_missing,
+        'missing_config': instagram_missing,
+        'connected': instagram is not None,
+        'requirements': (
+            'Business or Creator account linked to a Facebook Page; '
+            'instagram_content_publish App Review is required for non-test users.'
+        ),
+        'daily_publish_limit': 50,
+        'oauth_start_url': '/api/instagram/oauth/start',
+        'disconnect_url': '/api/instagram/disconnect',
+    }
+    if instagram:
+        instagram_payload.update(instagram.to_public_dict())
+        instagram_payload.update(_expiry_metadata(instagram, warning_days=10))
+
+    facebook_missing = _facebook_missing_config()
+    facebook_payload = {
+        'configured': not facebook_missing,
+        'missing_config': facebook_missing,
+        'connected': facebook is not None,
+        'requirements': (
+            'Facebook Page access with pages_manage_posts and '
+            'pages_read_engagement; App Review is required for non-test users.'
+        ),
+        'oauth_start_url': '/api/facebook/oauth/start',
+        'disconnect_url': '/api/facebook/disconnect',
+    }
+    if facebook:
+        facebook_payload.update(facebook.to_public_dict())
+        facebook_payload.update(_expiry_metadata(facebook, warning_days=10))
+
+    youtube_missing = _youtube_missing_config()
+    youtube_payload = {
+        'configured': not youtube_missing,
+        'missing_config': youtube_missing,
+        'connected': youtube is not None,
+        'video_upload_quota_daily': 100,
+        'oauth_start_url': '/api/youtube/oauth/start',
+        'disconnect_url': '/api/youtube/disconnect',
+        'testing_mode_warning': (
+            'OAuth refresh tokens expire after 7 days while the consent screen '
+            'is in Testing; unverified projects may upload only private videos.'
+        ),
+    }
+    if youtube:
+        youtube_payload.update(youtube.to_public_dict())
+        refreshable = bool(youtube.refresh_token_encrypted)
+        youtube_payload.update({
+            'access_token_refreshable': refreshable,
+            **(
+                {'days_until_expiry': None, 'expiry_warning': False, 'expired': False}
+                if refreshable
+                else _expiry_metadata(youtube, warning_days=2)
+            ),
+        })
+    return {
+        'platforms': {
+            'tiktok': tiktok_payload,
+            'instagram': instagram_payload,
+            'youtube': youtube_payload,
+            'facebook': facebook_payload,
+        }
+    }
+
+
+def _make_publisher(platform, article):
+    if platform == 'tiktok':
+        return _make_tiktok_publisher()
+    if platform == 'instagram':
+        access_token, account = _instagram_access_token()
+        return InstagramPublisher(
+            access_token=access_token,
+            instagram_user_id=account.external_user_id,
+            public_video_url=_signed_public_video_url(article.video_path),
+            graph_version=_instagram_config()['graph_version'],
+        )
+    if platform == 'youtube':
+        access_token, _ = _youtube_access_token()
+        return YouTubePublisher(access_token=access_token)
+    if platform == 'facebook':
+        access_token, account = _facebook_access_token()
+        return FacebookPublisher(
+            access_token=access_token,
+            page_id=account.external_user_id,
+            graph_version=_facebook_config()['graph_version'],
+        )
+    raise PublisherError('Unsupported publishing platform', code='unsupported_platform')
+
+
+def _post_as_result(post, *, idempotent=False):
+    accepted = post.status != 'FAILED'
+    return PublishResult(
+        platform=post.platform,
+        status=post.status,
+        accepted=accepted,
+        external_id=post.external_id,
+        permalink=post.permalink,
+        error=post.error,
+        published_at=(post.published_at.isoformat() if post.published_at else None),
+        idempotent=idempotent,
+    )
+
+
+def _claim_platform_post(article_id, platform):
+    post = PlatformPost.query.filter_by(
+        article_id=article_id,
+        platform=platform,
+    ).first()
+    if post is None:
+        post = PlatformPost(
+            article_id=article_id,
+            platform=platform,
+            status='INITIALIZING',
+        )
+        db.session.add(post)
+        try:
+            db.session.commit()
+            return post, None
+        except Exception:
+            db.session.rollback()
+            post = PlatformPost.query.filter_by(
+                article_id=article_id,
+                platform=platform,
+            ).first()
+            if post is None:
+                raise
+
+    if post.status == 'PUBLISHED' or post.status in ACTIVE_PLATFORM_POST_STATUSES:
+        return post, _post_as_result(post, idempotent=True)
+    post.status = 'INITIALIZING'
+    post.error = None
+    post.external_id = None
+    post.permalink = None
+    post.published_at = None
+    post.updated_at = datetime.now(timezone.utc)
+    db.session.commit()
+    return post, None
+
+
+def _persist_publish_result(post, result):
+    post.external_id = result.external_id
+    post.status = result.status
+    post.error = result.error
+    post.permalink = result.permalink
+    if result.status == 'PUBLISHED' and not post.published_at:
+        post.published_at = datetime.now(timezone.utc)
+    post.updated_at = datetime.now(timezone.utc)
+    db.session.commit()
+    return _post_as_result(post, idempotent=result.idempotent)
+
+
+def _publish_one_platform(article_id, platform, options):
+    with app.app_context():
+        article = db.session.get(Article, article_id)
+        if not article:
+            return PublishResult(platform, 'FAILED', False, error='Article not found')
+        try:
+            post, existing = _claim_platform_post(article_id, platform)
+            if existing:
+                if platform == 'instagram' and existing.status == 'PROCESSING_CONTAINER':
+                    _start_instagram_container_poller(article_id)
+                if platform == 'facebook' and existing.status == 'PROCESSING_UPLOAD':
+                    _start_facebook_reel_poller(article_id)
+                return existing
+            video_path = _video_file_for_article(article)
+            if platform == 'tiktok':
+                legacy = publish_article_to_tiktok(
+                    article_id,
+                    options,
+                )
+                post = PlatformPost.query.filter_by(
+                    article_id=article_id,
+                    platform=platform,
+                ).one()
+                result = PublishResult(
+                    platform='tiktok',
+                    status=post.status,
+                    accepted=True,
+                    external_id=legacy.get('publish_id'),
+                )
+            else:
+                result = _make_publisher(platform, article).publish(
+                    article,
+                    video_path,
+                    options,
+                )
+            post = PlatformPost.query.filter_by(
+                article_id=article_id,
+                platform=platform,
+            ).one()
+            persisted = _persist_publish_result(post, result)
+            if platform == 'instagram' and persisted.status == 'PROCESSING_CONTAINER':
+                _start_instagram_container_poller(article_id)
+            if platform == 'facebook' and persisted.status == 'PROCESSING_UPLOAD':
+                _start_facebook_reel_poller(article_id)
+            return persisted
+        except (PublisherError, TikTokPublishRequestError, TikTokAPIError, ValueError) as error:
+            logger.error(
+                '%s publish failed for article %s',
+                platform,
+                article_id,
+                exc_info=True,
+            )
+            post = PlatformPost.query.filter_by(
+                article_id=article_id,
+                platform=platform,
+            ).first()
+            safe_error = (
+                error.public_message
+                if isinstance(error, PublisherError)
+                else (
+                    _safe_tiktok_error_message(error, TIKTOK_GENERIC_PUBLISH_ERROR)
+                    if isinstance(error, TikTokAPIError)
+                    else str(error)
+                )
+            )
+            if post:
+                post.status = 'FAILED'
+                post.error = safe_error
+                post.updated_at = datetime.now(timezone.utc)
+                db.session.commit()
+                return _post_as_result(post)
+            return PublishResult(platform, 'FAILED', False, error=safe_error)
+        except Exception:
+            logger.error(
+                'Unexpected %s publish failure for article %s',
+                platform,
+                article_id,
+                exc_info=True,
+            )
+            db.session.rollback()
+            post = PlatformPost.query.filter_by(
+                article_id=article_id,
+                platform=platform,
+            ).first()
+            if post:
+                post.status = 'FAILED'
+                post.error = f'{platform.title()} could not publish this video'
+                post.updated_at = datetime.now(timezone.utc)
+                db.session.commit()
+                return _post_as_result(post)
+            return PublishResult(
+                platform,
+                'FAILED',
+                False,
+                error=f'{platform.title()} could not publish this video',
+            )
+        finally:
+            db.session.remove()
+
+
+def _normalize_publish_options(article, payload, platform):
+    shared_caption = str(payload.get('caption') or suggested_tiktok_caption(article))
+    raw_options = payload.get('options') or {}
+    if not isinstance(raw_options, dict):
+        raise TikTokPublishRequestError('Publishing options must be an object')
+    platform_options = raw_options.get(platform) or {}
+    if not isinstance(platform_options, dict):
+        raise TikTokPublishRequestError(
+            f'{platform.title()} options must be an object'
+        )
+    options = dict(platform_options)
+    options.setdefault('caption', shared_caption)
+    if platform == 'tiktok':
+        options.setdefault('title', shared_caption)
+        options.setdefault('privacy_level', 'SELF_ONLY')
+        options.setdefault('consent', False)
+    elif platform == 'youtube':
+        options.setdefault('title', article.title)
+        options.setdefault('description', shared_caption)
+        options.setdefault('privacy_status', 'private')
+    return options
+
+
+def publish_article_everywhere(article_id, payload):
+    """Fan out one retry-safe publish request and return per-platform outcomes."""
+    if not isinstance(payload, dict):
+        raise TikTokPublishRequestError('Publish request must be an object')
+    article = db.session.get(Article, article_id)
+    if not article:
+        raise TikTokPublishRequestError('Article not found', 404)
+    try:
+        _video_file_for_article(article)
+    except ValueError as error:
+        raise TikTokPublishRequestError(str(error)) from error
+    platforms = payload.get('platforms') if isinstance(payload, dict) else None
+    if not isinstance(platforms, list) or not platforms:
+        raise TikTokPublishRequestError('Choose at least one publishing platform')
+    platforms = list(dict.fromkeys(str(value).lower() for value in platforms))
+    invalid = [value for value in platforms if value not in SUPPORTED_PUBLISH_PLATFORMS]
+    if invalid:
+        raise TikTokPublishRequestError(
+            f"Unsupported platform: {', '.join(invalid)}"
+        )
+
+    platform_options = {
+        platform: _normalize_publish_options(article, payload, platform)
+        for platform in platforms
+    }
+    # Release the coordinator's read transaction before worker app contexts
+    # write their independent per-platform rows (important for SQLite).
+    db.session.remove()
+    outcomes = {}
+    with ThreadPoolExecutor(
+        max_workers=len(platforms),
+        thread_name_prefix=f'publish-{article_id}',
+    ) as executor:
+        futures = {
+            executor.submit(
+                _publish_one_platform,
+                article_id,
+                platform,
+                platform_options[platform],
+            ): platform
+            for platform in platforms
+        }
+        for future in as_completed(futures):
+            platform = futures[future]
+            try:
+                outcomes[platform] = future.result().to_dict()
+            except Exception:
+                logger.error(
+                    'Publish worker escaped for article %s platform %s',
+                    article_id,
+                    platform,
+                    exc_info=True,
+                )
+                outcomes[platform] = PublishResult(
+                    platform,
+                    'FAILED',
+                    False,
+                    error=f'{platform.title()} could not publish this video',
+                ).to_dict()
+    article = db.session.get(Article, article_id)
+    db.session.refresh(article)
+    return {
+        'article': article.to_dict(),
+        'results': {platform: outcomes[platform] for platform in platforms},
+        'all_accepted': all(result['accepted'] for result in outcomes.values()),
+    }
+
+_instagram_poll_lock = Lock()
+_instagram_polling_articles = set()
+
+
+def _start_instagram_container_poller(article_id):
+    if app.config.get('TESTING'):
+        return False
+    with _instagram_poll_lock:
+        if article_id in _instagram_polling_articles:
+            return False
+        _instagram_polling_articles.add(article_id)
+
+    def poll():
+        deadline = time.monotonic() + max(
+            60,
+            int(os.getenv('INSTAGRAM_CONTAINER_TIMEOUT_SECONDS', '1200')),
+        )
+        delay = 5
+        try:
+            while time.monotonic() < deadline:
+                with app.app_context():
+                    post = PlatformPost.query.filter_by(
+                        article_id=article_id,
+                        platform='instagram',
+                    ).first()
+                    if not post or post.status != 'PROCESSING_CONTAINER':
+                        return
+                    try:
+                        access_token, account = _instagram_access_token()
+                        publisher = InstagramPublisher(
+                            access_token=access_token,
+                            instagram_user_id=account.external_user_id,
+                            public_video_url='',
+                            graph_version=_instagram_config()['graph_version'],
+                        )
+                        result = publisher.check_status(post.external_id)
+                        _persist_publish_result(post, result)
+                        if result.status in {'PUBLISHED', 'FAILED'}:
+                            return
+                    except Exception:
+                        db.session.rollback()
+                        logger.warning(
+                            'Instagram container poll failed for article %s; retrying',
+                            article_id,
+                            exc_info=True,
+                        )
+                    finally:
+                        db.session.remove()
+                time.sleep(delay)
+                delay = min(30, delay * 2)
+            with app.app_context():
+                post = PlatformPost.query.filter_by(
+                    article_id=article_id,
+                    platform='instagram',
+                ).first()
+                if post and post.status == 'PROCESSING_CONTAINER':
+                    post.status = 'FAILED'
+                    post.error = 'Instagram timed out while processing this video'
+                    post.updated_at = datetime.now(timezone.utc)
+                    db.session.commit()
+        finally:
+            with _instagram_poll_lock:
+                _instagram_polling_articles.discard(article_id)
+
+    Thread(
+        target=poll,
+        name=f'instagram-container-{article_id}',
+        daemon=True,
+    ).start()
+    return True
+
+
+_facebook_poll_lock = Lock()
+_facebook_polling_articles = set()
+
+
+def _start_facebook_reel_poller(article_id):
+    if app.config.get('TESTING'):
+        return False
+    with _facebook_poll_lock:
+        if article_id in _facebook_polling_articles:
+            return False
+        _facebook_polling_articles.add(article_id)
+
+    def poll():
+        deadline = time.monotonic() + max(
+            60,
+            int(os.getenv('FACEBOOK_REEL_TIMEOUT_SECONDS', '1200')),
+        )
+        delay = 5
+        try:
+            while time.monotonic() < deadline:
+                with app.app_context():
+                    post = PlatformPost.query.filter_by(
+                        article_id=article_id,
+                        platform='facebook',
+                    ).first()
+                    if not post or post.status != 'PROCESSING_UPLOAD':
+                        return
+                    try:
+                        access_token, account = _facebook_access_token()
+                        publisher = FacebookPublisher(
+                            access_token=access_token,
+                            page_id=account.external_user_id,
+                            graph_version=_facebook_config()['graph_version'],
+                        )
+                        result = publisher.check_status(post.external_id)
+                        _persist_publish_result(post, result)
+                        if result.status in {'PUBLISHED', 'FAILED'}:
+                            return
+                    except Exception:
+                        db.session.rollback()
+                        logger.warning(
+                            'Facebook Reel status poll failed for article %s; retrying',
+                            article_id,
+                            exc_info=True,
+                        )
+                    finally:
+                        db.session.remove()
+                time.sleep(delay)
+                delay = min(30, delay * 2)
+            with app.app_context():
+                post = PlatformPost.query.filter_by(
+                    article_id=article_id,
+                    platform='facebook',
+                ).first()
+                if post and post.status == 'PROCESSING_UPLOAD':
+                    post.status = 'FAILED'
+                    post.error = 'Facebook timed out while processing this Reel'
+                    post.updated_at = datetime.now(timezone.utc)
+                    db.session.commit()
+        finally:
+            with _facebook_poll_lock:
+                _facebook_polling_articles.discard(article_id)
+
+    Thread(
+        target=poll,
+        name=f'facebook-reel-{article_id}',
+        daemon=True,
+    ).start()
+    return True
 
 
 # ============================================================
@@ -519,7 +1977,14 @@ def run_summarize_in_background(app_context, article_id):
             db.session.commit()
 
 
-def run_video_in_background(app_context, article_id, image_source="ai", style_override=None, use_video_hook=None):
+def run_video_in_background(
+    app_context,
+    article_id,
+    image_source="ai",
+    style_override=None,
+    use_video_hook=None,
+    generation_token=None,
+):
     """Run video generation in a background thread, with a watchdog timeout.
 
     If generation exceeds VIDEO_TIMEOUT_SECONDS, a separate timer thread flips
@@ -534,13 +1999,18 @@ def run_video_in_background(app_context, article_id, image_source="ai", style_ov
         # Runs in a separate thread — needs its own app context.
         with app.app_context():
             article = db.session.get(Article, article_id)
-            if article and article.status == 'generating_video':
+            if (
+                article
+                and article.status == 'generating_video'
+                and article.video_generation_token == generation_token
+            ):
                 logger.error(
                     f"Video generation for article {article_id} timed out after "
                     f"{VIDEO_TIMEOUT_SECONDS}s. Marking failed. Worker thread may "
                     "still be running and will discard its output on completion."
                 )
                 article.status = 'failed'
+                article.video_generation_token = None
                 db.session.commit()
 
     timer = Timer(VIDEO_TIMEOUT_SECONDS, _watchdog_fire)
@@ -572,10 +2042,14 @@ def run_video_in_background(app_context, article_id, image_source="ai", style_ov
                 # were inside generate_video(). If so, drop the result so we
                 # don't revive a failed row.
                 db.session.refresh(article)
-                if article.status != 'generating_video':
+                if (
+                    article.status != 'generating_video'
+                    or article.video_generation_token != generation_token
+                ):
                     logger.warning(
-                        f"Video for article {article_id} completed after watchdog "
-                        f"already set status={article.status}; discarding {video_path}"
+                        f"Stale video worker for article {article_id} completed "
+                        f"after ownership changed (status={article.status}); "
+                        f"discarding {video_path}"
                     )
                     try:
                         os.remove(video_path)
@@ -590,6 +2064,7 @@ def run_video_in_background(app_context, article_id, image_source="ai", style_ov
                 relative_path = os.path.basename(video_path)
                 article.video_path = relative_path
                 article.status = 'video_done'
+                article.video_generation_token = None
                 article.video_generated_at = datetime.now(timezone.utc)
                 db.session.commit()
                 logger.info(f"Video generated for article {article_id}")
@@ -598,8 +2073,12 @@ def run_video_in_background(app_context, article_id, image_source="ai", style_ov
                 logger.error(f"Failed to generate video for article {article_id}: {e}", exc_info=True)
                 # Only overwrite status if watchdog hasn't already set it.
                 db.session.refresh(article)
-                if article.status == 'generating_video':
+                if (
+                    article.status == 'generating_video'
+                    and article.video_generation_token == generation_token
+                ):
                     article.status = 'failed'
+                    article.video_generation_token = None
                     db.session.commit()
     finally:
         timer.cancel()
@@ -656,6 +2135,38 @@ def serve_video(filename):
     if not safe_filename or safe_filename != filename:
         return jsonify({'error': 'Invalid filename'}), 400
     return send_from_directory('static/videos', safe_filename)
+
+
+@app.route('/public-media/<path:filename>')
+def serve_signed_public_video(filename):
+    """Serve one generated video through an expiring HMAC URL for Instagram."""
+    safe_filename = secure_filename(filename)
+    if not safe_filename or safe_filename != filename:
+        return jsonify({'error': 'Invalid media link'}), 400
+    try:
+        expires = int(request.args.get('expires', '0'))
+    except ValueError:
+        expires = 0
+    signature = request.args.get('sig', '')
+    if expires <= int(time.time()) or not signature:
+        return jsonify({'error': 'Media link expired'}), 403
+    signing_key = (
+        os.getenv('PUBLIC_MEDIA_SIGNING_KEY', '').strip()
+        or _oauth_encryption_secret()
+    )
+    if not signing_key:
+        logger.error('Rejected public media request because no signing key is configured')
+        return jsonify({'error': 'Public media delivery is unavailable'}), 503
+    expected = hmac.new(
+        signing_key.encode('utf-8'),
+        f'{filename}:{expires}'.encode('utf-8'),
+        hashlib.sha256,
+    ).hexdigest()
+    if not hmac.compare_digest(expected, signature):
+        return jsonify({'error': 'Invalid media link'}), 403
+    response = send_from_directory('static/videos', safe_filename)
+    response.headers['Cache-Control'] = 'private, max-age=300'
+    return response
 
 
 @app.route('/carousels/<int:article_id>/<path:filename>')
@@ -1143,7 +2654,14 @@ def scrape_url():
 @app.route('/api/articles', methods=['GET'])
 def list_articles():
     """List all scraped articles, newest first."""
-    articles = Article.query.order_by(Article.scraped_at.desc()).all()
+    articles = (
+        Article.query.options(
+            selectinload(Article.video_metrics),
+            selectinload(Article.platform_posts),
+        )
+        .order_by(Article.scraped_at.desc())
+        .all()
+    )
     return jsonify({
         'articles': [a.to_dict(include_full_content=False) for a in articles],
         'count': len(articles)
@@ -1250,12 +2768,36 @@ def generate_video_endpoint(article_id):
     else:
         use_video_hook = bool(raw_hook)
 
-    article.status = 'generating_video'
+    generation_token = secrets.token_hex(24)
+    current_status = article.status
+    claim = Article.query.filter(Article.id == article_id)
+    if current_status is None:
+        claim = claim.filter(Article.status.is_(None))
+    else:
+        claim = claim.filter(Article.status == current_status)
+    claimed = claim.update(
+        {
+            Article.status: 'generating_video',
+            Article.video_generation_token: generation_token,
+        },
+        synchronize_session=False,
+    )
     db.session.commit()
+    if claimed != 1:
+        return jsonify({'error': 'Article is already being processed'}), 409
+
+    article = db.session.get(Article, article_id)
 
     thread = Thread(
         target=run_video_in_background,
-        args=(app.app_context(), article.id, image_source, style_override, use_video_hook)
+        args=(
+            app.app_context(),
+            article.id,
+            image_source,
+            style_override,
+            use_video_hook,
+            generation_token,
+        )
     )
     thread.daemon = True
     thread.start()
@@ -1336,6 +2878,420 @@ def generate_substack_endpoint(article_id):
         return jsonify({'error': 'Failed to generate Substack post'}), 500
 
 
+@app.route('/api/publishers/status', methods=['GET'])
+def publishers_connection_status():
+    """Return safe connection/readiness metadata for every destination."""
+    return jsonify(_publisher_status_payload())
+
+
+@app.route('/api/instagram/status', methods=['GET'])
+def instagram_connection_status():
+    return jsonify(_publisher_status_payload()['platforms']['instagram'])
+
+
+@app.route('/api/youtube/status', methods=['GET'])
+def youtube_connection_status():
+    return jsonify(_publisher_status_payload()['platforms']['youtube'])
+
+
+@app.route('/api/facebook/status', methods=['GET'])
+def facebook_connection_status():
+    return jsonify(_publisher_status_payload()['platforms']['facebook'])
+
+
+@app.route('/api/instagram/oauth/start', methods=['GET'])
+def instagram_oauth_start():
+    missing = _instagram_missing_config()
+    if missing:
+        return jsonify({'error': 'Instagram publishing is not configured', 'missing_config': missing}), 503
+    config = _instagram_config()
+    state = secrets.token_urlsafe(32)
+    session['instagram_oauth_state'] = state
+    session['instagram_oauth_issued_at'] = int(datetime.now(timezone.utc).timestamp())
+    return redirect(
+        'https://www.facebook.com/'
+        f"{config['graph_version']}/dialog/oauth?"
+        + urlencode({
+            'client_id': config['app_id'],
+            'redirect_uri': config['redirect_uri'],
+            'state': state,
+            'response_type': 'code',
+            'scope': ','.join((
+                'instagram_basic',
+                'instagram_content_publish',
+                'pages_show_list',
+                'pages_read_engagement',
+            )),
+        })
+    )
+
+
+@app.route('/api/instagram/oauth/callback', methods=['GET'])
+def instagram_oauth_callback():
+    expected = session.pop('instagram_oauth_state', None)
+    issued_at = session.pop('instagram_oauth_issued_at', None)
+    returned = request.args.get('state', '')
+    now_ts = int(datetime.now(timezone.utc).timestamp())
+    if (
+        not expected
+        or not returned
+        or not secrets.compare_digest(expected, returned)
+        or not issued_at
+        or now_ts - int(issued_at) > 600
+    ):
+        logger.warning('Rejected Instagram OAuth callback with invalid or expired state')
+        return redirect('/?instagram=error&reason=invalid_state')
+    if request.args.get('error') or not request.args.get('code'):
+        return redirect('/?instagram=error&reason=authorization_denied')
+    try:
+        config = _instagram_config()
+        token_response = request_with_retries(
+            requests.get,
+            f"https://graph.facebook.com/{config['graph_version']}/oauth/access_token",
+            params={
+                'client_id': config['app_id'],
+                'client_secret': config['app_secret'],
+                'redirect_uri': config['redirect_uri'],
+                'code': request.args['code'],
+            },
+        )
+        token_payload = response_json(token_response, platform='Instagram')
+        short_token = token_payload.get('access_token')
+        long_response = request_with_retries(
+            requests.get,
+            f"https://graph.facebook.com/{config['graph_version']}/oauth/access_token",
+            params={
+                'grant_type': 'fb_exchange_token',
+                'client_id': config['app_id'],
+                'client_secret': config['app_secret'],
+                'fb_exchange_token': short_token,
+            },
+        )
+        long_payload = response_json(long_response, platform='Instagram')
+        access_token = long_payload.get('access_token') or short_token
+        pages_response = request_with_retries(
+            requests.get,
+            f"https://graph.facebook.com/{config['graph_version']}/me/accounts",
+            params={
+                'fields': 'id,name,instagram_business_account{id,username}',
+                'access_token': access_token,
+            },
+        )
+        pages = response_json(pages_response, platform='Instagram').get('data') or []
+        instagram_profile = next(
+            (
+                page.get('instagram_business_account')
+                for page in pages
+                if page.get('instagram_business_account')
+            ),
+            None,
+        )
+        if not instagram_profile or not instagram_profile.get('id'):
+            raise PublisherError(
+                'No Instagram Business or Creator account is linked to this Facebook Page',
+                code='instagram_account_missing',
+            )
+        _store_publisher_account(
+            'instagram',
+            access_token=access_token,
+            expires_in=long_payload.get('expires_in') or 5_184_000,
+            external_user_id=str(instagram_profile['id']),
+            username=instagram_profile.get('username'),
+            scope='instagram_basic instagram_content_publish',
+        )
+        return redirect('/?instagram=connected')
+    except Exception:
+        logger.error('Instagram OAuth callback failed', exc_info=True)
+        return redirect('/?instagram=error&reason=token_exchange_failed')
+
+
+@app.route('/api/instagram/disconnect', methods=['POST'])
+def instagram_disconnect():
+    account = _publisher_account('instagram')
+    if account is None:
+        return jsonify({'message': 'Instagram is already disconnected'})
+    try:
+        token = _oauth_cipher().decrypt(account.access_token_encrypted)
+        request_with_retries(
+            requests.delete,
+            f"https://graph.facebook.com/{_instagram_config()['graph_version']}/me/permissions",
+            params={'access_token': token},
+            retries=1,
+        )
+    except Exception:
+        logger.warning('Instagram token revocation failed; removing local token', exc_info=True)
+    db.session.delete(account)
+    db.session.commit()
+    return jsonify({'message': 'Instagram disconnected'})
+
+
+@app.route('/api/facebook/oauth/start', methods=['GET'])
+def facebook_oauth_start():
+    missing = _facebook_missing_config()
+    if missing:
+        return jsonify({
+            'error': 'Facebook publishing is not configured',
+            'missing_config': missing,
+        }), 503
+    config = _facebook_config()
+    state = secrets.token_urlsafe(32)
+    session['facebook_oauth_state'] = state
+    session['facebook_oauth_issued_at'] = int(
+        datetime.now(timezone.utc).timestamp()
+    )
+    return redirect(
+        'https://www.facebook.com/'
+        f"{config['graph_version']}/dialog/oauth?"
+        + urlencode({
+            'client_id': config['app_id'],
+            'redirect_uri': config['redirect_uri'],
+            'state': state,
+            'response_type': 'code',
+            'scope': ','.join((
+                'pages_show_list',
+                'pages_manage_posts',
+                'pages_read_engagement',
+            )),
+        })
+    )
+
+
+@app.route('/api/facebook/oauth/callback', methods=['GET'])
+def facebook_oauth_callback():
+    expected = session.pop('facebook_oauth_state', None)
+    issued_at = session.pop('facebook_oauth_issued_at', None)
+    returned = request.args.get('state', '')
+    now_ts = int(datetime.now(timezone.utc).timestamp())
+    if (
+        not expected
+        or not returned
+        or not secrets.compare_digest(expected, returned)
+        or not issued_at
+        or now_ts - int(issued_at) > 600
+    ):
+        logger.warning('Rejected Facebook OAuth callback with invalid or expired state')
+        return redirect('/?facebook=error&reason=invalid_state')
+    if request.args.get('error') or not request.args.get('code'):
+        return redirect('/?facebook=error&reason=authorization_denied')
+    try:
+        config = _facebook_config()
+        token_response = request_with_retries(
+            requests.get,
+            f"https://graph.facebook.com/{config['graph_version']}/oauth/access_token",
+            params={
+                'client_id': config['app_id'],
+                'client_secret': config['app_secret'],
+                'redirect_uri': config['redirect_uri'],
+                'code': request.args['code'],
+            },
+        )
+        token_payload = response_json(token_response, platform='Facebook')
+        short_token = token_payload.get('access_token')
+        long_response = request_with_retries(
+            requests.get,
+            f"https://graph.facebook.com/{config['graph_version']}/oauth/access_token",
+            params={
+                'grant_type': 'fb_exchange_token',
+                'client_id': config['app_id'],
+                'client_secret': config['app_secret'],
+                'fb_exchange_token': short_token,
+            },
+        )
+        long_payload = response_json(long_response, platform='Facebook')
+        user_token = long_payload.get('access_token') or short_token
+        pages_response = request_with_retries(
+            requests.get,
+            f"https://graph.facebook.com/{config['graph_version']}/me/accounts",
+            params={
+                'fields': 'id,name,access_token',
+                'access_token': user_token,
+            },
+        )
+        pages = response_json(pages_response, platform='Facebook').get('data') or []
+        page = next(
+            (
+                value
+                for value in pages
+                if value.get('id') and value.get('access_token')
+            ),
+            None,
+        )
+        if not page:
+            raise PublisherError(
+                'No manageable Facebook Page is available for Reel publishing',
+                code='facebook_page_missing',
+            )
+        _store_publisher_account(
+            'facebook',
+            access_token=page['access_token'],
+            expires_in=long_payload.get('expires_in'),
+            external_user_id=str(page['id']),
+            username=page.get('name'),
+            scope='pages_show_list pages_manage_posts pages_read_engagement',
+        )
+        return redirect('/?facebook=connected')
+    except Exception:
+        logger.error('Facebook OAuth callback failed', exc_info=True)
+        return redirect('/?facebook=error&reason=token_exchange_failed')
+
+
+@app.route('/api/facebook/disconnect', methods=['POST'])
+def facebook_disconnect():
+    account = _publisher_account('facebook')
+    if account is None:
+        return jsonify({'message': 'Facebook is already disconnected'})
+    try:
+        token = _oauth_cipher().decrypt(account.access_token_encrypted)
+        request_with_retries(
+            requests.delete,
+            f"https://graph.facebook.com/{_facebook_config()['graph_version']}/me/permissions",
+            params={'access_token': token},
+            retries=1,
+        )
+    except Exception:
+        logger.warning(
+            'Facebook token revocation failed; removing local token',
+            exc_info=True,
+        )
+    db.session.delete(account)
+    db.session.commit()
+    return jsonify({'message': 'Facebook disconnected'})
+
+
+@app.route('/api/youtube/oauth/start', methods=['GET'])
+def youtube_oauth_start():
+    missing = _youtube_missing_config()
+    if missing:
+        return jsonify({'error': 'YouTube publishing is not configured', 'missing_config': missing}), 503
+    config = _youtube_config()
+    state = secrets.token_urlsafe(32)
+    session['youtube_oauth_state'] = state
+    session['youtube_oauth_issued_at'] = int(datetime.now(timezone.utc).timestamp())
+    return redirect(
+        'https://accounts.google.com/o/oauth2/v2/auth?'
+        + urlencode({
+            'client_id': config['client_id'],
+            'redirect_uri': config['redirect_uri'],
+            'response_type': 'code',
+            'scope': 'https://www.googleapis.com/auth/youtube.upload',
+            'access_type': 'offline',
+            'include_granted_scopes': 'true',
+            'prompt': 'consent',
+            'state': state,
+        })
+    )
+
+
+@app.route('/api/youtube/oauth/callback', methods=['GET'])
+def youtube_oauth_callback():
+    expected = session.pop('youtube_oauth_state', None)
+    issued_at = session.pop('youtube_oauth_issued_at', None)
+    returned = request.args.get('state', '')
+    now_ts = int(datetime.now(timezone.utc).timestamp())
+    if (
+        not expected
+        or not returned
+        or not secrets.compare_digest(expected, returned)
+        or not issued_at
+        or now_ts - int(issued_at) > 600
+    ):
+        logger.warning('Rejected YouTube OAuth callback with invalid or expired state')
+        return redirect('/?youtube=error&reason=invalid_state')
+    if request.args.get('error') or not request.args.get('code'):
+        return redirect('/?youtube=error&reason=authorization_denied')
+    try:
+        config = _youtube_config()
+        token_response = request_with_retries(
+            requests.post,
+            'https://oauth2.googleapis.com/token',
+            data={
+                'client_id': config['client_id'],
+                'client_secret': config['client_secret'],
+                'code': request.args['code'],
+                'redirect_uri': config['redirect_uri'],
+                'grant_type': 'authorization_code',
+            },
+        )
+        token_payload = response_json(token_response, platform='YouTube')
+        access_token = token_payload.get('access_token')
+        channel_response = request_with_retries(
+            requests.get,
+            'https://www.googleapis.com/youtube/v3/channels',
+            params={'part': 'snippet', 'mine': 'true'},
+            headers={'Authorization': f'Bearer {access_token}'},
+        )
+        items = response_json(channel_response, platform='YouTube').get('items') or []
+        channel = items[0] if items else {}
+        _store_publisher_account(
+            'youtube',
+            access_token=access_token,
+            refresh_token=token_payload.get('refresh_token'),
+            expires_in=token_payload.get('expires_in') or 3_600,
+            external_user_id=channel.get('id'),
+            username=(channel.get('snippet') or {}).get('title'),
+            scope=token_payload.get('scope') or 'https://www.googleapis.com/auth/youtube.upload',
+        )
+        return redirect('/?youtube=connected')
+    except Exception:
+        logger.error('YouTube OAuth callback failed', exc_info=True)
+        return redirect('/?youtube=error&reason=token_exchange_failed')
+
+
+@app.route('/api/youtube/disconnect', methods=['POST'])
+def youtube_disconnect():
+    account = _publisher_account('youtube')
+    if account is None:
+        return jsonify({'message': 'YouTube is already disconnected'})
+    try:
+        token = _oauth_cipher().decrypt(account.access_token_encrypted)
+        request_with_retries(
+            requests.post,
+            'https://oauth2.googleapis.com/revoke',
+            params={'token': token},
+            retries=1,
+        )
+    except Exception:
+        logger.warning('YouTube token revocation failed; removing local token', exc_info=True)
+    db.session.delete(account)
+    db.session.commit()
+    return jsonify({'message': 'YouTube disconnected'})
+
+
+@app.route('/api/articles/<int:article_id>/publish', methods=['POST'])
+def publish_article_multi_platform(article_id):
+    payload = request.get_json(silent=True) or {}
+    if not isinstance(payload, dict):
+        return jsonify({'error': 'Publish request must be an object'}), 400
+    try:
+        result = publish_article_everywhere(article_id, payload)
+    except TikTokPublishRequestError as error:
+        return jsonify({'error': str(error)}), error.status_code
+    # Accepted uploads may still be processing remotely. Partial or complete
+    # failures use HTTP 207 while retaining every platform's durable outcome.
+    return jsonify(result), 202 if result['all_accepted'] else 207
+
+
+@app.route('/api/articles/<int:article_id>/publish/cancel', methods=['POST'])
+def cancel_article_publish(article_id):
+    """Reclaim a retired local approval state without touching remote posts."""
+    article = db.session.get(Article, article_id)
+    if not article:
+        return jsonify({'error': 'Article not found'}), 404
+    try:
+        cancelled_platforms = _cancel_reclaimable_publish_state(article)
+    except TikTokPublishRequestError as error:
+        return jsonify({'error': str(error)}), error.status_code
+    db.session.refresh(article)
+    return jsonify({
+        'message': (
+            'Pending approval cancelled. You can choose Post and publish '
+            'manually now.'
+        ),
+        'cancelled_platforms': cancelled_platforms,
+        'article': article.to_dict(),
+    })
+
+
 @app.route('/api/tiktok/status', methods=['GET'])
 def tiktok_connection_status():
     """Return safe connection metadata; OAuth tokens are never serialized."""
@@ -1349,6 +3305,33 @@ def tiktok_connection_status():
     }
     if account:
         payload.update(account.to_public_dict())
+        granted_scopes = _tiktok_granted_scopes(account)
+        missing_posting_scopes = [
+            scope for scope in TIKTOK_POSTING_SCOPES if scope not in granted_scopes
+        ]
+        missing_metrics_scopes = [
+            scope for scope in TIKTOK_METRICS_SCOPES if scope not in granted_scopes
+        ]
+        request_metrics_scopes = _env_flag('TIKTOK_REQUEST_METRICS_SCOPES', False)
+        missing_requested_scopes = missing_posting_scopes + (
+            missing_metrics_scopes if request_metrics_scopes else []
+        )
+        if missing_posting_scopes:
+            reconsent_reason = 'posting'
+        elif request_metrics_scopes and missing_metrics_scopes:
+            reconsent_reason = 'metrics'
+        else:
+            reconsent_reason = None
+        payload.update({
+            'missing_scopes': missing_requested_scopes,
+            'missing_posting_scopes': missing_posting_scopes,
+            'missing_metrics_scopes': missing_metrics_scopes,
+            'needs_reconsent': bool(missing_requested_scopes),
+            'reconsent_reason': reconsent_reason,
+            'posting_authorized': not missing_posting_scopes,
+            'metrics_authorized': not missing_metrics_scopes,
+            'metrics_scope_request_enabled': request_metrics_scopes,
+        })
     return jsonify(payload)
 
 
@@ -1366,7 +3349,7 @@ def tiktok_oauth_start():
     authorize_query = urlencode({
         'client_key': config['client_key'],
         'response_type': 'code',
-        'scope': ','.join(TIKTOK_SCOPES),
+        'scope': ','.join(_tiktok_requested_scopes()),
         'redirect_uri': config['redirect_uri'],
         'state': state,
     })
@@ -1458,112 +3441,23 @@ def tiktok_creator_info():
         })
     except TikTokAPIError as error:
         return _tiktok_error_response(error)
-    except ValueError as error:
-        return jsonify({'error': str(error)}), 500
+    except ValueError:
+        logger.error('TikTok credentials could not be read', exc_info=True)
+        return jsonify({'error': 'TikTok connection could not be loaded'}), 500
 
 
 @app.route('/api/articles/<int:article_id>/tiktok/publish', methods=['POST'])
 def tiktok_publish_article(article_id):
     """Upload a generated video through TikTok's Direct Post API."""
-    article = db.session.get(Article, article_id)
-    if not article:
-        return jsonify({'error': 'Article not found'}), 404
-
     payload = request.get_json(silent=True) or {}
-    if payload.get('consent') is not True:
-        return jsonify({'error': 'TikTok music usage consent is required'}), 400
-
     try:
-        video_path = _video_file_for_article(article)
-    except ValueError as error:
-        return jsonify({'error': str(error)}), 400
-
-    if article.tiktok_publish_status in TIKTOK_PENDING_STATUSES:
-        return jsonify({'error': 'This video already has a TikTok post in progress'}), 409
-
-    title = str(payload.get('title') or '').strip()
-    if not title:
-        return jsonify({'error': 'Enter a TikTok caption'}), 400
-    if len(title) > 2_200:
-        return jsonify({'error': 'TikTok caption must be 2,200 characters or fewer'}), 400
-
-    privacy_level = str(payload.get('privacy_level') or '').strip()
-    if not privacy_level:
-        return jsonify({'error': 'Select a TikTok privacy setting'}), 400
-
-    allow_public = os.getenv('TIKTOK_ALLOW_PUBLIC_POSTS', 'false').lower() == 'true'
-    if not allow_public and privacy_level != 'SELF_ONLY':
-        return jsonify({
-            'error': 'This unaudited integration is locked to Only you (SELF_ONLY) posts'
-        }), 400
-
-    brand_content = payload.get('brand_content_toggle') is True
-    brand_organic = payload.get('brand_organic_toggle') is True
-    if brand_content and privacy_level == 'SELF_ONLY':
-        return jsonify({
-            'error': 'TikTok does not allow branded content posts with Only you privacy'
-        }), 400
-
-    article.tiktok_publish_status = 'INITIALIZING'
-    article.tiktok_publish_error = None
-    db.session.commit()
-
-    try:
-        access_token, _, creator = _refresh_creator_info()
-        privacy_options = creator.get('privacy_level_options') or []
-        if privacy_level not in privacy_options:
-            raise ValueError('That privacy setting is not available for this TikTok account')
-
-        duration = _video_duration_seconds(video_path)
-        max_duration = int(creator.get('max_video_post_duration_sec') or 0)
-        if max_duration and duration > max_duration:
-            raise ValueError(
-                f'This video is {duration:.1f}s; the connected account allows up to {max_duration}s'
-            )
-
-        allow_comment = payload.get('allow_comment') is True and not creator.get('comment_disabled', False)
-        allow_duet = payload.get('allow_duet') is True and not creator.get('duet_disabled', False)
-        allow_stitch = payload.get('allow_stitch') is True and not creator.get('stitch_disabled', False)
-
-        upload_plan = make_upload_plan(os.path.getsize(video_path))
-        initialized = initialize_video_post(
-            access_token=access_token,
-            title=title,
-            privacy_level=privacy_level,
-            disable_comment=not allow_comment,
-            disable_duet=not allow_duet,
-            disable_stitch=not allow_stitch,
-            brand_content_toggle=brand_content,
-            brand_organic_toggle=brand_organic,
-            upload_plan=upload_plan,
-        )
-
-        article.tiktok_publish_id = initialized['publish_id']
-        article.tiktok_publish_status = 'UPLOADING'
-        db.session.commit()
-
-        upload_video_file(initialized['upload_url'], video_path, upload_plan)
-        article.tiktok_publish_status = 'PROCESSING_UPLOAD'
-        db.session.commit()
-
-        return jsonify({
-            'message': 'Video uploaded to TikTok for processing',
-            'article': article.to_dict(),
-            'publish_id': article.tiktok_publish_id,
-        }), 202
-    except (TikTokAPIError, ValueError) as error:
-        logger.error('TikTok publish failed for article %s: %s', article_id, error)
-        article.tiktok_publish_status = 'FAILED'
-        article.tiktok_publish_error = str(error)
-        db.session.commit()
-        if isinstance(error, TikTokAPIError):
-            return _tiktok_error_response(error)
-        return jsonify({'error': str(error)}), 400
-    except Exception as error:
-        logger.error('Unexpected TikTok publish failure for article %s: %s', article_id, error, exc_info=True)
-        article.tiktok_publish_status = 'FAILED'
-        article.tiktok_publish_error = 'Unexpected upload failure'
-        db.session.commit()
+        result = publish_article_to_tiktok(article_id, payload)
+        return jsonify(result), 202
+    except TikTokPublishRequestError as error:
+        return jsonify({'error': str(error)}), error.status_code
+    except TikTokAPIError as error:
+        return _tiktok_error_response(error)
+    except Exception:
         return jsonify({'error': 'Unexpected TikTok upload failure'}), 500
 
 
@@ -1577,17 +3471,13 @@ def tiktok_article_publish_status(article_id):
         return jsonify({'error': 'This article has not been sent to TikTok'}), 400
 
     try:
-        access_token, _ = _tiktok_access_token()
-        status_data = fetch_publish_status(access_token, article.tiktok_publish_id)
-        status = status_data.get('status') or article.tiktok_publish_status or 'UNKNOWN'
-        article.tiktok_publish_status = status
-        article.tiktok_publish_error = status_data.get('fail_reason') or None
-        if status == 'PUBLISH_COMPLETE' and not article.tiktok_published_at:
-            article.tiktok_published_at = datetime.now(timezone.utc)
-        db.session.commit()
+        status_data = refresh_tiktok_publish_status(article)
         return jsonify({'article': article.to_dict(), 'tiktok': status_data})
     except TikTokAPIError as error:
-        article.tiktok_publish_error = str(error)
+        article.tiktok_publish_error = _safe_tiktok_error_message(
+            error,
+            'TikTok status could not be refreshed',
+        )
         db.session.commit()
         return _tiktok_error_response(error)
 
@@ -1596,6 +3486,18 @@ def tiktok_article_publish_status(article_id):
 def list_styles_endpoint():
     """Return available visual style presets for UI consumption."""
     return jsonify({'styles': list_styles()})
+
+
+@app.route('/api/generation-budget', methods=['GET'])
+def generation_budget_endpoint():
+    """Return cached provider balances and safe generation cost estimates."""
+    response = jsonify(
+        get_generation_budget(force=request.args.get('refresh') == '1')
+    )
+    # The server already maintains the 60-second cache. Do not let browsers or
+    # shared proxies persist financial account metadata beyond the request.
+    response.headers['Cache-Control'] = 'no-store'
+    return response
 
 
 @app.route('/api/health', methods=['GET'])
@@ -1611,6 +3513,11 @@ def health_check():
 # Run Server
 # ============================================================
 
+# WSGI servers import this module rather than executing it as __main__. Every
+# worker attempts startup, while discovery_web's file lock elects one owner.
+if __name__ != '__main__':
+    ensure_discovery_scheduler(app)
+
 if __name__ == '__main__':
     print("\n" + "=" * 60)
     print("  Clipper - Article to TikTok Video Generator")
@@ -1619,4 +3526,8 @@ if __name__ == '__main__':
     print("  API Base:  http://localhost:5050/api")
     print("\n" + "=" * 60 + "\n")
 
+    # Flask's debug reloader executes this file twice. Only the serving child
+    # should own the daily discovery scheduler.
+    if os.environ.get('WERKZEUG_RUN_MAIN') == 'true':
+        ensure_discovery_scheduler(app)
     app.run(host='0.0.0.0', port=5050, debug=True)

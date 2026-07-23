@@ -14,7 +14,54 @@ let searchQuery = '';
 let initialLoadDone = false;
 let availableStyles = [];       // loaded from /api/styles
 let selectedStyleByArticle = {}; // { [articleId]: 'manga' } — user override
-let tiktokConnection = { configured: false, connected: false };
+let platformConnections = {
+    tiktok: { configured: false, connected: false },
+    instagram: { configured: false, connected: false },
+    youtube: { configured: false, connected: false },
+    facebook: { configured: false, connected: false }
+};
+let generationBudget = null;
+let generationBudgetRequestInFlight = false;
+let generationBudgetLastLoadedAt = 0;
+let discoveryState = {
+    status: 'idle',
+    running: false,
+    candidates: [],
+    count: 0,
+    error: null
+};
+let discoveryRenderSignature = '';
+let discoveryRequestInFlight = false;
+let discoveryPollTimer = null;
+let discoveryPollDelayMs = 5000;
+const DISCOVERY_POLL_MIN_MS = 5000;
+const DISCOVERY_POLL_MAX_MS = 30000;
+const GENERATION_BUDGET_REFRESH_MS = 120000;
+
+function motionEnhancementsAllowed() {
+    const reduced = window.matchMedia && window.matchMedia('(prefers-reduced-motion: reduce)').matches;
+    return Boolean(window.anime) && !document.hidden && !reduced;
+}
+
+function discoveryIsBusy(state = discoveryState) {
+    return Boolean(state.running) || (state.candidates || []).some(
+        candidate => ['queued', 'processing'].includes(candidate.pipeline_status)
+    );
+}
+
+function discoverySignature(state) {
+    return JSON.stringify({
+        status: state.status,
+        running: Boolean(state.running),
+        error: state.error || null,
+        runVersion: state.run_version || 0,
+        candidates: state.candidates || []
+    });
+}
+
+function setTextIfChanged(element, value) {
+    if (element.textContent !== value) element.textContent = value;
+}
 
 // ============================================
 // API Functions
@@ -25,7 +72,13 @@ async function fetchArticles() {
         const response = await fetch(`${API_BASE}/api/articles`);
         const data = await response.json();
         const prevArticles = articles;
+        const isFirstLoad = !initialLoadDone;
         articles = data.articles;
+        const generationJustFinished = prevArticles.some(previous => {
+            if (!['generating_video', 'generating_carousel'].includes(previous.status)) return false;
+            const current = articles.find(article => article.id === previous.id);
+            return current && !['generating_video', 'generating_carousel'].includes(current.status);
+        });
 
         // Hide loading skeleton after first load
         if (!initialLoadDone) {
@@ -34,12 +87,13 @@ async function fetchArticles() {
         }
 
         // Smart render: only full re-render when data actually changed
-        if (articlesChanged(prevArticles, articles)) {
+        if (isFirstLoad || articlesChanged(prevArticles, articles)) {
             renderArticles();
         }
 
         updateStats();
         updateProgressBanner();
+        if (generationJustFinished) loadGenerationBudget(true);
     } catch (error) {
         console.error('Error fetching articles:', error);
         if (!initialLoadDone) {
@@ -48,6 +102,188 @@ async function fetchArticles() {
         }
         showToast('Failed to load articles', 'error');
     }
+}
+
+function formatBudgetUsd(value) {
+    if (value === null || value === undefined || value === '') return null;
+    const amount = Number(value);
+    if (!Number.isFinite(amount)) return null;
+    const digits = amount >= 100 ? 0 : amount >= 10 ? 1 : 2;
+    return `$${amount.toFixed(digits)}`;
+}
+
+function generationBudgetProviderMeta(providerId, provider) {
+    const links = {
+        fal: ['FAL', 'https://fal.ai/dashboard/billing'],
+        openrouter: ['OpenRouter', 'https://openrouter.ai/credits'],
+        groq: ['Groq', 'https://console.groq.com/dashboard/usage'],
+        gemini: ['Gemini', 'https://aistudio.google.com/app/billing']
+    };
+    const [name, fallbackUrl] = links[providerId] || [providerId, '#'];
+    const url = provider && provider.dashboard_url ? provider.dashboard_url : fallbackUrl;
+    const balance = formatBudgetUsd(provider && provider.balance_usd);
+    let value = 'Not configured';
+    let detail = 'No API key found';
+    let tone = 'muted';
+
+    if (provider && provider.available && balance) {
+        value = `${balance} left`;
+        detail = providerId === 'openrouter' && provider.key_usage_usd !== null && provider.key_usage_usd !== undefined && Number.isFinite(Number(provider.key_usage_usd))
+            ? `${formatBudgetUsd(provider.key_usage_usd)} used by this key`
+            : 'Live provider balance';
+        tone = provider.severity === 'critical'
+            ? 'critical'
+            : provider.severity === 'low'
+                ? 'warning'
+                : 'ready';
+    } else if (provider && provider.configured) {
+        const openRouterUsage = providerId === 'openrouter'
+            ? formatBudgetUsd(provider.key_usage_usd)
+            : null;
+        value = openRouterUsage
+            ? `${openRouterUsage} used`
+            : providerId === 'groq' || providerId === 'gemini'
+                ? 'Configured'
+                : 'Balance unavailable';
+        detail = providerId === 'fal'
+            ? 'Live balance lookup is temporarily unavailable'
+            : providerId === 'openrouter'
+                ? provider.key_limit_remaining_usd !== null && provider.key_limit_remaining_usd !== undefined
+                    ? `${formatBudgetUsd(provider.key_limit_remaining_usd)} left on this API key`
+                    : 'Live balance lookup is temporarily unavailable'
+                : 'Usage is available in the provider dashboard';
+        tone = 'muted';
+    }
+
+    return { name, url, value, detail, tone };
+}
+
+function renderGenerationBudget() {
+    const label = document.getElementById('generation-budget-label');
+    const dot = document.getElementById('generation-budget-dot');
+    const summary = document.getElementById('generation-budget-summary');
+    const providersContainer = document.getElementById('generation-budget-providers');
+    const estimate = document.getElementById('generation-budget-estimate');
+    const updated = document.getElementById('generation-budget-updated');
+    if (!label || !dot || !summary || !providersContainer || !estimate || !updated) return;
+
+    if (!generationBudget) {
+        label.textContent = 'API budget';
+        dot.dataset.tone = 'loading';
+        return;
+    }
+
+    const providers = generationBudget.providers || {};
+    const fal = providers.fal || {};
+    const openrouter = providers.openrouter || {};
+    const falBalance = formatBudgetUsd(fal.balance_usd);
+    const openRouterBalance = formatBudgetUsd(openrouter.balance_usd);
+    label.textContent = falBalance && openRouterBalance
+        ? `FAL ${falBalance} · OR ${openRouterBalance}`
+        : falBalance
+            ? `FAL ${falBalance}`
+            : openRouterBalance
+                ? `OR ${openRouterBalance}`
+                : 'API budget';
+
+    const status = generationBudget.status || 'unavailable';
+    const severity = generationBudget.severity || 'unavailable';
+    dot.dataset.tone = severity === 'critical'
+        ? 'critical'
+        : severity === 'low'
+            ? 'warning'
+            : severity === 'ready'
+                ? 'ready'
+                : 'muted';
+    summary.className = `generation-budget-summary ${severity}`;
+    summary.textContent = severity === 'critical'
+        ? 'Critical: top up before the next batch'
+        : severity === 'low'
+            ? 'Low balance: keep an eye on the next generation'
+            : status === 'ready'
+                ? 'Ready to generate'
+                : status === 'limited'
+                    ? 'Balance may be too low for a full generation'
+                    : 'Generation is configured; live balances are unavailable';
+
+    providersContainer.innerHTML = ['fal', 'openrouter', 'groq', 'gemini'].map(providerId => {
+        const meta = generationBudgetProviderMeta(providerId, providers[providerId] || {});
+        return `
+            <a class="generation-budget-provider" href="${meta.url}" target="_blank" rel="noopener noreferrer">
+                <span class="generation-budget-provider-dot ${meta.tone}"></span>
+                <span class="generation-budget-provider-copy">
+                    <strong>${meta.name}</strong>
+                    <small>${escapeHtml(meta.detail)}</small>
+                </span>
+                <span class="generation-budget-provider-value">${escapeHtml(meta.value)}</span>
+            </a>
+        `;
+    }).join('');
+
+    const estimates = generationBudget.estimates || {};
+    const standard = formatBudgetUsd(estimates.standard_video_usd);
+    const motion = formatBudgetUsd(estimates.max_motion_video_usd);
+    let videosLeft = '';
+    if (generationBudget.limiting_balance_usd !== null && generationBudget.limiting_balance_usd !== undefined && Number.isFinite(Number(generationBudget.limiting_balance_usd)) && Number(estimates.standard_video_usd) > 0) {
+        const count = Math.floor(Number(generationBudget.limiting_balance_usd) / Number(estimates.standard_video_usd));
+        videosLeft = ` · roughly ${count} standard video${count === 1 ? '' : 's'} left`;
+    }
+    estimate.textContent = standard && motion
+        ? `Estimated next video: ${standard} standard, up to ${motion} with motion${videosLeft}.`
+        : 'Generation cost estimates are temporarily unavailable.';
+
+    const fetched = generationBudget.fetched_at ? new Date(generationBudget.fetched_at) : null;
+    updated.textContent = fetched && !Number.isNaN(fetched.getTime())
+        ? `Updated ${fetched.toLocaleTimeString([], { hour: '2-digit', minute: '2-digit' })}${generationBudget.cached ? ' · cached' : ''}`
+        : 'Balance status unavailable';
+}
+
+async function loadGenerationBudget(force = false) {
+    if (generationBudgetRequestInFlight) return;
+    generationBudgetRequestInFlight = true;
+    try {
+        const suffix = force ? '?refresh=1' : '';
+        const response = await fetch(`${API_BASE}/api/generation-budget${suffix}`);
+        if (!response.ok) throw new Error('Budget endpoint unavailable');
+        generationBudget = await response.json();
+        generationBudgetLastLoadedAt = Date.now();
+        renderGenerationBudget();
+    } catch (error) {
+        console.warn('Failed to load generation budget', error);
+        if (!generationBudget) renderGenerationBudget();
+        const updated = document.getElementById('generation-budget-updated');
+        if (updated) updated.textContent = 'Could not refresh balances';
+    } finally {
+        generationBudgetRequestInFlight = false;
+    }
+}
+
+function toggleGenerationBudget(event) {
+    if (event) event.stopPropagation();
+    const trigger = document.getElementById('generation-budget-trigger');
+    const panel = document.getElementById('generation-budget-panel');
+    if (!trigger || !panel) return;
+    const willOpen = panel.classList.contains('hidden');
+    panel.classList.toggle('hidden', !willOpen);
+    trigger.setAttribute('aria-expanded', willOpen ? 'true' : 'false');
+    if (willOpen && Date.now() - generationBudgetLastLoadedAt > GENERATION_BUDGET_REFRESH_MS) {
+        loadGenerationBudget(true);
+    }
+}
+
+function closeGenerationBudget() {
+    const trigger = document.getElementById('generation-budget-trigger');
+    const panel = document.getElementById('generation-budget-panel');
+    if (!trigger || !panel) return;
+    panel.classList.add('hidden');
+    trigger.setAttribute('aria-expanded', 'false');
+}
+
+function refreshGenerationBudget(event) {
+    if (event) event.stopPropagation();
+    const updated = document.getElementById('generation-budget-updated');
+    if (updated) updated.textContent = 'Refreshing balances\u2026';
+    loadGenerationBudget(true);
 }
 
 function articlesChanged(prev, next) {
@@ -59,6 +295,7 @@ function articlesChanged(prev, next) {
             prev[i].carousel_dir !== next[i].carousel_dir ||
             prev[i].tiktok_publish_status !== next[i].tiktok_publish_status ||
             prev[i].tiktok_publish_error !== next[i].tiktok_publish_error ||
+            JSON.stringify(prev[i].platform_posts || []) !== JSON.stringify(next[i].platform_posts || []) ||
             prev[i].tldr !== next[i].tldr) {
             return true;
         }
@@ -66,62 +303,378 @@ function articlesChanged(prev, next) {
     return false;
 }
 
-async function loadTikTokStatus() {
+async function loadPublisherStatus() {
     try {
-        const response = await fetch(`${API_BASE}/api/tiktok/status`);
-        tiktokConnection = await response.json();
-        renderTikTokConnection();
+        const response = await fetch(`${API_BASE}/api/publishers/status`);
+        const data = await response.json();
+        if (!response.ok) throw new Error(data.error || 'Could not load publishing connections');
+        platformConnections = {
+            ...platformConnections,
+            ...(data.platforms || {})
+        };
+        renderPublisherConnections();
     } catch (error) {
-        console.warn('Failed to load TikTok connection status', error);
+        console.warn('Failed to load publishing connection status', error);
+        // Keep TikTok connection visibility working during a rolling deploy
+        // where the legacy route may appear before the unified endpoint.
+        try {
+            const response = await fetch(`${API_BASE}/api/tiktok/status`);
+            if (response.ok) {
+                platformConnections.tiktok = await response.json();
+                renderPublisherConnections();
+            }
+        } catch (legacyError) {
+            console.warn('Failed to load TikTok connection status', legacyError);
+        }
     }
 }
 
-function renderTikTokConnection() {
-    const container = document.getElementById('tiktok-connection');
-    const label = document.getElementById('tiktok-connection-label');
-    const button = document.getElementById('tiktok-connect-btn');
+function loadTikTokStatus() {
+    return loadPublisherStatus();
+}
+
+function platformAccountLabel(platform, connection) {
+    if (platform === 'tiktok') {
+        return connection.creator_nickname || connection.creator_username || 'Connected';
+    }
+    if (platform === 'instagram') {
+        return connection.username || connection.account_name || connection.page_name || 'Connected';
+    }
+    if (platform === 'facebook') {
+        return connection.page_name || connection.username || connection.account_name || 'Connected Page';
+    }
+    return connection.channel_title || connection.channel_name || connection.username ||
+        connection.email || 'Connected';
+}
+
+function platformNeedsReconnect(connection) {
+    return Boolean(
+        connection.needs_reconsent ||
+        connection.needs_reconnect ||
+        connection.reconnect_required ||
+        connection.expired
+    );
+}
+
+function platformExpiryMessage(connection) {
+    if (!connection) return '';
+    if (connection.expired) return 'Token expired';
+    if (!connection.expiry_warning && !connection.token_expiry_warning) return '';
+    const days = Number(connection.days_until_expiry);
+    return Number.isFinite(days)
+        ? `Token expires in ${days} day${days === 1 ? '' : 's'}`
+        : 'Token expires soon';
+}
+
+function renderPlatformConnection(platform) {
+    const connection = platformConnections[platform] || { configured: false, connected: false };
+    const container = document.getElementById(`platform-connection-${platform}`);
+    const label = document.getElementById(`platform-connection-${platform}-label`);
+    const button = document.getElementById(`platform-connection-${platform}-btn`);
     if (!container || !label || !button) return;
 
-    container.classList.toggle('connected', Boolean(tiktokConnection.connected));
-    if (tiktokConnection.connected) {
-        const accountName = tiktokConnection.creator_nickname || tiktokConnection.creator_username || 'Connected';
-        label.textContent = accountName;
-        button.textContent = 'Disconnect';
+    const reconnect = platformNeedsReconnect(connection);
+    const expiryWarning = platformExpiryMessage(connection);
+    container.classList.toggle('connected', Boolean(connection.connected) && !reconnect);
+    container.classList.toggle('warning', Boolean(expiryWarning) || reconnect);
+
+    if (connection.connected) {
+        const accountName = platformAccountLabel(platform, connection);
+        label.textContent = reconnect
+            ? 'Reconnect required'
+            : expiryWarning
+                ? 'Token expires soon'
+                : accountName;
+        button.textContent = reconnect ? 'Reconnect' : 'Disconnect';
         button.disabled = false;
-        button.onclick = disconnectTikTok;
-    } else if (!tiktokConnection.configured) {
-        label.textContent = 'TikTok setup needed';
+        button.title = reconnect
+            ? connection.reconnect_reason || `Reconnect ${platform} to continue publishing`
+            : expiryWarning || `Disconnect ${platform}`;
+        button.onclick = reconnect
+            ? () => connectPlatform(platform)
+            : () => disconnectPlatform(platform);
+        container.title = expiryWarning || accountName;
+    } else if (!connection.configured) {
+        label.textContent = 'Setup needed';
         button.textContent = 'Connect';
-        button.disabled = true;
-        button.title = `Missing: ${(tiktokConnection.missing_config || []).join(', ')}`;
-        button.onclick = connectTikTok;
+        button.disabled = false;
+        button.title = connection.reason || connection.setup_reason ||
+            `Missing: ${(connection.missing_config || []).join(', ')}`;
+        button.onclick = () => connectPlatform(platform);
     } else {
-        label.textContent = 'TikTok not connected';
+        label.textContent = 'Not connected';
         button.textContent = 'Connect';
         button.disabled = false;
-        button.onclick = connectTikTok;
+        button.title = `Connect ${platform}`;
+        button.onclick = () => connectPlatform(platform);
     }
 }
 
-function connectTikTok() {
-    if (!tiktokConnection.configured) {
-        showToast(`TikTok setup is missing: ${(tiktokConnection.missing_config || []).join(', ')}`, 'error');
+function renderPublisherConnections() {
+    ['tiktok', 'instagram', 'youtube', 'facebook'].forEach(renderPlatformConnection);
+}
+
+function connectPlatform(platform) {
+    const connection = platformConnections[platform] || {};
+    if (!connection.configured) {
+        const missing = (connection.missing_config || []).join(', ');
+        const reason = connection.reason || connection.setup_reason ||
+            (missing ? `Missing configuration: ${missing}` : 'Provider setup is incomplete');
+        showToast(`${platformDisplayName(platform)} cannot connect yet. ${reason}`, 'error');
         return;
     }
-    window.location.href = '/api/tiktok/oauth/start';
+    window.location.href = connection.oauth_start_url || `/api/${platform}/oauth/start`;
 }
 
-async function disconnectTikTok() {
-    if (!confirm('Disconnect this TikTok account from Clipper?')) return;
+async function disconnectPlatform(platform) {
+    const name = platform[0].toUpperCase() + platform.slice(1);
+    if (!confirm(`Disconnect this ${name} account from Clipper?`)) return;
     try {
-        const response = await fetch('/api/tiktok/disconnect', { method: 'POST' });
+        const connection = platformConnections[platform] || {};
+        const response = await fetch(connection.disconnect_url || `/api/${platform}/disconnect`, { method: 'POST' });
         const data = await response.json();
         if (!response.ok) throw new Error(data.error || 'Disconnect failed');
-        showToast('TikTok disconnected', 'success');
-        await loadTikTokStatus();
+        showToast(`${name} disconnected`, 'success');
+        await loadPublisherStatus();
     } catch (error) {
-        showToast(error.message || 'Failed to disconnect TikTok', 'error');
+        showToast(error.message || `Failed to disconnect ${name}`, 'error');
     }
+}
+
+async function fetchDiscoveryCandidates(quiet = false) {
+    if (discoveryRequestInFlight) return false;
+    discoveryRequestInFlight = true;
+    const previousStatuses = new Map(
+        (discoveryState.candidates || []).map(candidate => [candidate.candidate_id, candidate.pipeline_status])
+    );
+
+    try {
+        const response = await fetch(`${API_BASE}/api/discovery/candidates`);
+        const data = await response.json();
+        if (!response.ok) throw new Error(data.error || 'Could not load story discovery');
+
+        const nextSignature = discoverySignature(data);
+        const changed = nextSignature !== discoveryRenderSignature;
+        discoveryState = data;
+        if (changed) {
+            discoveryRenderSignature = nextSignature;
+            renderDiscovery();
+        }
+
+        let pipelineCompleted = false;
+        for (const candidate of discoveryState.candidates || []) {
+            const previous = previousStatuses.get(candidate.candidate_id);
+            if (
+                ['queued', 'processing'].includes(previous) &&
+                !['queued', 'processing'].includes(candidate.pipeline_status)
+            ) {
+                pipelineCompleted = true;
+            }
+            if (['queued', 'processing'].includes(previous) && candidate.pipeline_status === 'video_done') {
+                showToast('Discovery video is ready', 'success');
+            } else if (['queued', 'processing'].includes(previous) && candidate.pipeline_status === 'failed') {
+                showToast(candidate.pipeline_error || 'Video creation failed. Check the failed stage below.', 'error');
+            }
+        }
+        if (pipelineCompleted) await fetchArticles();
+        return changed;
+    } catch (error) {
+        console.error('Error loading discovery candidates:', error);
+        if (!quiet) showToast('Failed to load story discovery', 'error');
+        return false;
+    } finally {
+        discoveryRequestInFlight = false;
+    }
+}
+
+function stopDiscoveryPolling() {
+    if (discoveryPollTimer !== null) {
+        clearTimeout(discoveryPollTimer);
+        discoveryPollTimer = null;
+    }
+}
+
+function scheduleDiscoveryPoll({ reset = false } = {}) {
+    stopDiscoveryPolling();
+    if (reset) discoveryPollDelayMs = DISCOVERY_POLL_MIN_MS;
+    if (document.hidden || !discoveryIsBusy()) return;
+
+    discoveryPollTimer = setTimeout(async () => {
+        discoveryPollTimer = null;
+        const changed = await fetchDiscoveryCandidates(true);
+        discoveryPollDelayMs = changed
+            ? DISCOVERY_POLL_MIN_MS
+            : Math.min(discoveryPollDelayMs * 2, DISCOVERY_POLL_MAX_MS);
+        scheduleDiscoveryPoll();
+    }, discoveryPollDelayMs);
+}
+
+async function runStoryDiscovery() {
+    const button = document.getElementById('discovery-run-btn');
+    if (button) button.disabled = true;
+
+    try {
+        const response = await fetch(`${API_BASE}/api/discovery/run`, { method: 'POST' });
+        const data = await response.json();
+        if (!response.ok) throw new Error(data.error || 'Could not start story discovery');
+        showToast(data.started ? 'Scanning today\'s science stories…' : 'Story discovery is already running', 'info');
+        await fetchDiscoveryCandidates(true);
+        scheduleDiscoveryPoll({ reset: true });
+    } catch (error) {
+        console.error('Error starting discovery:', error);
+        showToast('Failed to start story discovery', 'error');
+        if (button) button.disabled = false;
+    }
+}
+
+async function makeDiscoveryVideo(candidateId) {
+    const button = document.querySelector(`[data-discovery-video="${candidateId}"]`);
+    if (button) {
+        button.disabled = true;
+        button.textContent = 'Starting…';
+    }
+
+    try {
+        const response = await fetch(
+            `${API_BASE}/api/discovery/candidates/${candidateId}/make-video`,
+            { method: 'POST' }
+        );
+        const data = await response.json();
+        if (!response.ok) throw new Error(data.error || 'Could not start video creation');
+        showToast(data.started ? 'Video creation started' : 'This story is already being processed', 'info');
+        await fetchDiscoveryCandidates(true);
+        scheduleDiscoveryPoll({ reset: true });
+    } catch (error) {
+        console.error('Error starting discovery video:', error);
+        showToast(error.message || 'Failed to start video creation', 'error');
+        if (button) {
+            button.disabled = false;
+            button.textContent = 'Make video';
+        }
+    }
+}
+
+function captureDiscoveryFocus(container) {
+    const active = document.activeElement;
+    if (!active || !container.contains(active)) return null;
+    const card = active.closest('[data-discovery-candidate]');
+    if (!card) return null;
+    const action = active.matches('[data-discovery-video]')
+        ? 'video'
+        : active.matches('[data-discovery-source]')
+            ? 'source'
+            : null;
+    return action ? { candidateId: card.dataset.discoveryCandidate, action } : null;
+}
+
+function restoreDiscoveryFocus(container, descriptor) {
+    if (!descriptor) return;
+    const card = container.querySelector(
+        `[data-discovery-candidate="${descriptor.candidateId}"]`
+    );
+    if (!card) return;
+    const target = card.querySelector(
+        descriptor.action === 'video' ? '[data-discovery-video]' : '[data-discovery-source]'
+    );
+    if (target && !target.disabled) target.focus({ preventScroll: true });
+}
+
+function renderDiscovery() {
+    const button = document.getElementById('discovery-run-btn');
+    const status = document.getElementById('discovery-status');
+    const container = document.getElementById('discovery-candidates');
+    if (!button || !status || !container) return;
+
+    const candidates = discoveryState.candidates || [];
+    const hasPipelineWork = candidates.some(
+        candidate => ['queued', 'processing'].includes(candidate.pipeline_status)
+    );
+    button.disabled = Boolean(discoveryState.running) || hasPipelineWork;
+    setTextIfChanged(
+        button,
+        discoveryState.running
+            ? 'Finding stories…'
+            : hasPipelineWork
+                ? 'Video in progress…'
+                : 'Find today\'s stories'
+    );
+
+    let statusMessage;
+    if (discoveryState.running) {
+        statusMessage = 'Scanning science feeds and ranking the strongest stories. This usually takes under a minute.';
+    } else if (discoveryState.status === 'failed') {
+        statusMessage = discoveryState.error || 'Story discovery failed. Please try again.';
+    } else if (discoveryState.status === 'complete') {
+        statusMessage = candidates.length
+            ? `${candidates.length} ranked stor${candidates.length === 1 ? 'y' : 'ies'} found.`
+            : 'No unseen stories were found today. Try again later.';
+    } else {
+        statusMessage = 'Ready to scan today\'s science stories.';
+    }
+    setTextIfChanged(status, statusMessage);
+
+    const focusDescriptor = captureDiscoveryFocus(container);
+    if (!candidates.length) {
+        container.innerHTML = discoveryState.status === 'complete'
+            ? '<div class="discovery-empty">No unseen stories are waiting right now.</div>'
+            : '';
+        container.classList.toggle('hidden', discoveryState.status !== 'complete');
+        restoreDiscoveryFocus(container, focusDescriptor);
+        return;
+    }
+
+    container.classList.remove('hidden');
+    container.innerHTML = candidates.map(candidate => {
+        const score = Math.round(Number(candidate.viral_score) || 0);
+        const pipelineStatus = candidate.pipeline_status || 'ready';
+        const isProcessing = ['queued', 'processing'].includes(pipelineStatus);
+        const isDone = pipelineStatus === 'video_done';
+        const isSkipped = pipelineStatus === 'skipped';
+        const failedStage = candidate.failure_stage || (candidate.result && candidate.result.failure_stage);
+        const pipelineError = candidate.pipeline_error || (candidate.result && candidate.result.pipeline_error);
+        const buttonLabel = isProcessing
+            ? 'Making video…'
+            : isDone
+                ? 'Video ready'
+                : isSkipped
+                    ? 'Already added'
+                    : pipelineStatus === 'failed'
+                        ? 'Retry video'
+                        : 'Make video';
+
+        return `
+            <article class="discovery-card" data-discovery-candidate="${candidate.candidate_id}">
+                <div class="discovery-rank" aria-label="Rank ${candidate.rank || ''}">${candidate.rank || '–'}</div>
+                <div class="discovery-score" aria-label="Viral score ${score} out of 100">
+                    <strong>${score}</strong><span>/100</span>
+                </div>
+                <div class="discovery-story">
+                    <h3>${escapeHtml(candidate.title)}</h3>
+                    <div class="discovery-source-row">
+                        <span>${escapeHtml(candidate.source || 'Science feed')}</span>
+                        <a href="${escapeAttribute(candidate.url)}" target="_blank" rel="noopener noreferrer"
+                            data-discovery-source>Read source</a>
+                    </div>
+                    <p class="discovery-reason" title="${escapeAttribute(candidate.score_reason || '')}">
+                        ${escapeHtml(candidate.score_reason || 'Strong fit for a short science story.')}
+                    </p>
+                    ${pipelineStatus === 'failed' ? `
+                        <p class="discovery-failure">
+                            <strong>${escapeHtml(failedStage ? `${failedStage[0].toUpperCase() + failedStage.slice(1)} failed` : 'Video creation failed')}:</strong>
+                            ${escapeHtml(pipelineError || 'This story could not be processed. You can retry it.')}
+                        </p>
+                    ` : ''}
+                </div>
+                <button type="button" class="btn btn-secondary discovery-video-btn"
+                    data-discovery-video="${candidate.candidate_id}"
+                    onclick="makeDiscoveryVideo('${candidate.candidate_id}')"
+                    ${discoveryState.running || isProcessing || isDone || isSkipped ? 'disabled' : ''}>
+                    ${buttonLabel}
+                </button>
+            </article>
+        `;
+    }).join('');
+    restoreDiscoveryFocus(container, focusDescriptor);
 }
 
 async function scrapeUrl(event) {
@@ -413,67 +966,105 @@ function closeQrModal() {
 }
 
 // ============================================
-// TikTok Direct Post
+// Manual multi-platform publishing
 // ============================================
 
-function formatTikTokStatus(status) {
+function platformDisplayName(platform) {
+    return {
+        tiktok: 'TikTok',
+        instagram: 'Instagram',
+        youtube: 'YouTube',
+        facebook: 'Facebook'
+    }[platform] || platform;
+}
+
+function formatPublishStatus(status) {
     const labels = {
+        AWAITING_APPROVAL: 'Old pending request — cancel to retry',
+        CANCELLED: 'Cancelled',
+        QUEUED: 'Queued',
+        ACCEPTED: 'Accepted',
         INITIALIZING: 'Preparing upload',
         UPLOADING: 'Uploading video',
         PROCESSING_UPLOAD: 'Processing upload',
         PROCESSING_DOWNLOAD: 'Processing video',
+        PROCESSING_CONTAINER: 'Processing Reel',
+        CONTAINER_CREATED: 'Preparing Reel',
+        IN_PROGRESS: 'Processing',
+        FINISHED: 'Ready to publish',
+        PUBLISHING: 'Publishing',
+        PUBLISHED: 'Published',
         PUBLISH_COMPLETE: 'Published',
         FAILED: 'Failed',
         SEND_TO_USER_INBOX: 'Sent to TikTok inbox'
     };
-    return labels[status] || (status || 'Unknown').replaceAll('_', ' ').toLowerCase();
+    return labels[status] || String(status || 'Unknown').replaceAll('_', ' ').toLowerCase();
 }
 
-function closeTikTokModal() {
-    const modal = document.getElementById('tiktok-modal');
-    if (modal) {
-        modal.classList.remove('active');
-        setTimeout(() => modal.remove(), 200);
-    }
-}
-
-function suggestedTikTokCaption(article) {
+function suggestedShareCaption(article) {
     const hashtags = (article.hashtags || []).join(' ');
-    return `${article.title}${hashtags ? `\n\n${hashtags}` : ''}`.slice(0, 2200);
+    return `${article.title}${hashtags ? `\n\n${hashtags}` : ''}`;
 }
 
-async function openTikTokPostDialog(event, articleId) {
-    if (event) event.stopPropagation();
-    if (!tiktokConnection.connected) {
-        if (tiktokConnection.configured) {
-            showToast('Connect your TikTok account first', 'info');
-            connectTikTok();
-        } else {
-            showToast('TikTok app credentials still need to be configured', 'error');
-        }
-        return;
+function sharePlatformDisabledReason(platform, connection) {
+    if (!connection || !connection.configured) {
+        const missing = (connection && connection.missing_config || []).join(', ');
+        return connection && (connection.reason || connection.setup_reason) ||
+            (missing
+                ? `Missing configuration: ${missing}`
+                : (connection && connection.requirements) || 'Provider setup is incomplete');
     }
+    if (platformNeedsReconnect(connection)) {
+        return connection.reconnect_reason || 'Reconnect the account first';
+    }
+    if (!connection.connected) {
+        return connection.reason || connection.connection_reason ||
+            `Connect ${platformDisplayName(platform)} first`;
+    }
+    if (connection.publishing_available === false) {
+        return connection.unavailable_reason || connection.publish_blocked_reason ||
+            connection.reason || connection.requirements || 'Publishing is not available yet';
+    }
+    return '';
+}
 
+function closeShareModal() {
+    const modal = document.getElementById('share-modal');
+    if (!modal) return;
+    modal.classList.remove('active');
+    setTimeout(() => modal.remove(), 200);
+}
+
+async function openShareEverywhereDialog(event, articleId, retryPlatform = null) {
+    if (event) event.stopPropagation();
     const article = articles.find(item => item.id === articleId);
     if (!article || !article.video_path) return;
-    showToast('Loading the latest TikTok account settings…', 'info');
 
+    showToast('Loading your publishing accounts…', 'info');
     try {
-        const response = await fetch('/api/tiktok/creator-info', { method: 'POST' });
-        const data = await response.json();
-        if (!response.ok) throw new Error(data.error || 'Could not load TikTok creator settings');
-        renderTikTokPostDialog(article, data.creator, data.account, data.public_posting_enabled);
+        await loadPublisherStatus();
+        let tiktokContext = null;
+        if (platformConnections.tiktok && platformConnections.tiktok.connected) {
+            try {
+                const response = await fetch('/api/tiktok/creator-info', { method: 'POST' });
+                const data = await response.json();
+                if (response.ok) tiktokContext = data;
+            } catch (error) {
+                console.warn('Could not refresh TikTok creator settings', error);
+            }
+        }
+        renderShareEverywhereDialog(article, tiktokContext, retryPlatform);
     } catch (error) {
-        showToast(error.message || 'Could not open TikTok posting', 'error');
+        showToast(error.message || 'Could not open publishing', 'error');
     }
 }
 
-function renderTikTokPostDialog(article, creator, account, publicPostingEnabled) {
-    closeTikTokModal();
+function renderShareEverywhereDialog(article, tiktokContext = null, retryPlatform = null) {
+    closeShareModal();
     const modal = document.createElement('div');
-    modal.id = 'tiktok-modal';
-    modal.className = 'tiktok-modal-overlay';
-    modal.onclick = (event) => { if (event.target === modal) closeTikTokModal(); };
+    modal.id = 'share-modal';
+    modal.className = 'tiktok-modal-overlay share-modal-overlay';
+    modal.onclick = (event) => { if (event.target === modal) closeShareModal(); };
 
     const privacyLabels = {
         PUBLIC_TO_EVERYONE: 'Everyone',
@@ -481,132 +1072,326 @@ function renderTikTokPostDialog(article, creator, account, publicPostingEnabled)
         FOLLOWER_OF_CREATOR: 'Followers',
         SELF_ONLY: 'Only you'
     };
+    const creator = tiktokContext && tiktokContext.creator || {};
+    const publicPostingEnabled = Boolean(tiktokContext && tiktokContext.public_posting_enabled);
     const privacyOptions = creator.privacy_level_options || [];
-    const creatorName = creator.creator_nickname || creator.creator_username || account.creator_nickname || 'TikTok creator';
-    const avatar = creator.creator_avatar_url
-        ? `<img src="${escapeHtml(creator.creator_avatar_url)}" alt="" class="tiktok-creator-avatar">`
-        : '<div class="tiktok-creator-avatar placeholder">♪</div>';
+    const creatorAccountAppearsPublic = privacyOptions.includes('PUBLIC_TO_EVERYONE');
+    const caption = suggestedShareCaption(article);
+    const platforms = ['tiktok', 'instagram', 'youtube', 'facebook'];
+    const platformCards = platforms.map(platform => {
+        const connection = platformConnections[platform] || {};
+        const reason = sharePlatformDisabledReason(platform, connection);
+        // Publishing is always explicit. A normal Post flow starts with no
+        // destinations selected; only a single-platform retry is preselected.
+        const selected = !reason && Boolean(retryPlatform && retryPlatform === platform);
+        const lockedByRetry = Boolean(retryPlatform && retryPlatform !== platform);
+        const icon = { tiktok: '♪', instagram: '◎', youtube: '▶', facebook: 'f' }[platform];
+        const helper = lockedByRetry
+            ? `Retrying ${platformDisplayName(retryPlatform)} only`
+            : reason || platformExpiryMessage(connection) || 'Ready to publish';
+        const canConnect = reason && (!connection.connected || platformNeedsReconnect(connection));
+        const connectLabel = platformNeedsReconnect(connection) ? 'Reconnect' : 'Connect';
+        return `
+            <div class="share-platform-card ${reason ? 'unavailable' : ''} ${lockedByRetry ? 'retry-locked' : ''}">
+                <label class="share-platform-toggle">
+                    <input type="checkbox" name="share-platform" value="${platform}" ${selected ? 'checked' : ''} ${reason || lockedByRetry ? 'disabled' : ''}>
+                    <span class="share-platform-icon ${platform}">${icon}</span>
+                    <span class="share-platform-copy">
+                        <strong>${platformDisplayName(platform)}</strong>
+                        <small>${escapeHtml(helper)}</small>
+                    </span>
+                    <span class="share-platform-check" aria-hidden="true">✓</span>
+                </label>
+                ${canConnect ? `
+                    <button type="button" class="share-platform-connect"
+                        onclick="event.stopPropagation(); connectPlatform('${platform}')">${connectLabel}</button>
+                ` : ''}
+            </div>
+        `;
+    }).join('');
+    const tiktokPrivacyOptions = privacyOptions.length ? privacyOptions : ['SELF_ONLY'];
+    modal.dataset.tiktokAccountBlocked =
+        !publicPostingEnabled && creatorAccountAppearsPublic ? 'true' : 'false';
 
     modal.innerHTML = `
-        <div class="tiktok-modal-content">
-            <button class="qr-modal-close" onclick="closeTikTokModal()">&times;</button>
+        <div class="tiktok-modal-content share-modal-content">
+            <button class="qr-modal-close" onclick="closeShareModal()">&times;</button>
             <div class="tiktok-modal-heading">
-                <div class="tiktok-mark">♪</div>
+                <div class="tiktok-mark share-mark">↗</div>
                 <div>
-                    <h3>Post video to TikTok</h3>
-                    <p>Review every setting before uploading.</p>
+                    <h3>${retryPlatform ? `Retry ${platformDisplayName(retryPlatform)}` : 'Post video'}</h3>
+                    <p>Choose each destination yourself, then confirm once.</p>
                 </div>
             </div>
-            <div class="tiktok-creator-card">
-                ${avatar}
-                <div>
-                    <strong>${escapeHtml(creatorName)}</strong>
-                    <span>${creator.creator_username ? '@' + escapeHtml(creator.creator_username) : 'Connected account'}</span>
+            <div class="share-platform-grid">${platformCards}</div>
+            <form id="share-post-form" onsubmit="submitShareEverywhere(event, ${article.id})">
+                <label class="tiktok-field share-caption-field">
+                    <span>Shared caption</span>
+                    <textarea id="share-caption" required>${escapeHtml(caption)}</textarea>
+                    <small class="share-counters">
+                        <span data-counter-platform="tiktok">TikTok <b>${caption.length}</b>/2,200</span>
+                        <span data-counter-platform="instagram">Instagram <b>${caption.length}</b>/2,200</span>
+                        <span data-counter-platform="youtube">YouTube description <b>${caption.length}</b>/5,000</span>
+                        <span data-counter-platform="facebook">Facebook <b>${caption.length}</b>/2,200</span>
+                    </small>
+                </label>
+                <label class="tiktok-field share-youtube-title" data-options-platform="youtube">
+                    <span>YouTube title</span>
+                    <input id="share-youtube-title" type="text" value="${escapeHtml(article.title)}" required>
+                    <small><span id="share-youtube-title-count">${article.title.length}</span>/100</small>
+                </label>
+
+                <div class="share-platform-options" data-options-platform="tiktok">
+                    <div class="share-options-heading">TikTok settings</div>
+                    ${!publicPostingEnabled && platformConnections.tiktok.connected ? `
+                        <div class="tiktok-account-requirement ${creatorAccountAppearsPublic ? 'blocking' : ''}">
+                            <strong>${creatorAccountAppearsPublic ? 'Account change required before upload' : 'Unaudited-app requirement'}</strong>
+                            <span>${creatorAccountAppearsPublic
+                                ? 'Set the TikTok account to Private, then reopen this window.'
+                                : 'TikTok requires the account to remain Private and this post to use Only you until the app passes audit.'}</span>
+                        </div>
+                    ` : ''}
+                    <label class="tiktok-field">
+                        <span>Who can watch this video?</span>
+                        <select id="tiktok-privacy" required>
+                            ${tiktokPrivacyOptions.map(option => {
+                                const locked = !publicPostingEnabled && option !== 'SELF_ONLY';
+                                return `<option value="${escapeHtml(option)}" ${locked ? 'disabled' : ''} ${option === 'SELF_ONLY' ? 'selected' : ''}>${escapeHtml(privacyLabels[option] || option)}${locked ? ' · requires TikTok audit' : ''}</option>`;
+                            }).join('')}
+                        </select>
+                    </label>
+                    <fieldset class="tiktok-fieldset">
+                        <legend>Allow people to</legend>
+                        <label><input type="checkbox" id="tiktok-comments" ${creator.comment_disabled ? 'disabled' : ''}> Comment</label>
+                        <label><input type="checkbox" id="tiktok-duet" ${creator.duet_disabled ? 'disabled' : ''}> Duet</label>
+                        <label><input type="checkbox" id="tiktok-stitch" ${creator.stitch_disabled ? 'disabled' : ''}> Stitch</label>
+                    </fieldset>
+                    <fieldset class="tiktok-fieldset">
+                        <legend>Content disclosure</legend>
+                        <label><input type="checkbox" id="tiktok-own-brand"> Promotes my own brand or business</label>
+                        <label><input type="checkbox" id="tiktok-branded-content"> Paid partnership or third-party brand</label>
+                    </fieldset>
+                    <label class="tiktok-consent">
+                        <input type="checkbox" id="tiktok-consent">
+                        <span>By posting, I agree to TikTok's <a href="https://www.tiktok.com/legal/page/global/music-usage-confirmation/en" target="_blank" rel="noopener">Music Usage Confirmation</a>.</span>
+                    </label>
                 </div>
-            </div>
-            <form id="tiktok-post-form" onsubmit="submitTikTokPost(event, ${article.id})">
-                <label class="tiktok-field">
-                    <span>Caption</span>
-                    <textarea id="tiktok-caption" maxlength="2200" required>${escapeHtml(suggestedTikTokCaption(article))}</textarea>
-                    <small><span id="tiktok-caption-count">${suggestedTikTokCaption(article).length}</span>/2200</small>
-                </label>
-                <label class="tiktok-field">
-                    <span>Who can watch this video?</span>
-                    <select id="tiktok-privacy" required>
-                        <option value="" selected disabled>Select privacy</option>
-                        ${privacyOptions.map(option => {
-                            const locked = !publicPostingEnabled && option !== 'SELF_ONLY';
-                            return `<option value="${escapeHtml(option)}" ${locked ? 'disabled' : ''}>${escapeHtml(privacyLabels[option] || option)}${locked ? ' · requires TikTok audit' : ''}</option>`;
-                        }).join('')}
-                    </select>
-                    ${!publicPostingEnabled ? '<small>Unaudited TikTok apps can post privately only.</small>' : ''}
-                </label>
-                <fieldset class="tiktok-fieldset">
-                    <legend>Allow people to</legend>
-                    <label><input type="checkbox" id="tiktok-comments" ${creator.comment_disabled ? 'disabled' : ''}> Comment</label>
-                    <label><input type="checkbox" id="tiktok-duet" ${creator.duet_disabled ? 'disabled' : ''}> Duet</label>
-                    <label><input type="checkbox" id="tiktok-stitch" ${creator.stitch_disabled ? 'disabled' : ''}> Stitch</label>
-                    <small>Nothing is enabled by default. Disabled options follow your TikTok settings.</small>
-                </fieldset>
-                <fieldset class="tiktok-fieldset">
-                    <legend>Content disclosure</legend>
-                    <label><input type="checkbox" id="tiktok-own-brand"> Promotes my own brand or business</label>
-                    <label><input type="checkbox" id="tiktok-branded-content"> Paid partnership or third-party brand</label>
-                </fieldset>
-                <label class="tiktok-consent">
-                    <input type="checkbox" id="tiktok-consent" required>
-                    <span>By posting, I agree to TikTok's <a href="https://www.tiktok.com/legal/page/global/music-usage-confirmation/en" target="_blank" rel="noopener">Music Usage Confirmation</a>.</span>
-                </label>
+
+                <div class="share-platform-options" data-options-platform="instagram">
+                    <div class="share-options-heading">Instagram settings</div>
+                    <label class="tiktok-consent">
+                        <input type="checkbox" id="instagram-share-to-feed" checked>
+                        <span>Also show the Reel in the main Instagram feed.</span>
+                    </label>
+                    <small class="share-platform-note">Instagram fetches the finished MP4 from a temporary signed HTTPS link.</small>
+                </div>
+
+                <div class="share-platform-options" data-options-platform="youtube">
+                    <div class="share-options-heading">YouTube settings</div>
+                    <label class="tiktok-field">
+                        <span>Visibility</span>
+                        <select id="youtube-privacy">
+                            <option value="private" selected>Private</option>
+                            <option value="unlisted">Unlisted</option>
+                            <option value="public">Public</option>
+                        </select>
+                        <small>Unverified API projects are restricted to private uploads.</small>
+                    </label>
+                </div>
+
+                <div class="share-platform-options" data-options-platform="facebook">
+                    <div class="share-options-heading">Facebook settings</div>
+                    <small class="share-platform-note">The Reel will publish to the connected Facebook Page, not a personal profile.</small>
+                </div>
+
+                <div class="share-submit-note">Each platform records its own result. One failure will not cancel the others.</div>
+                <div class="share-character-warning hidden" id="share-validation-error" role="alert"></div>
+                <div class="share-request-error hidden" id="share-request-error" role="alert" aria-live="assertive"></div>
                 <div class="tiktok-modal-actions">
-                    <button type="button" class="btn btn-action" onclick="closeTikTokModal()">Cancel</button>
-                    <button type="submit" class="btn btn-action btn-tiktok" id="tiktok-submit">Upload privately</button>
+                    <button type="button" class="btn btn-action" onclick="closeShareModal()">Cancel</button>
+                    <button type="submit" class="btn btn-action btn-tiktok btn-share-everywhere" id="share-submit">${retryPlatform ? 'Retry selected platform' : 'Post to selected platforms'}</button>
                 </div>
             </form>
+            <div class="share-results hidden" id="share-results" aria-live="polite"></div>
         </div>
     `;
     document.body.appendChild(modal);
-    const caption = document.getElementById('tiktok-caption');
-    caption.addEventListener('input', () => {
-        document.getElementById('tiktok-caption-count').textContent = caption.value.length;
-    });
+    modal.querySelectorAll('input[name="share-platform"]').forEach(input => input.addEventListener('change', updateShareDialogValidation));
+    document.getElementById('share-caption').addEventListener('input', updateShareDialogValidation);
+    document.getElementById('share-youtube-title').addEventListener('input', updateShareDialogValidation);
+    document.getElementById('tiktok-consent').addEventListener('change', updateShareDialogValidation);
+    updateShareDialogValidation();
     requestAnimationFrame(() => modal.classList.add('active'));
 }
 
-async function submitTikTokPost(event, articleId) {
-    event.preventDefault();
-    const submit = document.getElementById('tiktok-submit');
-    const privacy = document.getElementById('tiktok-privacy').value;
-    if (!privacy) {
-        showToast('Choose a TikTok privacy setting', 'error');
-        return;
+function selectedSharePlatforms() {
+    return [...document.querySelectorAll('input[name="share-platform"]:checked')].map(input => input.value);
+}
+
+function updateShareDialogValidation() {
+    const caption = document.getElementById('share-caption');
+    const youtubeTitle = document.getElementById('share-youtube-title');
+    const warning = document.getElementById('share-validation-error');
+    const submit = document.getElementById('share-submit');
+    if (!caption || !youtubeTitle || !warning || !submit) return;
+    setShareRequestError('');
+
+    const selected = selectedSharePlatforms();
+    const limits = { tiktok: 2200, instagram: 2200, youtube: 5000, facebook: 2200 };
+    const issues = [];
+    if (!caption.value.trim()) issues.push('Add a caption before posting');
+    document.querySelectorAll('[data-counter-platform]').forEach(counter => {
+        const platform = counter.dataset.counterPlatform;
+        const countNode = counter.querySelector('b');
+        if (countNode) countNode.textContent = caption.value.length;
+        const over = selected.includes(platform) && caption.value.length > limits[platform];
+        counter.classList.toggle('over-limit', over);
+        if (over) issues.push(`${platformDisplayName(platform)} caption is ${caption.value.length - limits[platform]} characters too long`);
+    });
+    document.getElementById('share-youtube-title-count').textContent = youtubeTitle.value.length;
+    if (selected.includes('youtube') && youtubeTitle.value.length > 100) {
+        issues.push(`YouTube title is ${youtubeTitle.value.length - 100} characters too long`);
     }
+    if (selected.includes('youtube') && !youtubeTitle.value.trim()) {
+        issues.push('Add a YouTube title');
+    }
+    if (selected.includes('tiktok') && !document.getElementById('tiktok-consent').checked) {
+        issues.push('TikTok music usage consent is required');
+    }
+    const modal = document.getElementById('share-modal');
+    if (
+        selected.includes('tiktok') &&
+        modal &&
+        modal.dataset.tiktokAccountBlocked === 'true'
+    ) {
+        issues.push('Make the connected TikTok account private, then reopen this window');
+    }
+    if (!selected.length) issues.push('Select at least one connected platform');
 
-    submit.disabled = true;
-    submit.textContent = 'Uploading…';
+    warning.classList.toggle('hidden', issues.length === 0);
+    warning.textContent = issues.length ? issues.join('. ') + '.' : '';
+    submit.disabled = issues.length > 0;
+    document.querySelectorAll('[data-options-platform]').forEach(section => {
+        section.classList.toggle('inactive', !selected.includes(section.dataset.optionsPlatform));
+    });
+}
+
+function setShareRequestError(message) {
+    const region = document.getElementById('share-request-error');
+    if (!region) return;
+    region.textContent = message || '';
+    region.classList.toggle('hidden', !message);
+}
+
+function safePublishUrl(value) {
+    if (!value) return null;
     try {
-        const response = await fetch(`/api/articles/${articleId}/tiktok/publish`, {
-            method: 'POST',
-            headers: { 'Content-Type': 'application/json' },
-            body: JSON.stringify({
-                title: document.getElementById('tiktok-caption').value,
-                privacy_level: privacy,
-                allow_comment: document.getElementById('tiktok-comments').checked,
-                allow_duet: document.getElementById('tiktok-duet').checked,
-                allow_stitch: document.getElementById('tiktok-stitch').checked,
-                brand_organic_toggle: document.getElementById('tiktok-own-brand').checked,
-                brand_content_toggle: document.getElementById('tiktok-branded-content').checked,
-                consent: document.getElementById('tiktok-consent').checked
-            })
-        });
-        const data = await response.json();
-        if (!response.ok) throw new Error(data.error || 'TikTok upload failed');
-
-        const index = articles.findIndex(article => article.id === articleId);
-        if (index !== -1) articles[index] = data.article;
-        closeTikTokModal();
-        renderArticles();
-        showToast('Video uploaded. TikTok is processing it privately.', 'success');
+        const parsed = new URL(value, window.location.origin);
+        return ['http:', 'https:'].includes(parsed.protocol) ? parsed.href : null;
     } catch (error) {
-        showToast(error.message || 'TikTok upload failed', 'error');
-        submit.disabled = false;
-        submit.textContent = 'Upload privately';
+        return null;
     }
 }
 
-async function refreshTikTokPublishStatus(event, articleId, quiet = false) {
-    if (event) event.stopPropagation();
+function renderShareResults(articleId, results) {
+    const container = document.getElementById('share-results');
+    const form = document.getElementById('share-post-form');
+    if (!container) return;
+    const iconByPlatform = { tiktok: '♪', instagram: '◎', youtube: '▶', facebook: 'f' };
+    const rows = Object.entries(results || {}).map(([platform, result]) => {
+        const status = result.status || (result.accepted ? 'ACCEPTED' : 'FAILED');
+        const failed = !result.accepted || status === 'FAILED';
+        const permalink = safePublishUrl(result.permalink);
+        return `
+            <div class="share-result-row ${failed ? 'failed' : 'accepted'}">
+                <span class="share-platform-icon ${platform}">${iconByPlatform[platform] || '↗'}</span>
+                <span class="share-result-copy">
+                    <strong>${platformDisplayName(platform)}</strong>
+                    <small>${escapeHtml(formatPublishStatus(status))}${result.error ? ` · ${escapeHtml(result.error)}` : ''}</small>
+                </span>
+                ${permalink ? `<a href="${escapeHtml(permalink)}" target="_blank" rel="noopener noreferrer">View post</a>` : ''}
+                ${failed ? `<button type="button" onclick="openShareEverywhereDialog(event, ${articleId}, '${platform}')">Retry</button>` : '<span class="share-result-ok">✓</span>'}
+            </div>
+        `;
+    }).join('');
+    if (form) form.classList.add('hidden');
+    container.classList.remove('hidden');
+    container.innerHTML = `
+        <div class="share-results-heading">
+            <div><strong>Publishing results</strong><small>Each platform continues independently.</small></div>
+            <button type="button" class="btn btn-action" onclick="closeShareModal()">Done</button>
+        </div>
+        ${rows || '<div class="share-result-row failed">No platform result was returned.</div>'}
+    `;
+}
+
+async function submitShareEverywhere(event, articleId) {
+    event.preventDefault();
+    updateShareDialogValidation();
+    const submit = document.getElementById('share-submit');
+    if (!submit || submit.disabled) return;
+    const platforms = selectedSharePlatforms();
+    const caption = document.getElementById('share-caption').value;
+
+    submit.disabled = true;
+    submit.textContent = 'Sharing…';
+    setShareRequestError('');
     try {
-        const response = await fetch(`/api/articles/${articleId}/tiktok/status`, { method: 'POST' });
-        const data = await response.json();
-        if (!response.ok) throw new Error(data.error || 'Could not refresh TikTok status');
-        const index = articles.findIndex(article => article.id === articleId);
-        if (index !== -1) articles[index] = data.article;
-        renderArticles();
-        if (!quiet && data.article.tiktok_publish_status === 'PUBLISH_COMPLETE') {
-            showToast('TikTok post is complete', 'success');
+        const response = await fetch(`/api/articles/${articleId}/publish`, {
+            method: 'POST',
+            headers: { 'Content-Type': 'application/json' },
+            body: JSON.stringify({
+                platforms,
+                caption,
+                options: {
+                    tiktok: {
+                        title: caption,
+                        privacy_level: document.getElementById('tiktok-privacy').value,
+                        allow_comment: document.getElementById('tiktok-comments').checked,
+                        allow_duet: document.getElementById('tiktok-duet').checked,
+                        allow_stitch: document.getElementById('tiktok-stitch').checked,
+                        brand_organic_toggle: document.getElementById('tiktok-own-brand').checked,
+                        brand_content_toggle: document.getElementById('tiktok-branded-content').checked,
+                        consent: document.getElementById('tiktok-consent').checked
+                    },
+                    instagram: {
+                        share_to_feed: document.getElementById('instagram-share-to-feed').checked
+                    },
+                    youtube: {
+                        title: document.getElementById('share-youtube-title').value,
+                        description: caption,
+                        privacy_status: document.getElementById('youtube-privacy').value
+                    },
+                    facebook: {
+                        caption
+                    }
+                }
+            })
+        });
+        let data = {};
+        try {
+            data = await response.json();
+        } catch (error) {
+            console.warn('Publishing response was not JSON', error);
         }
+        if (!response.ok && response.status !== 207) throw new Error(data.error || 'Publishing request failed');
+
+        const index = articles.findIndex(article => article.id === articleId);
+        if (index !== -1 && data.article) articles[index] = data.article;
+        renderArticles();
+        renderShareResults(articleId, data.results || {});
+        const accepted = Object.values(data.results || {}).filter(result => result.accepted).length;
+        const failed = Object.keys(data.results || {}).length - accepted;
+        showToast(
+            failed ? `${accepted} platform${accepted === 1 ? '' : 's'} accepted; ${failed} needs attention` : 'Publishing started for the selected platforms',
+            failed ? 'info' : 'success'
+        );
     } catch (error) {
-        if (!quiet) showToast(error.message || 'Could not refresh TikTok status', 'error');
+        const message = error.message || 'Publishing failed';
+        setShareRequestError(message);
+        showToast(message, 'error');
+        submit.disabled = false;
+        submit.textContent = 'Post to selected platforms';
     }
 }
 
@@ -714,13 +1499,15 @@ function renderArticles() {
     });
 
     // Staggered entry animation (only on content change)
-    if (shouldAnimate && window.anime) {
+    if (shouldAnimate && motionEnhancementsAllowed()) {
         anime({
             targets: '.article-card',
-            translateY: [20, 0],
-            opacity: [0, 1],
+            // Cards are CSS-visible by default. Motion is an enhancement only,
+            // so a suspended animation frame can never strand them at opacity 0.
+            translateY: [12, 0],
             delay: anime.stagger(80),
-            easing: 'spring(1, 80, 10, 0)'
+            duration: 360,
+            easing: 'easeOutCubic'
         });
     }
 }
@@ -760,39 +1547,149 @@ function renderArticleCard(article) {
     `;
 }
 
-function getStatusBadges(article) {
-    let tiktokBadge = '';
-    if (article.tiktok_publish_status === 'PUBLISH_COMPLETE') {
-        tiktokBadge = '<span class="badge badge-tiktok">TikTok Posted</span>';
-    } else if (['INITIALIZING', 'UPLOADING', 'PROCESSING_UPLOAD', 'PROCESSING_DOWNLOAD'].includes(article.tiktok_publish_status)) {
-        tiktokBadge = '<span class="badge badge-processing">TikTok Processing</span>';
-    } else if (article.tiktok_publish_status === 'FAILED') {
-        tiktokBadge = '<span class="badge badge-failed">TikTok Failed</span>';
+function normalizedPlatformPosts(article) {
+    const posts = article.platform_posts;
+    const normalized = {};
+    if (Array.isArray(posts)) {
+        posts.forEach(post => {
+            if (post && post.platform) normalized[post.platform] = post;
+        });
+    } else if (posts && typeof posts === 'object') {
+        Object.entries(posts).forEach(([platform, post]) => {
+            normalized[platform] = { platform, ...(post || {}) };
+        });
     }
+    if (!normalized.tiktok && article.tiktok_publish_status) {
+        normalized.tiktok = {
+            platform: 'tiktok',
+            status: article.tiktok_publish_status,
+            external_id: article.tiktok_publish_id,
+            error: article.tiktok_publish_error,
+            published_at: article.tiktok_published_at
+        };
+    }
+    return normalized;
+}
+
+function platformPostIsPending(status) {
+    return [
+        'QUEUED', 'ACCEPTED', 'INITIALIZING', 'UPLOADING',
+        'PROCESSING_UPLOAD', 'PROCESSING_DOWNLOAD', 'CONTAINER_CREATED',
+        'PROCESSING_CONTAINER', 'IN_PROGRESS', 'FINISHED', 'PUBLISHING', 'PROCESSING'
+    ].includes(status);
+}
+
+function platformPostIsPublished(status) {
+    return ['PUBLISHED', 'PUBLISH_COMPLETE', 'SEND_TO_USER_INBOX'].includes(status);
+}
+
+function platformPostCanRetry(status) {
+    return ['FAILED', 'CANCELLED'].includes(status);
+}
+
+async function cancelPendingPublish(event, articleId) {
+    if (event) event.stopPropagation();
+    const button = event && event.currentTarget;
+    if (button) {
+        button.disabled = true;
+        button.textContent = 'Cancelling…';
+    }
+    try {
+        const response = await fetch(`/api/articles/${articleId}/publish/cancel`, {
+            method: 'POST'
+        });
+        let data = {};
+        try {
+            data = await response.json();
+        } catch (error) {
+            console.warn('Cancel response was not JSON', error);
+        }
+        if (!response.ok) {
+            throw new Error(data.error || 'Could not cancel this pending post');
+        }
+        const index = articles.findIndex(article => article.id === articleId);
+        if (index !== -1 && data.article) articles[index] = data.article;
+        renderArticles();
+        showToast(data.message || 'Pending post cancelled. You can post it manually now.', 'success');
+    } catch (error) {
+        showToast(error.message || 'Could not cancel this pending post', 'error');
+        if (button) {
+            button.disabled = false;
+            button.textContent = 'Cancel pending post';
+        }
+    }
+}
+
+function renderPlatformPostStates(article) {
+    const posts = normalizedPlatformPosts(article);
+    const platformOrder = ['tiktok', 'instagram', 'youtube', 'facebook'];
+    const rows = Object.values(posts)
+        .filter(post => platformOrder.includes(post.platform))
+        .sort((a, b) => platformOrder.indexOf(a.platform) - platformOrder.indexOf(b.platform))
+        .map(post => {
+        const platform = post.platform || 'platform';
+        const status = post.status || 'UNKNOWN';
+        const failed = status === 'FAILED';
+        const cancelled = status === 'CANCELLED';
+        const awaitingCancellation = status === 'AWAITING_APPROVAL';
+        const permalink = safePublishUrl(post.permalink);
+        return `
+            <div class="platform-post-state ${failed ? 'failed' : cancelled ? 'cancelled' : platformPostIsPublished(status) ? 'published' : ''}">
+                <span><strong>${platformDisplayName(platform)}:</strong> ${escapeHtml(formatPublishStatus(status))}${post.error ? ` · ${escapeHtml(post.error)}` : ''}</span>
+                ${permalink ? `<a href="${escapeHtml(permalink)}" target="_blank" rel="noopener noreferrer">View post</a>` : ''}
+                ${platformPostCanRetry(status) ? `<button type="button" onclick="openShareEverywhereDialog(event, ${article.id}, '${platform}')">Retry</button>` : ''}
+                ${awaitingCancellation ? `<button type="button" class="cancel-pending-post" onclick="cancelPendingPublish(event, ${article.id})">Cancel pending post</button>` : ''}
+            </div>
+        `;
+    }).join('');
+    return rows ? `<div class="platform-post-list">${rows}</div>` : '';
+}
+
+function getStatusBadges(article) {
+    const posts = normalizedPlatformPosts(article);
+    const supportedPlatforms = ['tiktok', 'instagram', 'youtube', 'facebook'];
+    const platformBadges = Object.values(posts).filter(
+        post => supportedPlatforms.includes(post.platform)
+    ).map(post => {
+        const name = platformDisplayName(post.platform);
+        if (platformPostIsPublished(post.status)) {
+            return `<span class="badge badge-platform badge-${post.platform}">${name} Posted</span>`;
+        }
+        if (platformPostIsPending(post.status)) {
+            return `<span class="badge badge-processing">${name} Processing</span>`;
+        }
+        if (post.status === 'FAILED') {
+            return `<span class="badge badge-failed">${name} Failed</span>`;
+        }
+        if (post.status === 'AWAITING_APPROVAL') {
+            return `<span class="badge badge-failed">${name} Needs cancel</span>`;
+        }
+        return '';
+    }).join('');
 
     // Single current-state pill. Priority: failed > processing > completed > scraped.
     if (article.status === 'failed') {
-        return '<span class="badge badge-failed">Failed</span>' + tiktokBadge;
+        return '<span class="badge badge-failed">Failed</span>' + platformBadges;
     }
     if (article.status === 'generating_video') {
-        return '<span class="badge badge-processing">Generating Video</span>' + tiktokBadge;
+        return '<span class="badge badge-processing">Generating Video</span>' + platformBadges;
     }
     if (article.status === 'generating_carousel') {
-        return '<span class="badge badge-processing">Generating Carousel</span>' + tiktokBadge;
+        return '<span class="badge badge-processing">Generating Carousel</span>' + platformBadges;
     }
     if (article.status === 'summarizing') {
-        return '<span class="badge badge-processing">Summarizing</span>' + tiktokBadge;
+        return '<span class="badge badge-processing">Summarizing</span>' + platformBadges;
     }
     if (article.video_path) {
-        return '<span class="badge badge-video">Video Ready</span>' + tiktokBadge;
+        return '<span class="badge badge-video">Video Ready</span>' + platformBadges;
     }
     if (article.carousel_dir) {
-        return '<span class="badge badge-carousel">Carousel Ready</span>' + tiktokBadge;
+        return '<span class="badge badge-carousel">Carousel Ready</span>' + platformBadges;
     }
     if (article.tldr) {
-        return '<span class="badge badge-summarized">Summarized</span>' + tiktokBadge;
+        return '<span class="badge badge-summarized">Summarized</span>' + platformBadges;
     }
-    return '<span class="badge badge-scraped">Scraped</span>' + tiktokBadge;
+    return '<span class="badge badge-scraped">Scraped</span>' + platformBadges;
 }
 
 function renderStylePicker(article) {
@@ -899,21 +1796,12 @@ function renderSummary(article) {
                         onclick="showQrModal(${article.id}, '${escapeHtml(article.title)}', 'video')">
                     📱 Send to Phone
                 </button>
-                <button class="btn btn-action btn-tiktok"
-                        onclick="openTikTokPostDialog(event, ${article.id})"
-                        ${['INITIALIZING', 'UPLOADING', 'PROCESSING_UPLOAD', 'PROCESSING_DOWNLOAD'].includes(article.tiktok_publish_status) ? 'disabled' : ''}>
-                    ${article.tiktok_publish_status === 'PUBLISH_COMPLETE' ? '✓ Posted to TikTok' : 'Post to TikTok'}
+                <button class="btn btn-action btn-tiktok btn-post"
+                        onclick="openShareEverywhereDialog(event, ${article.id})">
+                    ↗ Post
                 </button>
             </div>
-            ${article.tiktok_publish_status ? `
-                <div class="tiktok-post-state ${article.tiktok_publish_status === 'FAILED' ? 'failed' : ''}">
-                    TikTok: ${escapeHtml(formatTikTokStatus(article.tiktok_publish_status))}
-                    ${article.tiktok_publish_error ? ` · ${escapeHtml(article.tiktok_publish_error)}` : ''}
-                    ${article.tiktok_publish_id && article.tiktok_publish_status !== 'PUBLISH_COMPLETE' ? `
-                        <button onclick="refreshTikTokPublishStatus(event, ${article.id})">Check status</button>
-                    ` : ''}
-                </div>
-            ` : ''}
+            ${renderPlatformPostStates(article)}
         ` : ''}
 
         ${article.carousel_dir ? `
@@ -1016,7 +1904,7 @@ function toggleExpand(articleId, cardElement) {
         expandedArticles.delete(articleId);
         if (cardElement) {
             const content = cardElement.querySelector('.article-content');
-            if (content && window.anime) {
+            if (content && motionEnhancementsAllowed()) {
                 anime({
                     targets: content,
                     height: 0,
@@ -1034,7 +1922,7 @@ function toggleExpand(articleId, cardElement) {
 
     renderArticles();
 
-    if (expandedArticles.has(articleId) && window.anime) {
+    if (expandedArticles.has(articleId) && motionEnhancementsAllowed()) {
         const newCard = document.querySelector(`.article-card[data-article-id="${articleId}"] .article-content`);
         if (newCard) {
             anime({
@@ -1072,7 +1960,7 @@ function updateStats() {
         carouselCountEl.textContent = `${carouselCount} carousel${carouselCount !== 1 ? 's' : ''}`;
     }
 
-    if (window.anime) {
+    if (motionEnhancementsAllowed()) {
         if (prevTotal !== newTotal) {
             anime({
                 targets: totalCountEl,
@@ -1242,6 +2130,12 @@ function escapeHtml(text) {
     return div.innerHTML;
 }
 
+function escapeAttribute(text) {
+    return escapeHtml(String(text || ''))
+        .replace(/"/g, '&quot;')
+        .replace(/'/g, '&#39;');
+}
+
 // ============================================
 // Initialize
 // ============================================
@@ -1288,7 +2182,9 @@ document.addEventListener('DOMContentLoaded', () => {
 
     syncHookToggle();
     loadStyles();
-    loadTikTokStatus();
+    loadPublisherStatus();
+    loadGenerationBudget();
+    fetchDiscoveryCandidates(true).finally(() => scheduleDiscoveryPoll({ reset: true }));
     handleBookmarkletHash();
     fetchArticles();
 
@@ -1299,19 +2195,68 @@ document.addEventListener('DOMContentLoaded', () => {
     } else if (query.get('tiktok') === 'error') {
         showToast('TikTok connection failed. Check the app configuration and try again.', 'error');
         history.replaceState(null, '', window.location.pathname + window.location.hash);
+    } else if (query.get('instagram') === 'connected') {
+        showToast('Instagram account connected', 'success');
+        history.replaceState(null, '', window.location.pathname + window.location.hash);
+    } else if (query.get('instagram') === 'error') {
+        showToast('Instagram connection failed. Check the Meta app configuration and try again.', 'error');
+        history.replaceState(null, '', window.location.pathname + window.location.hash);
+    } else if (query.get('youtube') === 'connected') {
+        showToast('YouTube channel connected', 'success');
+        history.replaceState(null, '', window.location.pathname + window.location.hash);
+    } else if (query.get('youtube') === 'error') {
+        showToast('YouTube connection failed. Check the Google app configuration and try again.', 'error');
+        history.replaceState(null, '', window.location.pathname + window.location.hash);
+    } else if (query.get('facebook') === 'connected') {
+        showToast('Facebook Page connected', 'success');
+        history.replaceState(null, '', window.location.pathname + window.location.hash);
+    } else if (query.get('facebook') === 'error') {
+        showToast('Facebook connection failed. Check the Meta app configuration and try again.', 'error');
+        history.replaceState(null, '', window.location.pathname + window.location.hash);
     }
 
     // Poll for status updates when articles are processing
     setInterval(() => {
+        if (document.hidden) return;
+
         const hasProcessing = articles.some(a =>
             ['summarizing', 'generating_video', 'generating_carousel'].includes(a.status)
         );
-        if (hasProcessing) {
+        const remotePublishingBusy = articles.some(article =>
+            Object.values(normalizedPlatformPosts(article)).some(post => platformPostIsPending(post.status))
+        );
+        if (hasProcessing || remotePublishingBusy) {
+            // The server owns provider status polling; the dashboard refreshes
+            // only while local generation or a selected platform is processing.
             fetchArticles();
         }
-
-        articles
-            .filter(article => ['INITIALIZING', 'UPLOADING', 'PROCESSING_UPLOAD', 'PROCESSING_DOWNLOAD'].includes(article.tiktok_publish_status))
-            .forEach(article => refreshTikTokPublishStatus(null, article.id, true));
     }, 5000);
+
+    setInterval(() => {
+        if (!document.hidden) loadGenerationBudget();
+    }, GENERATION_BUDGET_REFRESH_MS);
+
+    document.addEventListener('click', event => {
+        const budget = document.getElementById('generation-budget');
+        if (budget && !budget.contains(event.target)) closeGenerationBudget();
+    });
+
+    document.addEventListener('keydown', event => {
+        if (event.key === 'Escape') {
+            closeGenerationBudget();
+            closeShareModal();
+        }
+    });
+
+    document.addEventListener('visibilitychange', async () => {
+        if (document.hidden) {
+            stopDiscoveryPolling();
+            return;
+        }
+        if (Date.now() - generationBudgetLastLoadedAt > GENERATION_BUDGET_REFRESH_MS) {
+            loadGenerationBudget();
+        }
+        await fetchDiscoveryCandidates(true);
+        scheduleDiscoveryPoll({ reset: true });
+    });
 });

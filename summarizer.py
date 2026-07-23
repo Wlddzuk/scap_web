@@ -131,9 +131,11 @@ def parse_response(text: str) -> dict:
             'emotion': (s.get('emotion') or '').strip().lower() or None,
         })
 
-    # If video_script missing, reconstruct from scenes
+    # Scenes are the source of truth whenever present. This enforces the core
+    # summarizer -> renderer contract even when a provider returns a separate
+    # video_script with small wording or punctuation drift.
     video_script = (result.get('video_script') or '').strip()
-    if not video_script and normalized_scenes:
+    if normalized_scenes:
         video_script = ' '.join(s['speech'] for s in normalized_scenes)
 
     return {

@@ -87,6 +87,47 @@ class TikTokServiceTests(unittest.TestCase):
         self.assertEqual(second['headers']['Content-Range'], 'bytes 5-10/11')
         self.assertEqual(second['data'], b'56789A')
 
+    @patch('tiktok_service.requests.post')
+    def test_list_user_videos_requests_metric_fields_with_timeout(self, post):
+        post.return_value = FakeResponse(
+            {'data': {'videos': [{'id': 'video-1', 'view_count': 42}]}},
+        )
+
+        result = tiktok_service.list_user_videos('access-token', max_count=20)
+
+        self.assertEqual(result['videos'][0]['id'], 'video-1')
+        _, kwargs = post.call_args
+        self.assertEqual(kwargs['timeout'], 30)
+        self.assertEqual(kwargs['json'], {'max_count': 20})
+        self.assertIn('view_count', kwargs['params']['fields'])
+        self.assertIn('share_count', kwargs['params']['fields'])
+
+    @patch('tiktok_service.requests.get')
+    def test_query_user_stats_uses_stats_fields(self, get):
+        get.return_value = FakeResponse(
+            {'data': {'user': {'follower_count': 12, 'video_count': 3}}},
+        )
+
+        result = tiktok_service.query_user_stats('access-token')
+
+        self.assertEqual(result['follower_count'], 12)
+        _, kwargs = get.call_args
+        self.assertEqual(kwargs['timeout'], 30)
+        self.assertIn('likes_count', kwargs['params']['fields'])
+
+    @patch('tiktok_service.requests.post')
+    def test_publish_status_timeout_is_normalized(self, post):
+        post.side_effect = tiktok_service.requests.Timeout(
+            'connection detail that must stay in the exception chain'
+        )
+
+        with self.assertRaises(tiktok_service.TikTokAPIError) as caught:
+            tiktok_service.fetch_publish_status('access-token', 'publish-1')
+
+        self.assertEqual(caught.exception.code, 'network_error')
+        self.assertEqual(str(caught.exception), 'TikTok could not be reached')
+        self.assertIsInstance(caught.exception.__cause__, tiktok_service.requests.Timeout)
+
 
 if __name__ == '__main__':
     unittest.main()
