@@ -39,6 +39,9 @@ videos/
 node_modules/
 package-lock.json
 
+# Separate Cloudflare Workers project with its own git repo
+website/
+
 # Test files
 test_*.mp4
 test_*.wav
