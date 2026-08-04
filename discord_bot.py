@@ -63,7 +63,11 @@ from app import (
     scrape_url_content,
     start_tiktok_status_poller,
 )
-from models import Article
+from models import (
+    Article,
+    find_matching_hook_index,
+    valid_hook_index,
+)
 from summarizer import summarize_article
 from video_generator import generate_video
 from tts_preview import format_results_table, render_previews
@@ -175,12 +179,21 @@ async def process_article_url(
             article.bullets = json.dumps(result["bullets"])
             article.video_script = result["video_script"]
             article.hashtags = json.dumps(result.get("hashtags", []))
+            article.cover_line = result.get("cover_line") or None
+            article.cta_question = result.get("cta_question") or None
+            article.search_caption = result.get("search_caption") or None
+            article.series_lane = result.get("series_lane") or None
 
             # Engagement metadata (scene-based generation)
             scenes = result.get("scenes") or []
             article.scenes = json.dumps(scenes) if scenes else None
             hook_variants = result.get("hook_variants") or []
             article.hook_variants = json.dumps(hook_variants) if hook_variants else None
+            article.best_hook_index = valid_hook_index(
+                result.get("best_hook_index"),
+                hook_variants,
+            )
+            article.hook_index_used = None
             article.dominant_emotion = result.get("dominant_emotion") or None
             suggested = result.get("suggested_style")
             if suggested and suggested in VISUAL_STYLES:
@@ -196,6 +209,9 @@ async def process_article_url(
             article_scenes = scenes or None
             article_style = article.style
             article_emotion = article.dominant_emotion
+            article_cover_line = article.cover_line
+            article_series_lane = article.series_lane
+            article_hero_image = article.hero_image
 
         await progress_msg.edit(
             content=(
@@ -214,11 +230,18 @@ async def process_article_url(
                 scenes=article_scenes,
                 style_key=article_style,
                 emotion=article_emotion,
+                cover_line=article_cover_line,
+                series_lane=article_series_lane,
+                hero_image=article_hero_image,
             )
 
             article = db.session.get(Article, article_id)
             relative_path = os.path.basename(video_path)
             article.video_path = relative_path
+            article.hook_index_used = find_matching_hook_index(
+                hook_variants,
+                article_scenes or [],
+            )
             article.status = "video_done"
             article.video_generated_at = datetime.now(timezone.utc)
             db.session.commit()

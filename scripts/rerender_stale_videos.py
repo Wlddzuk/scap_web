@@ -25,7 +25,7 @@ os.chdir(ROOT)
 (ROOT / "instance").mkdir(parents=True, exist_ok=True)
 
 from app import app  # noqa: E402
-from models import Article, db  # noqa: E402
+from models import Article, db, find_matching_hook_index  # noqa: E402
 from video_generator import generate_video  # noqa: E402
 
 
@@ -114,6 +114,23 @@ def commit_replacement(
     size_mb = new_path.stat().st_size / (1024 * 1024)
     article.video_path = new_path.name
     article.video_generated_at = datetime.now(timezone.utc)
+    try:
+        hook_variants = (
+            json.loads(article.hook_variants)
+            if getattr(article, "hook_variants", None)
+            else []
+        )
+        scenes = (
+            json.loads(article.scenes)
+            if getattr(article, "scenes", None)
+            else []
+        )
+        article.hook_index_used = find_matching_hook_index(
+            hook_variants,
+            scenes,
+        )
+    except (TypeError, ValueError):
+        article.hook_index_used = None
     article.status = "video_done"
     db.session.commit()
 
@@ -138,7 +155,11 @@ def main() -> int:
     parser.add_argument("--article-id", type=int, action="append", dest="article_ids")
     parser.add_argument("--execute", action="store_true", help="perform renders; otherwise list only")
     parser.add_argument("--keep-old", action="store_true", help="keep superseded MP4 files")
-    parser.add_argument("--image-source", choices=("ai", "stock"), default="ai")
+    parser.add_argument(
+        "--image-source",
+        choices=("ai", "stock", "mixed"),
+        default="ai",
+    )
     parser.add_argument("--video-hook", choices=("env", "on", "off"), default="env")
     parser.add_argument("--max-size-mb", type=float, default=25.0)
     parser.add_argument("--ffmpeg-timeout", type=int, default=900)
@@ -183,6 +204,9 @@ def main() -> int:
                         style_key=article.style or None,
                         emotion=article.dominant_emotion,
                         use_video_hook=hook_setting(args.video_hook),
+                        cover_line=getattr(article, "cover_line", None),
+                        series_lane=getattr(article, "series_lane", None),
+                        hero_image=getattr(article, "hero_image", None),
                     )
                 ).resolve()
                 if os.path.commonpath([str(VIDEOS_DIR), str(new_path)]) != str(VIDEOS_DIR):

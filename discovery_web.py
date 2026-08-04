@@ -21,7 +21,7 @@ from pathlib import Path
 from threading import Lock, Thread
 from typing import Any, Iterator, Optional, TextIO
 
-from flask import Blueprint, current_app, jsonify
+from flask import Blueprint, current_app, jsonify, request
 
 try:  # fcntl is available on the Linux/macOS hosts Clipper supports.
     import fcntl
@@ -51,6 +51,12 @@ _SCRAPE_FAILURE_MESSAGES = {
         "summary was too short to use."
     ),
     "not_enough_text": "Scrape failed: the source did not contain enough readable text.",
+}
+_DISCOVERY_FAILURE_MESSAGES = {
+    "scoring_unavailable": (
+        "Stories were found, but the ranking service is temporarily unavailable. "
+        "Please try again."
+    ),
 }
 
 
@@ -254,6 +260,14 @@ def _public_candidate(candidate, rank: int) -> dict[str, Any]:
     return payload
 
 
+def _public_discovery_error(error: Exception) -> str:
+    """Map known discovery failures to safe, actionable browser copy."""
+    return _DISCOVERY_FAILURE_MESSAGES.get(
+        str(getattr(error, "error_code", "") or ""),
+        "Story discovery failed. Please try again.",
+    )
+
+
 def _run_discovery_worker(
     flask_app,
     owner: TextIO,
@@ -290,8 +304,9 @@ def _run_discovery_worker(
 
         _update_state(flask_app, complete)
         logger.info("Discovery completed with %d ranked candidates (%s)", len(candidates), trigger)
-    except Exception:
+    except Exception as error:
         logger.error("Discovery run failed", exc_info=True)
+        public_error = _public_discovery_error(error)
 
         def fail(state):
             if int(state.get("run_version") or 0) != run_version:
@@ -300,7 +315,7 @@ def _run_discovery_worker(
                 {
                     "status": "failed",
                     "running": False,
-                    "error": "Story discovery failed. Please try again.",
+                    "error": public_error,
                     "trigger": trigger,
                 }
             )
@@ -409,6 +424,7 @@ def _run_candidate_worker(
     candidate_id: str,
     candidate_payload: dict[str, Any],
     run_version: int,
+    color_intensity: str = "vivid",
 ) -> None:
     try:
         def mark_processing(state):
@@ -433,7 +449,10 @@ def _run_candidate_worker(
             score_reason=str(candidate_payload.get("score_reason") or ""),
             use_rss_fallback=candidate_payload.get("use_rss_fallback") is True,
         )
-        result = _process_candidate(candidate)
+        result = _process_candidate(
+            candidate,
+            color_intensity=color_intensity,
+        )
         final_status = str(result.get("status") or "failed")
         public_result = result
         if final_status == "failed":
@@ -483,7 +502,11 @@ def _run_candidate_worker(
         _release_file_lock(owner)
 
 
-def start_candidate_pipeline(flask_app, candidate_id: str) -> tuple[str, Optional[dict[str, Any]]]:
+def start_candidate_pipeline(
+    flask_app,
+    candidate_id: str,
+    color_intensity: str = "vivid",
+) -> tuple[str, Optional[dict[str, Any]]]:
     """Queue one shortlist candidate and guard against duplicate video jobs."""
     state = _read_state(flask_app)
     candidate = _find_candidate(state, candidate_id)
@@ -524,6 +547,7 @@ def start_candidate_pipeline(flask_app, candidate_id: str) -> tuple[str, Optiona
                 candidate_id,
                 dict(candidate),
                 run_version,
+                color_intensity,
             ),
             name=f"clipper-discovery-video-{candidate_id}",
             daemon=True,
@@ -656,9 +680,34 @@ def make_discovery_video_route(candidate_id: str):
     if len(candidate_id) != 16 or any(char not in "0123456789abcdef" for char in candidate_id):
         return jsonify({"error": "Story candidate not found"}), 404
 
+    payload = request.get_json(silent=True)
+    if payload is None:
+        payload = {}
+    elif not isinstance(payload, dict):
+        return jsonify({"error": "JSON body must be an object"}), 400
+
+    from video_generator import (
+        DEFAULT_COLOR_INTENSITY,
+        normalize_color_intensity,
+    )
+
+    raw_color_intensity = payload.get(
+        "color_intensity",
+        DEFAULT_COLOR_INTENSITY,
+    )
+    if (
+        not isinstance(raw_color_intensity, str)
+        or raw_color_intensity.strip().lower()
+        not in {"natural", "vivid", "electric"}
+    ):
+        return jsonify({"error": "Unknown color intensity"}), 400
+    color_intensity = normalize_color_intensity(raw_color_intensity)
+
     try:
         outcome, candidate = start_candidate_pipeline(
-            current_app._get_current_object(), candidate_id
+            current_app._get_current_object(),
+            candidate_id,
+            color_intensity,
         )
     except Exception:
         return jsonify({"error": "Video creation could not be started"}), 500

@@ -634,10 +634,78 @@ class TikTokRouteTests(unittest.TestCase):
         )
         self.assertIn('Set the TikTok account to Private', script)
 
-    def test_suggested_caption_matches_title_plus_hashtags(self):
+    def test_suggested_caption_orders_search_copy_cta_then_three_hashtags(self):
         with clipper_app.app.app_context():
             article = Article(
                 url='https://example.test/caption',
+                title='A new science result',
+                content='Body',
+                search_caption='How scientists found an ocean under Europa.',
+                cta_question='Would you explore this ocean?',
+                hashtags=json.dumps(['#Europa', '#Space', '#Astrobiology']),
+            )
+            self.assertEqual(
+                clipper_app.suggested_tiktok_caption(article),
+                (
+                    'How scientists found an ocean under Europa.\n\n'
+                    'Would you explore this ocean?\n\n'
+                    '#Europa #Space #Astrobiology'
+                ),
+            )
+
+    def test_suggested_caption_caps_legacy_or_imported_tags_at_three(self):
+        with clipper_app.app.app_context():
+            article = Article(
+                url='https://example.test/caption-extra-tags',
+                title='A new science result',
+                content='Body',
+                search_caption='How scientists found an ocean under Europa.',
+                cta_question='Would you explore this ocean?',
+                hashtags=json.dumps([
+                    '#Europa',
+                    '#Space',
+                    '#Astrobiology',
+                    '#Science',
+                    '#Discovery',
+                ]),
+            )
+            caption = clipper_app.suggested_tiktok_caption(article)
+
+            self.assertIn('#Europa #Space #Astrobiology', caption)
+            self.assertNotIn('#Science', caption)
+            self.assertNotIn('#Discovery', caption)
+
+    def test_suggested_caption_preserves_bounded_cta_and_hashtag_tail(self):
+        with clipper_app.app.app_context():
+            article = Article(
+                url='https://example.test/caption-bounds',
+                title='A new science result',
+                content='Body',
+                search_caption='S' * 400,
+                cta_question='Q' * 400,
+                hashtags=json.dumps([
+                    '#' + ('A' * 100),
+                    '#' + ('B' * 100),
+                    '#' + ('C' * 100),
+                    '#' + ('D' * 100),
+                ]),
+            )
+            caption = clipper_app.suggested_tiktok_caption(article)
+            sections = caption.split('\n\n')
+
+            self.assertEqual(len(sections), 3)
+            self.assertEqual(len(sections[0]), 220)
+            self.assertEqual(len(sections[1]), 220)
+            tags = sections[2].split()
+            self.assertEqual(len(tags), 3)
+            self.assertTrue(all(tag.startswith('#') for tag in tags))
+            self.assertTrue(all(len(tag) == 64 for tag in tags))
+            self.assertNotIn('D', sections[2])
+
+    def test_suggested_caption_falls_back_to_title_for_older_articles(self):
+        with clipper_app.app.app_context():
+            article = Article(
+                url='https://example.test/legacy-caption',
                 title='A new science result',
                 content='Body',
                 hashtags=json.dumps(['#science', '#space']),
@@ -655,7 +723,16 @@ class TikTokRouteTests(unittest.TestCase):
                 url='https://example.test/manual-only',
                 title='Manual publishing only',
                 content='Body',
-                video_script='A complete narration.',
+                video_script='The selected hook. A complete narration.',
+                scenes=json.dumps([
+                    {'speech': 'The selected hook.', 'visual': 'Opening image'},
+                    {'speech': 'A complete narration.', 'visual': 'Second image'},
+                ]),
+                hook_variants=json.dumps([
+                    'A different hook.',
+                    'The selected hook.',
+                    'A third hook.',
+                ]),
                 status='generating_video',
                 video_generation_token='manual-only-token',
             )
@@ -667,16 +744,21 @@ class TikTokRouteTests(unittest.TestCase):
             clipper_app,
             'generate_video',
             return_value=output_path,
-        ):
+        ) as generate:
             clipper_app.run_video_in_background(
                 clipper_app.app.app_context(),
                 article_id,
                 generation_token='manual-only-token',
             )
 
+        self.assertEqual(
+            generate.call_args.kwargs['voice_tone'],
+            'controlled',
+        )
         with clipper_app.app.app_context():
             saved = db.session.get(Article, article_id)
             self.assertEqual(saved.status, 'video_done')
+            self.assertEqual(saved.hook_index_used, 1)
             self.assertIsNone(saved.tiktok_publish_status)
             self.assertIsNone(saved.tiktok_publish_id)
             self.assertEqual(
@@ -1151,11 +1233,427 @@ class TikTokRouteTests(unittest.TestCase):
         self.assertEqual(response.status_code, 202)
         worker_args = thread_type.call_args.kwargs['args']
         generation_token = worker_args[-1]
+        self.assertEqual(worker_args[-2], 'controlled')
+        self.assertEqual(
+            thread_type.call_args.kwargs['kwargs']['color_intensity'],
+            'vivid',
+        )
         self.assertTrue(generation_token)
         with clipper_app.app.app_context():
             saved = db.session.get(Article, article_id)
             self.assertEqual(saved.status, 'generating_video')
             self.assertEqual(saved.video_generation_token, generation_token)
+
+    def test_video_route_forwards_selected_voice_tone(self):
+        with clipper_app.app.app_context():
+            article = Article(
+                url='https://example.test/video-tone',
+                title='Tone story',
+                content='Body',
+                video_script='A complete narration.',
+                status='summarized',
+            )
+            db.session.add(article)
+            db.session.commit()
+            article_id = article.id
+
+        with patch.object(clipper_app, 'Thread') as thread_type:
+            response = self.client.post(
+                f'/api/articles/{article_id}/video',
+                json={'voice_tone': 'documentary'},
+            )
+
+        self.assertEqual(response.status_code, 202)
+        worker_args = thread_type.call_args.kwargs['args']
+        self.assertEqual(worker_args[-2], 'documentary')
+
+    def test_video_route_forwards_color_without_persisting_before_render(self):
+        with clipper_app.app.app_context():
+            article = Article(
+                url='https://example.test/video-color',
+                title='Color story',
+                content='Body',
+                video_script='A complete narration.',
+                status='summarized',
+            )
+            db.session.add(article)
+            db.session.commit()
+            article_id = article.id
+
+        with patch.object(clipper_app, 'Thread') as thread_type:
+            response = self.client.post(
+                f'/api/articles/{article_id}/video',
+                json={'color_intensity': ' Electric '},
+            )
+
+        self.assertEqual(response.status_code, 202)
+        self.assertEqual(
+            thread_type.call_args.kwargs['kwargs']['color_intensity'],
+            'electric',
+        )
+        with clipper_app.app.app_context():
+            saved = db.session.get(Article, article_id)
+            self.assertEqual(saved.status, 'generating_video')
+            self.assertIsNone(saved.color_intensity)
+
+    def test_video_route_rejects_unknown_color_before_claiming_article(self):
+        with clipper_app.app.app_context():
+            article = Article(
+                url='https://example.test/video-bad-color',
+                title='Bad color story',
+                content='Body',
+                video_script='A complete narration.',
+                status='summarized',
+            )
+            db.session.add(article)
+            db.session.commit()
+            article_id = article.id
+
+        with patch.object(clipper_app, 'Thread') as thread_type:
+            response = self.client.post(
+                f'/api/articles/{article_id}/video',
+                json={'color_intensity': 'radioactive'},
+            )
+
+        self.assertEqual(response.status_code, 400)
+        self.assertEqual(response.get_json()['error'], 'Unknown color intensity')
+        thread_type.assert_not_called()
+        with clipper_app.app.app_context():
+            saved = db.session.get(Article, article_id)
+            self.assertEqual(saved.status, 'summarized')
+            self.assertIsNone(saved.video_generation_token)
+            self.assertIsNone(saved.color_intensity)
+
+    def test_video_worker_persists_color_only_after_successful_render(self):
+        handle, output_path = tempfile.mkstemp(suffix='.mp4', dir=TEST_DIR)
+        os.close(handle)
+        with clipper_app.app.app_context():
+            article = Article(
+                url='https://example.test/video-color-success',
+                title='Successful color story',
+                content='Body',
+                video_script='A complete narration.',
+                status='generating_video',
+                video_generation_token='color-success-token',
+                color_intensity='natural',
+            )
+            db.session.add(article)
+            db.session.commit()
+            article_id = article.id
+
+        with patch.object(
+            clipper_app,
+            'generate_video',
+            return_value=output_path,
+        ) as generate:
+            clipper_app.run_video_in_background(
+                clipper_app.app.app_context(),
+                article_id,
+                generation_token='color-success-token',
+                color_intensity='electric',
+            )
+
+        self.assertEqual(
+            generate.call_args.kwargs['color_intensity'],
+            'electric',
+        )
+        with clipper_app.app.app_context():
+            saved = db.session.get(Article, article_id)
+            self.assertEqual(saved.status, 'video_done')
+            self.assertEqual(saved.color_intensity, 'electric')
+
+    def test_video_worker_does_not_persist_color_when_render_fails(self):
+        with clipper_app.app.app_context():
+            article = Article(
+                url='https://example.test/video-color-failure',
+                title='Failed color story',
+                content='Body',
+                video_script='A complete narration.',
+                status='generating_video',
+                video_generation_token='color-failure-token',
+                color_intensity='natural',
+            )
+            db.session.add(article)
+            db.session.commit()
+            article_id = article.id
+
+        with patch.object(
+            clipper_app,
+            'generate_video',
+            side_effect=RuntimeError('render failed'),
+        ):
+            clipper_app.run_video_in_background(
+                clipper_app.app.app_context(),
+                article_id,
+                generation_token='color-failure-token',
+                color_intensity='electric',
+            )
+
+        with clipper_app.app.app_context():
+            saved = db.session.get(Article, article_id)
+            self.assertEqual(saved.status, 'failed')
+            self.assertEqual(saved.color_intensity, 'natural')
+
+    def test_video_route_rejects_unknown_voice_tone_before_claiming_article(self):
+        with clipper_app.app.app_context():
+            article = Article(
+                url='https://example.test/video-bad-tone',
+                title='Bad tone story',
+                content='Body',
+                video_script='A complete narration.',
+                status='summarized',
+            )
+            db.session.add(article)
+            db.session.commit()
+            article_id = article.id
+
+        response = self.client.post(
+            f'/api/articles/{article_id}/video',
+            json={'voice_tone': 'shouty'},
+        )
+
+        self.assertEqual(response.status_code, 400)
+        self.assertEqual(response.get_json()['error'], 'Unknown voice tone')
+        with clipper_app.app.app_context():
+            saved = db.session.get(Article, article_id)
+            self.assertEqual(saved.status, 'summarized')
+            self.assertIsNone(saved.video_generation_token)
+
+    def test_hook_route_rewrites_scene_one_and_rebuilds_script(self):
+        scenes = [
+            {
+                'speech': 'The original hook.',
+                'visual': 'A telescope rotates toward a red planet.',
+                'emotion': 'curious',
+            },
+            {
+                'speech': 'The original hook.',
+                'visual': 'A scientist checks the same result.',
+                'emotion': 'shocking',
+            },
+            {
+                'speech': 'The final consequence lands.',
+                'visual': 'The planet fills the frame.',
+                'emotion': 'curious',
+            },
+        ]
+        with clipper_app.app.app_context():
+            article = Article(
+                url='https://example.test/hook-selection',
+                title='Hook selection',
+                content='Body',
+                video_script='The original hook. The original hook. The final consequence lands.',
+                scenes=json.dumps(scenes),
+                hook_variants=json.dumps([
+                    'The original hook.',
+                    'This result changes where scientists look.',
+                    'A planet rewrote the search.',
+                ]),
+                best_hook_index=2,
+                hook_index_used=0,
+                status='video_done',
+                video_path='existing-video.mp4',
+            )
+            db.session.add(article)
+            db.session.commit()
+            article_id = article.id
+
+        response = self.client.post(
+            f'/api/articles/{article_id}/hook',
+            json={'hook_index': 1},
+        )
+
+        self.assertEqual(response.status_code, 200)
+        payload = response.get_json()
+        self.assertTrue(payload['requires_regeneration'])
+        self.assertIn('Regenerate the video', payload['message'])
+        self.assertEqual(payload['article']['best_hook_index'], 2)
+        # The existing MP4 still contains hook zero. Attribution advances only
+        # after a replacement render completes.
+        self.assertEqual(payload['article']['hook_index_used'], 0)
+        with clipper_app.app.app_context():
+            saved = db.session.get(Article, article_id)
+            saved_scenes = json.loads(saved.scenes)
+            self.assertEqual(
+                saved_scenes[0]['speech'],
+                'This result changes where scientists look.',
+            )
+            self.assertEqual(saved_scenes[0]['visual'], scenes[0]['visual'])
+            self.assertEqual(saved_scenes[0]['emotion'], scenes[0]['emotion'])
+            # The duplicate old hook in scene two must not be string-replaced.
+            self.assertEqual(saved_scenes[1], scenes[1])
+            self.assertEqual(
+                saved.video_script,
+                (
+                    'This result changes where scientists look. '
+                    'The original hook. The final consequence lands.'
+                ),
+            )
+            self.assertEqual(saved.hook_index_used, 0)
+            self.assertEqual(saved.video_path, 'existing-video.mp4')
+
+    def test_hook_route_accepts_zero_and_is_idempotent(self):
+        with clipper_app.app.app_context():
+            article = Article(
+                url='https://example.test/hook-zero',
+                title='Hook zero',
+                content='Body',
+                video_script='Hook zero. Rest of script.',
+                scenes=json.dumps([
+                    {'speech': 'Hook zero.', 'visual': 'First image'},
+                    {'speech': 'Rest of script.', 'visual': 'Second image'},
+                ]),
+                hook_variants=json.dumps(['Hook zero.', 'Hook one.', 'Hook two.']),
+                best_hook_index=0,
+                hook_index_used=0,
+                status='summarized',
+            )
+            db.session.add(article)
+            db.session.commit()
+            article_id = article.id
+
+        response = self.client.post(
+            f'/api/articles/{article_id}/hook',
+            json={'hook_index': 0},
+        )
+
+        self.assertEqual(response.status_code, 200)
+        self.assertFalse(response.get_json()['requires_regeneration'])
+        with clipper_app.app.app_context():
+            saved = db.session.get(Article, article_id)
+            self.assertEqual(saved.hook_index_used, 0)
+            self.assertEqual(saved.video_script, 'Hook zero. Rest of script.')
+
+    def test_hook_route_strictly_rejects_invalid_indexes_without_mutation(self):
+        with clipper_app.app.app_context():
+            article = Article(
+                url='https://example.test/hook-invalid-index',
+                title='Invalid hook',
+                content='Body',
+                video_script='Hook zero. Rest.',
+                scenes=json.dumps([
+                    {'speech': 'Hook zero.', 'visual': 'First image'},
+                    {'speech': 'Rest.', 'visual': 'Second image'},
+                ]),
+                hook_variants=json.dumps(['Hook zero.', 'Hook one.', 'Hook two.']),
+                hook_index_used=0,
+                status='summarized',
+            )
+            db.session.add(article)
+            db.session.commit()
+            article_id = article.id
+
+        invalid_payloads = [
+            {},
+            {'hook_index': True},
+            {'hook_index': '1'},
+            {'hook_index': 1.0},
+            {'hook_index': -1},
+            {'hook_index': 3},
+        ]
+        for payload in invalid_payloads:
+            with self.subTest(payload=payload):
+                response = self.client.post(
+                    f'/api/articles/{article_id}/hook',
+                    json=payload,
+                )
+                self.assertEqual(response.status_code, 400)
+
+        with clipper_app.app.app_context():
+            saved = db.session.get(Article, article_id)
+            self.assertEqual(saved.hook_index_used, 0)
+            self.assertEqual(saved.video_script, 'Hook zero. Rest.')
+            self.assertEqual(json.loads(saved.scenes)[0]['speech'], 'Hook zero.')
+
+    def test_hook_route_rejects_processing_or_incomplete_scene_data(self):
+        with clipper_app.app.app_context():
+            processing = Article(
+                url='https://example.test/hook-processing',
+                title='Processing hook',
+                content='Body',
+                video_script='Hook zero.',
+                scenes=json.dumps([{'speech': 'Hook zero.', 'visual': 'Image'}]),
+                hook_variants=json.dumps(['Hook zero.', 'Hook one.']),
+                status='generating_video',
+            )
+            incomplete = Article(
+                url='https://example.test/hook-incomplete',
+                title='Incomplete hook',
+                content='Body',
+                video_script='Hook zero.',
+                scenes=json.dumps([{'visual': 'Image without speech'}]),
+                hook_variants=json.dumps(['Hook zero.', 'Hook one.']),
+                status='summarized',
+            )
+            db.session.add_all([processing, incomplete])
+            db.session.commit()
+            processing_id = processing.id
+            incomplete_id = incomplete.id
+
+        processing_response = self.client.post(
+            f'/api/articles/{processing_id}/hook',
+            json={'hook_index': 1},
+        )
+        incomplete_response = self.client.post(
+            f'/api/articles/{incomplete_id}/hook',
+            json={'hook_index': 1},
+        )
+
+        self.assertEqual(processing_response.status_code, 409)
+        self.assertEqual(incomplete_response.status_code, 409)
+
+    def test_voice_preview_returns_wav_for_whitelisted_tone(self):
+        expected_audio = b'RIFF-test-wave-data'
+
+        def write_preview(_text, output_path, **_kwargs):
+            with open(output_path, 'wb') as audio_file:
+                audio_file.write(expected_audio)
+            return output_path
+
+        with patch.object(
+            clipper_app.tts_engine,
+            'synthesize',
+            side_effect=write_preview,
+        ) as synthesize:
+            response = self.client.post(
+                '/api/tts/preview',
+                json={'voice_tone': 'energetic'},
+            )
+
+        self.assertEqual(response.status_code, 200)
+        self.assertEqual(response.mimetype, 'audio/wav')
+        self.assertEqual(response.data, expected_audio)
+        self.assertEqual(
+            synthesize.call_args.kwargs['voice_tone'],
+            'energetic',
+        )
+
+    def test_voice_preview_rejects_unknown_tone_without_synthesis(self):
+        with patch.object(clipper_app.tts_engine, 'synthesize') as synthesize:
+            response = self.client.post(
+                '/api/tts/preview',
+                json={'voice_tone': 'maximum-hype'},
+            )
+
+        self.assertEqual(response.status_code, 400)
+        self.assertEqual(response.get_json()['error'], 'Unknown voice tone')
+        synthesize.assert_not_called()
+
+    def test_voice_preview_hides_provider_errors(self):
+        with patch.object(
+            clipper_app.tts_engine,
+            'synthesize',
+            side_effect=RuntimeError('provider-secret-detail'),
+        ):
+            response = self.client.post(
+                '/api/tts/preview',
+                json={'voice_tone': 'controlled'},
+            )
+
+        self.assertEqual(response.status_code, 503)
+        body = response.get_data(as_text=True)
+        self.assertNotIn('provider-secret-detail', body)
+        self.assertIn('Voice preview is unavailable', body)
 
     def test_stale_video_worker_cannot_overwrite_a_newer_retry(self):
         handle, stale_output = tempfile.mkstemp(suffix='.mp4', dir=TEST_DIR)

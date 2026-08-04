@@ -103,7 +103,76 @@ class DiscoveryRouteTests(unittest.TestCase):
 
         self.assertEqual(response.status_code, 202)
         self.assertTrue(response.get_json()["started"])
-        start.assert_called_once_with(self.app, "0123456789abcdef")
+        start.assert_called_once_with(self.app, "0123456789abcdef", "vivid")
+
+    def test_make_video_forwards_selected_color_intensity(self):
+        self._save_shortlist()
+        candidate = {"candidate_id": "0123456789abcdef", "title": "Story"}
+        with patch.object(
+            discovery_web,
+            "start_candidate_pipeline",
+            return_value=("started", candidate),
+        ) as start:
+            response = self.client.post(
+                "/api/discovery/candidates/0123456789abcdef/make-video",
+                json={"color_intensity": " Electric "},
+            )
+
+        self.assertEqual(response.status_code, 202)
+        start.assert_called_once_with(
+            self.app,
+            "0123456789abcdef",
+            "electric",
+        )
+
+    def test_make_video_rejects_unknown_color_intensity(self):
+        self._save_shortlist()
+        with patch.object(discovery_web, "start_candidate_pipeline") as start:
+            response = self.client.post(
+                "/api/discovery/candidates/0123456789abcdef/make-video",
+                json={"color_intensity": "radioactive"},
+            )
+
+        self.assertEqual(response.status_code, 400)
+        self.assertEqual(
+            response.get_json()["error"],
+            "Unknown color intensity",
+        )
+        start.assert_not_called()
+
+    def test_candidate_worker_threads_color_intensity_to_pipeline(self):
+        self._save_shortlist()
+
+        class FakeCandidate:
+            def __init__(self, **values):
+                self.__dict__.update(values)
+
+        fake_story_finder = types.ModuleType("story_finder")
+        fake_story_finder.StoryCandidate = FakeCandidate
+        process = unittest.mock.Mock(
+            return_value={"status": "video_done", "article_id": 44}
+        )
+        fake_story_finder._process_candidate = process
+        owner = discovery_web._try_file_lock(
+            self.app,
+            "candidate-worker-color",
+        )
+
+        with patch.dict(sys.modules, {"story_finder": fake_story_finder}):
+            discovery_web._run_candidate_worker(
+                self.app,
+                owner,
+                "0123456789abcdef",
+                discovery_web._read_state(self.app)["candidates"][0],
+                0,
+                "electric",
+            )
+
+        process.assert_called_once()
+        self.assertEqual(
+            process.call_args.kwargs["color_intensity"],
+            "electric",
+        )
 
     def test_make_video_rejects_unknown_or_malformed_candidate(self):
         malformed = self.client.post(
@@ -297,6 +366,14 @@ class DiscoveryFrontendTests(unittest.TestCase):
         self.assertIn("Math.min(discoveryPollDelayMs * 2, DISCOVERY_POLL_MAX_MS)", script)
         self.assertIn("if (document.hidden || !discoveryIsBusy()) return;", script)
         self.assertIn("if (document.hidden) {\n            stopDiscoveryPolling();", script)
+
+    def test_failed_ranking_is_visible_and_not_rendered_as_no_unseen_stories(self):
+        script = (PROJECT_ROOT / "static" / "app.js").read_text(encoding="utf-8")
+
+        self.assertIn("previousDiscoveryStatus === 'running' && data.status === 'failed'", script)
+        self.assertIn("const isFailed = discoveryState.status === 'failed';", script)
+        self.assertIn("discoveryState.error || 'Story discovery failed. Please try again.'", script)
+        self.assertIn("container.classList.toggle('hidden', !isComplete && !isFailed);", script)
 
     def test_empty_dashboard_renders_on_first_fetch_and_hidden_is_global(self):
         markup = (PROJECT_ROOT / "static" / "index.html").read_text(encoding="utf-8")

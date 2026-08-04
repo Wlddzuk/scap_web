@@ -1,4 +1,5 @@
 import importlib
+import json
 import os
 import shutil
 import tempfile
@@ -169,6 +170,157 @@ class DiscoveryPreflightTests(unittest.TestCase):
         self.assertEqual(result, [reachable])
 
 
+class DiscoveryScoringFallbackTests(unittest.TestCase):
+    def _candidates(self):
+        return [
+            story_finder.StoryCandidate(
+                title="First science story",
+                url="https://example.test/first",
+                source="ScienceDaily",
+                summary="A visual result with broad public appeal.",
+            ),
+            story_finder.StoryCandidate(
+                title="Second science story",
+                url="https://example.test/second",
+                source="Live Science",
+                summary="A useful but less surprising result.",
+            ),
+        ]
+
+    def test_groq_permission_failure_falls_back_to_openrouter(self):
+        openrouter_payload = json.dumps(
+            {
+                "scores": [
+                    {"id": 0, "score": 92, "reason": "Immediate visual payoff."},
+                    {"id": 1, "score": 71, "reason": "Clear but less surprising."},
+                ]
+            }
+        )
+        with patch.dict(
+            os.environ,
+            {
+                "GROQ_API_KEY": "test-groq",
+                "OPENROUTER_API_KEY": "test-openrouter",
+                "GEMINI_API_KEY": "test-gemini",
+            },
+        ), patch.object(
+            story_finder,
+            "_performance_examples",
+            return_value={"top_performers": [], "bottom_performers": []},
+        ), patch.object(
+            story_finder,
+            "_groq_scoring_content",
+            side_effect=forbidden_error(),
+        ) as groq, patch.object(
+            story_finder,
+            "_openrouter_scoring_content",
+            return_value=openrouter_payload,
+        ) as openrouter, patch.object(
+            story_finder,
+            "_gemini_scoring_content",
+        ) as gemini:
+            ranked = story_finder.score_candidates(self._candidates())
+
+        self.assertEqual([candidate.viral_score for candidate in ranked], [92.0, 71.0])
+        self.assertEqual(ranked[0].score_reason, "Immediate visual payoff.")
+        groq.assert_called_once()
+        openrouter.assert_called_once()
+        gemini.assert_not_called()
+
+    def test_all_provider_failures_raise_instead_of_becoming_empty_results(self):
+        with patch.dict(
+            os.environ,
+            {
+                "GROQ_API_KEY": "test-groq",
+                "OPENROUTER_API_KEY": "test-openrouter",
+                "GEMINI_API_KEY": "test-gemini",
+            },
+        ), patch.object(
+            story_finder,
+            "_performance_examples",
+            return_value={"top_performers": [], "bottom_performers": []},
+        ), patch.object(
+            story_finder,
+            "_groq_scoring_content",
+            side_effect=forbidden_error(),
+        ), patch.object(
+            story_finder,
+            "_openrouter_scoring_content",
+            side_effect=RuntimeError("provider unavailable"),
+        ), patch.object(
+            story_finder,
+            "_gemini_scoring_content",
+            side_effect=RuntimeError("provider unavailable"),
+        ):
+            with self.assertRaises(story_finder.StoryScoringError):
+                story_finder.score_candidates(self._candidates())
+
+    def test_a_genuinely_empty_feed_does_not_call_any_ranker(self):
+        with patch.object(story_finder, "_groq_scoring_content") as groq, patch.object(
+            story_finder,
+            "_openrouter_scoring_content",
+        ) as openrouter, patch.object(
+            story_finder,
+            "_gemini_scoring_content",
+        ) as gemini:
+            self.assertEqual(story_finder.score_candidates([]), [])
+
+        groq.assert_not_called()
+        openrouter.assert_not_called()
+        gemini.assert_not_called()
+
+    def test_gemini_scoring_uses_a_non_versioned_model_alias_by_default(self):
+        with patch.dict(os.environ, {"GEMINI_SCORING_MODEL": ""}):
+            self.assertEqual(
+                story_finder._gemini_scoring_model_name(),
+                "gemini-flash-latest",
+            )
+        with patch.dict(os.environ, {"GEMINI_SCORING_MODEL": "gemini-3.6-flash"}):
+            self.assertEqual(
+                story_finder._gemini_scoring_model_name(),
+                "gemini-3.6-flash",
+            )
+
+
+class DiscoveryWorkerScoringFailureTests(unittest.TestCase):
+    def setUp(self):
+        self.test_dir = tempfile.mkdtemp(prefix="clipper-discovery-scoring-")
+        self.state_path = os.path.join(self.test_dir, "discovery.json")
+        self.env = patch.dict(os.environ, {"DISCOVERY_STATE_PATH": self.state_path})
+        self.env.start()
+        self.app = Flask(__name__, instance_path=self.test_dir)
+
+    def tearDown(self):
+        self.env.stop()
+        shutil.rmtree(self.test_dir)
+
+    def test_scoring_failure_is_not_saved_as_successful_empty_scan(self):
+        def mark_running(state):
+            state.update({"status": "running", "run_version": 1, "candidates": []})
+
+        discovery_web._update_state(self.app, mark_running)
+        owner = discovery_web._try_file_lock(self.app, "scoring-worker-test")
+        self.assertIsNotNone(owner)
+
+        with patch.object(
+            story_finder,
+            "discover_and_score",
+            side_effect=story_finder.StoryScoringError("rankers unavailable"),
+        ):
+            discovery_web._run_discovery_worker(
+                self.app,
+                owner,
+                trigger="manual",
+                run_version=1,
+            )
+
+        state = discovery_web._read_state(self.app)
+        self.assertEqual(state["status"], "failed")
+        self.assertEqual(state["candidates"], [])
+        self.assertIn("Stories were found", state["error"])
+        self.assertIn("ranking service", state["error"])
+
+
 class DiscoveryScrapeFallbackTests(unittest.TestCase):
     def test_http_403_uses_long_rss_summary_without_retry(self):
         summary = "Researchers measured a surprising effect in a controlled study. " * 6
@@ -228,7 +380,13 @@ class DiscoveryScrapeFallbackTests(unittest.TestCase):
 
 
 class DiscoveryFailureStageTests(unittest.TestCase):
-    def _run_with_fake_article(self, *, summarize_side_effect=None, render_side_effect=None):
+    def _run_with_fake_article(
+        self,
+        *,
+        summarize_side_effect=None,
+        render_side_effect=None,
+        color_intensity="vivid",
+    ):
         candidate = story_finder.StoryCandidate(
             title="Pipeline story",
             url="https://example.test/story",
@@ -242,6 +400,8 @@ class DiscoveryFailureStageTests(unittest.TestCase):
             style=None,
             dominant_emotion=None,
             status="scraped",
+            color_intensity="natural",
+            viral_score=87.0,
         )
         article_type = MagicMock(return_value=article)
         article_type.query.filter_by.return_value.first.return_value = None
@@ -278,8 +438,15 @@ class DiscoveryFailureStageTests(unittest.TestCase):
             "generate_video",
             return_value="unused.mp4",
             side_effect=render_side_effect,
-        ):
-            return story_finder._process_candidate(candidate)
+        ) as generate:
+            result = story_finder._process_candidate(
+                candidate,
+                color_intensity=color_intensity,
+            )
+
+        self.last_article = article
+        self.last_generate = generate
+        return result
 
     def test_summarize_failure_is_classified_and_generic(self):
         result = self._run_with_fake_article(
@@ -320,6 +487,25 @@ class DiscoveryFailureStageTests(unittest.TestCase):
         self.assertEqual(result["failure_stage"], "render")
         self.assertEqual(result["pipeline_error"], "Video render failed: the video could not be created.")
         self.assertNotIn("ffmpeg", result["pipeline_error"])
+
+    def test_successful_discovery_render_forwards_and_persists_color(self):
+        result = self._run_with_fake_article(color_intensity="electric")
+
+        self.assertEqual(result["status"], "video_done")
+        self.assertEqual(
+            self.last_generate.call_args.kwargs["color_intensity"],
+            "electric",
+        )
+        self.assertEqual(self.last_article.color_intensity, "electric")
+
+    def test_failed_discovery_render_does_not_persist_requested_color(self):
+        result = self._run_with_fake_article(
+            color_intensity="electric",
+            render_side_effect=RuntimeError("render failed"),
+        )
+
+        self.assertEqual(result["status"], "failed")
+        self.assertEqual(self.last_article.color_intensity, "natural")
 
     def test_discovery_payload_allow_lists_stage_message(self):
         payload = discovery_web._public_pipeline_failure(

@@ -9,11 +9,14 @@ import json
 import logging
 import math
 import random
+import tempfile
 import threading
+from collections import Counter
 from datetime import datetime
 from pathlib import Path
 from io import BytesIO
 from concurrent.futures import ThreadPoolExecutor, as_completed
+from uuid import uuid4
 
 from groq import Groq
 import numpy as np
@@ -28,7 +31,7 @@ from moviepy.editor import (
     vfx,
 )
 from moviepy.audio.fx import all as afx
-from PIL import Image, ImageDraw, ImageFont
+from PIL import Image, ImageDraw, ImageEnhance, ImageFilter, ImageFont, ImageStat
 import requests
 from dotenv import load_dotenv
 import tts_engine
@@ -75,6 +78,19 @@ def _bounded_int_env(name: str, default: int, minimum: int, maximum: int) -> int
         return default
 
 
+def _bounded_float_env(
+    name: str,
+    default: float,
+    minimum: float,
+    maximum: float,
+) -> float:
+    """Read a bounded float setting without letting bad env values break startup."""
+    try:
+        return max(minimum, min(maximum, float(os.getenv(name, str(default)))))
+    except (TypeError, ValueError):
+        return default
+
+
 # This cap applies to every generated motion clip, including the hook. Keeping
 # the default at three holds the estimated motion spend below the work-order's
 # $0.60/video ceiling while still allowing two body scenes after a video hook.
@@ -87,6 +103,24 @@ FAL_VIDEO_TIMEOUT_SECONDS = _bounded_int_env(
 FAL_IMAGE_TIMEOUT_SECONDS = _bounded_int_env(
     "FAL_IMAGE_TIMEOUT_SECONDS", 120, 30, 900
 )
+FAL_IMAGE_MODEL = (
+    os.getenv("FAL_IMAGE_MODEL", "fal-ai/flux/schnell").strip()
+    or "fal-ai/flux/schnell"
+)
+FAL_IMAGE_STEPS = _bounded_int_env("FAL_IMAGE_STEPS", 4, 1, 100)
+FAL_HOOK_IMAGE_MODEL = (
+    os.getenv("FAL_HOOK_IMAGE_MODEL", "fal-ai/flux/dev").strip()
+    or "fal-ai/flux/dev"
+)
+# Official default-model prices checked at implementation time. portrait_16_9
+# is 576x1024 and therefore rounds up to one billed megapixel. Operators using
+# a different model can override each price without falsifying the budget UI.
+FAL_IMAGE_COST_USD = _bounded_float_env(
+    "FAL_IMAGE_COST_PER_MP_USD", 0.003, 0.0, 100.0
+)
+FAL_HOOK_IMAGE_COST_USD = _bounded_float_env(
+    "FAL_HOOK_IMAGE_COST_PER_MP_USD", 0.025, 0.0, 100.0
+)
 try:
     VIDEO_CLIP_ESTIMATED_COST_USD = max(
         0.0, float(os.getenv("VIDEO_CLIP_ESTIMATED_COST_USD", "0.18"))
@@ -94,8 +128,17 @@ try:
 except (TypeError, ValueError):
     VIDEO_CLIP_ESTIMATED_COST_USD = 0.18
 
-BASE_VIDEO_ESTIMATED_COST_USD = 0.05
-MAX_VIDEO_ESTIMATED_COST_USD = 0.60
+# The automatic Illustrated Science render uses one premium hook illustration,
+# one illustration for each of the first two scenes, and about ten cheap later
+# scenes. Each scene image is reused across its progressive teaching shots.
+# generate_video computes the exact plan before allowing optional motion.
+BASE_VIDEO_ESTIMATED_COST_USD = (
+    3 * FAL_HOOK_IMAGE_COST_USD
+    + 10 * FAL_IMAGE_COST_USD
+)
+MAX_VIDEO_ESTIMATED_COST_USD = _bounded_float_env(
+    "MAX_VIDEO_ESTIMATED_COST_USD", 0.60, 0.0, 1000.0
+)
 ABSOLUTE_MAX_VIDEO_CLIPS_PER_VIDEO = 3
 
 
@@ -128,12 +171,198 @@ NUM_BODY_IMAGES = 14
 # Parallel image generation workers
 MAX_IMAGE_WORKERS = 6
 
+# An archive image is treated as a scanned diagram when it is bimodal "ink on a
+# page": mostly near-white with very little mid-tone. Measured against real
+# sources -- the NASA Gemini schematic scores white 0.59 / mid 0.11, while photos
+# including a bright snowy landscape stay above mid 0.54.
+DOCUMENTARY_PAGE_WHITE_SHARE = float(
+    os.getenv("DOCUMENTARY_PAGE_WHITE_SHARE", "0.35") or 0.35
+)
+DOCUMENTARY_PAGE_MID_SHARE = float(
+    os.getenv("DOCUMENTARY_PAGE_MID_SHARE", "0.35") or 0.35
+)
+
 # Timing constraints
 MIN_CHUNK_DURATION = 1.2
 MAX_CHUNK_DURATION = 3.2
 DEFAULT_CHUNK_DURATION = 2.5
+MAX_SHOT_DURATION = 2.5
 DEFAULT_WORDS_PER_CHUNK = 4
 RETRY_ATTEMPTS = 2
+SHOT_TYPES = (
+    "macro close-up",
+    "wide establishing shot",
+    "human-scale perspective",
+    "detail with scale contrast",
+)
+SHOT_MOTIONS = ("push", "pan-left", "pan-right", "pull")
+
+# Color is graded once per still before MoviePy starts animating it. This keeps
+# the look deterministic across AI, stock, hero, and NASA imagery without
+# paying for a per-frame filter throughout a 60-second render.
+DEFAULT_COLOR_INTENSITY = "vivid"
+COLOR_INTENSITY_PRESETS = {
+    "natural": {
+        "label": "Natural",
+        "description": "True-to-life color with no added saturation or contrast.",
+        "saturation": 1.0,
+        "contrast": 1.0,
+        "prompt_guidance": (
+            "natural true-to-life color, neutral white balance, restrained "
+            "saturation, realistic highlights"
+        ),
+    },
+    "vivid": {
+        "label": "Vivid",
+        "description": "Richer color and crisp contrast while staying believable.",
+        "saturation": 1.30,
+        "contrast": 1.10,
+        "prompt_guidance": (
+            "vivid yet believable color, rich saturation, crisp contrast, "
+            "protected skin tones and highlights"
+        ),
+    },
+    "electric": {
+        "label": "Electric",
+        "description": "Extreme high-chroma cyan, magenta, blue, and red.",
+        "saturation": 1.72,
+        "contrast": 1.18,
+        "prompt_guidance": (
+            "electric high-chroma color, intense cyan, cobalt blue, hot "
+            "magenta and vivid red accents, deep blacks, luminous highlights "
+            "without clipping"
+        ),
+    },
+}
+
+
+def normalize_color_intensity(color_intensity: str | None) -> str:
+    """Return a stable color preset id, falling back to Vivid."""
+    key = str(color_intensity or DEFAULT_COLOR_INTENSITY).strip().lower()
+    if key not in COLOR_INTENSITY_PRESETS:
+        logger.warning(
+            "[Color] Unknown intensity %s; using %s",
+            color_intensity,
+            DEFAULT_COLOR_INTENSITY,
+        )
+        return DEFAULT_COLOR_INTENSITY
+    return key
+
+
+def color_intensity_options() -> list[dict[str, str]]:
+    """Return browser-safe preset metadata in display order."""
+    return [
+        {
+            "id": key,
+            "label": str(preset["label"]),
+            "description": str(preset["description"]),
+        }
+        for key, preset in COLOR_INTENSITY_PRESETS.items()
+    ]
+
+
+def color_intensity_prompt_guidance(color_intensity: str | None) -> str:
+    """Return deterministic palette guidance for still and motion prompts."""
+    key = normalize_color_intensity(color_intensity)
+    return str(COLOR_INTENSITY_PRESETS[key]["prompt_guidance"])
+
+
+def apply_color_intensity(
+    image: Image.Image,
+    color_intensity: str | None = DEFAULT_COLOR_INTENSITY,
+) -> Image.Image:
+    """Apply one preset to a still without introducing a frame-time filter.
+
+    Natural deliberately returns the exact source object. Vivid and Electric
+    use Pillow's luminance-aware color enhancement, followed by a modest
+    contrast curve. Saturation changes therefore preserve tonal detail better
+    than multiplying RGB channels and Electric remains visibly stronger than
+    Vivid without raising brightness or clipping highlights wholesale.
+    """
+    key = normalize_color_intensity(color_intensity)
+    if key == "natural" or not isinstance(image, Image.Image):
+        return image
+
+    alpha = image.getchannel("A") if image.mode == "RGBA" else None
+    source = image.convert("RGB")
+    preset = COLOR_INTENSITY_PRESETS[key]
+    graded = ImageEnhance.Color(source).enhance(float(preset["saturation"]))
+    graded = ImageEnhance.Contrast(graded).enhance(float(preset["contrast"]))
+    if alpha is not None:
+        graded = graded.convert("RGBA")
+        graded.putalpha(alpha)
+    return graded
+
+
+def apply_color_intensity_to_images(
+    images: list,
+    color_intensity: str | None = DEFAULT_COLOR_INTENSITY,
+) -> list:
+    """Grade a list of stills once while preserving its order."""
+    key = normalize_color_intensity(color_intensity)
+    return [apply_color_intensity(image, key) for image in images]
+
+
+def estimate_ai_still_cost(premium_images: int, body_images: int) -> float:
+    """Estimate FAL still spend for the configured premium/body split."""
+    premium = max(0, int(premium_images))
+    body = max(0, int(body_images))
+    return (
+        premium * FAL_HOOK_IMAGE_COST_USD
+        + body * FAL_IMAGE_COST_USD
+    )
+
+
+def estimate_planned_still_cost(
+    body_shots: list,
+    *,
+    use_scenes: bool,
+    image_source: str,
+    style_key: str | None = None,
+) -> float:
+    """Conservatively price the still fallbacks for one planned render.
+
+    A motion request can always fail back to four premium hook stills. Scene
+    and mixed-source renders can likewise fall back to AI in every body slot,
+    so real imagery is deliberately not deducted before those requests finish.
+    Legacy AI renders generate a fixed pool of cheap body images which is
+    reused across the shot plan.
+    """
+    source = str(image_source or "ai").strip().lower()
+    if use_scenes:
+        # Real-image searches are free, but any unique scene may need a
+        # premium, deliberately illustrated fallback. Price the worst case so
+        # optional motion can never silently push the render over budget.
+        unique_scene_ids = set()
+        for index, shot in enumerate(body_shots or []):
+            try:
+                scene_index = int((shot or {}).get("_scene_index", index))
+            except (TypeError, ValueError):
+                scene_index = index
+            unique_scene_ids.add(scene_index)
+        return estimate_ai_still_cost(len(unique_scene_ids), 0)
+    if source == "stock":
+        return 0.0
+
+    if not use_scenes and source == "ai":
+        return estimate_ai_still_cost(NUM_HOOK_IMAGES, NUM_BODY_IMAGES)
+
+    premium_body = 0
+    cheap_body = 0
+    for index, shot in enumerate(body_shots or []):
+        try:
+            scene_index = int((shot or {}).get("_scene_index", index))
+        except (TypeError, ValueError):
+            scene_index = index
+        if scene_index < 2:
+            premium_body += 1
+        else:
+            cheap_body += 1
+
+    return estimate_ai_still_cost(
+        NUM_HOOK_IMAGES + premium_body,
+        cheap_body,
+    )
 
 # Caption settings
 CAPTION_FONT_PATH = Path(__file__).resolve().parent / "static" / "fonts" / "Montserrat-Variable.ttf"
@@ -167,7 +396,13 @@ if not hasattr(Image, 'ANTIALIAS'):
     Image.ANTIALIAS = Image.Resampling.LANCZOS
 
 
-def generate_image_fal(prompt: str, retry_count: int = RETRY_ATTEMPTS) -> Image.Image:
+def generate_image_fal(
+    prompt: str,
+    retry_count: int = RETRY_ATTEMPTS,
+    *,
+    model: str | None = None,
+    num_inference_steps: int | None = FAL_IMAGE_STEPS,
+) -> Image.Image:
     """Generate image using FAL.ai FLUX model."""
     import fal_client
 
@@ -177,36 +412,64 @@ def generate_image_fal(prompt: str, retry_count: int = RETRY_ATTEMPTS) -> Image.
         return create_gradient_background()
 
     enhanced_prompt = (
-        f"{prompt}, vibrant bright colors, high contrast, eye-catching, "
-        f"clean composition, vertical 9:16, professional quality, no text no words"
+        f"{prompt}, clear high-contrast focal hierarchy, faithful to the requested "
+        f"medium and palette, clean composition, vertical 9:16, professional quality, "
+        f"no text no words"
     )
 
+    selected_model = model or FAL_IMAGE_MODEL
+    image_url = None
     for attempt in range(retry_count):
         try:
-            logger.info(f"[Image] Generating: {prompt[:40]}...")
+            arguments = {
+                "prompt": enhanced_prompt,
+                "image_size": "portrait_16_9",
+                "num_images": 1,
+            }
+            # FLUX dev's official default is 28. Hook callers deliberately pass
+            # None so the premium model is not accidentally reduced to 4 steps.
+            if num_inference_steps is not None:
+                arguments["num_inference_steps"] = num_inference_steps
+            logger.info(
+                "[Image] Generating via %s: %s...",
+                selected_model,
+                prompt[:40],
+            )
             result = fal_client.run(
-                "fal-ai/flux/schnell",
-                arguments={
-                    "prompt": enhanced_prompt,
-                    "image_size": "portrait_16_9",
-                    "num_images": 1,
-                    "num_inference_steps": 4
-                },
+                selected_model,
+                arguments=arguments,
                 timeout=FAL_IMAGE_TIMEOUT_SECONDS,
                 start_timeout=min(30, FAL_IMAGE_TIMEOUT_SECONDS),
             )
 
             if result and "images" in result and result["images"]:
-                image_url = result["images"][0]["url"]
+                image_url = result["images"][0].get("url")
+            if not image_url:
+                raise ValueError("FAL image response did not include a URL")
+            break
+
+        except Exception as e:
+            logger.info(f"[Image] Inference attempt {attempt + 1} failed: {e}")
+            if attempt + 1 < retry_count:
+                time.sleep(2)
+
+    if image_url:
+        # Once inference succeeds, never repeat the paid model call just because
+        # the provider CDN is briefly unavailable. Retry only the free download.
+        for attempt in range(retry_count):
+            try:
                 response = requests.get(image_url, timeout=30)
+                response.raise_for_status()
                 img = Image.open(BytesIO(response.content)).convert("RGB")
                 img = resize_and_crop_image(img, VIDEO_WIDTH, VIDEO_HEIGHT)
                 logger.info("[Image] Generated")
                 return img
-
-        except Exception as e:
-            logger.info(f"[Image] Attempt {attempt + 1} failed: {e}")
-            time.sleep(2)
+            except Exception as e:
+                logger.info(
+                    f"[Image] Download attempt {attempt + 1} failed: {e}"
+                )
+                if attempt + 1 < retry_count:
+                    time.sleep(2)
 
     logger.info("[Image] Failed, using gradient")
     return create_gradient_background()
@@ -310,6 +573,23 @@ def load_hook_video_clip(video_path: str, target_duration: float):
             clip = clip.crop(y1=y_center - new_h // 2, y2=y_center + new_h // 2)
 
     return clip.resize((VIDEO_WIDTH, VIDEO_HEIGHT))
+
+
+def split_motion_clip(clip, duration: float) -> list:
+    """Slice a motion clip into edit shots no longer than the pacing cap."""
+    durations = split_shot_duration(duration)
+    if len(durations) <= 1:
+        return [clip]
+
+    slices = []
+    start = 0.0
+    for shot_duration in durations:
+        end = min(duration, start + shot_duration)
+        slices.append(clip.subclip(start, end))
+        start = end
+    # Keep the original reader alive through render and close it during cleanup.
+    slices[0]._scap_parent_clip = clip
+    return slices
 
 
 def search_pexels_images(query: str, num_images: int, orientation: str = "portrait") -> list:
@@ -787,6 +1067,7 @@ def render_text_overlay(
     min_font_size: int,
     stroke_width: int,
     padding: int = 18,
+    max_lines: int | None = None,
 ) -> Image.Image:
     """Render centered white text with a black stroke onto a compact RGBA image."""
     text = clean_text(text)
@@ -797,19 +1078,98 @@ def render_text_overlay(
     chosen_font = None
     wrapped_text = text
     bbox = (0, 0, inner_width, font_size)
+    fitted = False
     for size in range(font_size, min_font_size - 1, -4):
         chosen_font = _load_caption_font(size)
-        wrapped_text = _wrap_text(draw, text, chosen_font, inner_width, stroke_width)
-        bbox = draw.multiline_textbbox(
+        candidate = _wrap_text(
+            draw,
+            text,
+            chosen_font,
+            inner_width,
+            stroke_width,
+        )
+        candidate_bbox = draw.multiline_textbbox(
             (0, 0),
-            wrapped_text,
+            candidate,
             font=chosen_font,
             spacing=8,
             align="center",
             stroke_width=stroke_width,
         )
-        if bbox[2] - bbox[0] <= inner_width:
+        if (
+            (not max_lines or len(candidate.splitlines()) <= max_lines)
+            and candidate_bbox[2] - candidate_bbox[0] <= inner_width
+        ):
+            wrapped_text = candidate
+            bbox = candidate_bbox
+            fitted = True
             break
+
+    # Only truncate after trying the full phrase at every allowed font size.
+    # This keeps ordinary 3--5 word cover lines intact while still enforcing
+    # the two-line ceiling for unusually long words.
+    if not fitted:
+        chosen_font = _load_caption_font(min_font_size)
+        words = text.split()
+        for kept_word_count in range(len(words) - 1, 0, -1):
+            shortened = " ".join(words[:kept_word_count]).rstrip(".,;:!?")
+            shortened += "…"
+            candidate = _wrap_text(
+                draw,
+                shortened,
+                chosen_font,
+                inner_width,
+                stroke_width,
+            )
+            candidate_bbox = draw.multiline_textbbox(
+                (0, 0),
+                candidate,
+                font=chosen_font,
+                spacing=8,
+                align="center",
+                stroke_width=stroke_width,
+            )
+            if (
+                (not max_lines or len(candidate.splitlines()) <= max_lines)
+                and candidate_bbox[2] - candidate_bbox[0] <= inner_width
+            ):
+                wrapped_text = candidate
+                bbox = candidate_bbox
+                fitted = True
+                break
+
+        # A single very wide word cannot be wrapped. Shorten it by characters
+        # instead of accepting an empty string, so the cover can never vanish.
+        if not fitted:
+            first_word = words[0] if words else text
+            for kept_character_count in range(len(first_word) - 1, 0, -1):
+                candidate = (
+                    first_word[:kept_character_count].rstrip(".,;:!?") + "…"
+                )
+                candidate_bbox = draw.multiline_textbbox(
+                    (0, 0),
+                    candidate,
+                    font=chosen_font,
+                    spacing=8,
+                    align="center",
+                    stroke_width=stroke_width,
+                )
+                if candidate_bbox[2] - candidate_bbox[0] <= inner_width:
+                    wrapped_text = candidate
+                    bbox = candidate_bbox
+                    fitted = True
+                    break
+
+        if not fitted:
+            wrapped_text = "…"
+            bbox = draw.multiline_textbbox(
+                (0, 0),
+                wrapped_text,
+                font=chosen_font,
+                spacing=8,
+                align="center",
+                stroke_width=stroke_width,
+            )
 
     image_width = int(min(max_width, max(1, math.ceil(bbox[2] - bbox[0] + (padding * 2)))))
     image_height = int(max(1, math.ceil(bbox[3] - bbox[1] + (padding * 2))))
@@ -1138,21 +1498,27 @@ def create_music_mix(
         return narration_audio, []
 
 
-def create_headline_clip(title: str, duration: float):
-    """Create the static article headline shown during the opening hook."""
-    headline = clean_text(title)
+def create_headline_clip(
+    title: str,
+    duration: float,
+    cover_line: str | None = None,
+):
+    """Create the short, high-impact cover line shown during the opening hook."""
+    headline = clean_text(cover_line or "")
+    if not headline:
+        headline = " ".join(clean_text(title).split()[:5])
+    headline = " ".join(headline.split()[:5]).upper()
     if not headline or duration <= 0:
         return None
-    if len(headline) > 140:
-        headline = headline[:137].rsplit(" ", 1)[0] + "..."
 
     image = render_text_overlay(
         headline,
-        max_width=VIDEO_WIDTH - (CAPTION_SIDE_MARGIN * 2),
-        font_size=76,
-        min_font_size=44,
-        stroke_width=7,
-        padding=22,
+        max_width=VIDEO_WIDTH - 80,
+        font_size=144,
+        min_font_size=96,
+        stroke_width=9,
+        padding=26,
+        max_lines=2,
     )
     return (
         ImageClip(np.array(image), transparent=True)
@@ -1279,7 +1645,13 @@ def generate_image_prompts(title: str, script: str, num_prompts: int, style: str
         return None
 
 
-def generate_themed_images(title: str, script: str, num_images: int = NUM_BODY_IMAGES, image_source: str = "ai") -> list:
+def generate_themed_images(
+    title: str,
+    script: str,
+    num_images: int = NUM_BODY_IMAGES,
+    image_source: str = "ai",
+    color_intensity: str = DEFAULT_COLOR_INTENSITY,
+) -> list:
     """Generate themed images for video body.
 
     Args:
@@ -1312,33 +1684,53 @@ def generate_themed_images(title: str, script: str, num_images: int = NUM_BODY_I
         logger.info("[Video] Using fallback prompts")
         keywords = subjects.get("visual_keywords", [title])
         setting = subjects.get("setting", "")
-        prompts = [f"{kw}, {setting}, {style}" for kw in (keywords * 5)[:num_images]]
+        repeats = max(1, math.ceil(num_images / max(1, len(keywords))))
+        prompts = [
+            f"{kw}, {setting}, {style}"
+            for kw in (keywords * repeats)[:num_images]
+        ]
 
-    # Parallel image generation
-    images = [None] * len(prompts)
-    with ThreadPoolExecutor(max_workers=MAX_IMAGE_WORKERS) as executor:
-        future_to_idx = {
-            executor.submit(generate_image_fal, prompt): i
-            for i, prompt in enumerate(prompts)
-        }
-        for future in as_completed(future_to_idx):
-            idx = future_to_idx[future]
-            try:
-                images[idx] = future.result()
-            except Exception as e:
-                logger.info(f"[Video] Image {idx+1} failed: {e}")
-                images[idx] = create_gradient_background()
-
-    logger.info(f"[Video] Generated {len(images)} images")
-    return images
+    color_guidance = color_intensity_prompt_guidance(color_intensity)
+    prompts = [
+        (
+            f"{prompt}, {SHOT_TYPES[index % len(SHOT_TYPES)]}, "
+            f"{color_guidance}"
+        )
+        for index, prompt in enumerate(prompts)
+    ]
+    logger.info(
+        "[Cost] Legacy body stills: premium=0 body=%d estimated=$%.3f",
+        len(prompts),
+        estimate_ai_still_cost(0, len(prompts)),
+    )
+    return _parallel_image_gen(prompts)
 
 
-def _parallel_image_gen(prompts: list) -> list:
+def _parallel_image_gen(
+    prompts: list,
+    *,
+    premium_flags: list[bool] | None = None,
+) -> list:
     """Generate N images in parallel. Returns list[PIL.Image] in prompt order."""
+    premium_flags = premium_flags or [False] * len(prompts)
     images = [None] * len(prompts)
+
+    def generate(index: int, prompt: str):
+        if index < len(premium_flags) and premium_flags[index]:
+            return generate_image_fal(
+                prompt,
+                model=FAL_HOOK_IMAGE_MODEL,
+                num_inference_steps=None,
+            )
+        return generate_image_fal(
+            prompt,
+            model=FAL_IMAGE_MODEL,
+            num_inference_steps=FAL_IMAGE_STEPS,
+        )
+
     with ThreadPoolExecutor(max_workers=MAX_IMAGE_WORKERS) as executor:
         future_to_idx = {
-            executor.submit(generate_image_fal, p): i
+            executor.submit(generate, i, p): i
             for i, p in enumerate(prompts)
         }
         for future in as_completed(future_to_idx):
@@ -1352,26 +1744,1097 @@ def _parallel_image_gen(prompts: list) -> list:
     return images
 
 
-def generate_scene_images(scenes: list, style_key: str, image_source: str = "ai") -> list:
-    """Generate one image per scene, style applied consistently.
+def generate_scene_images(
+    shots: list,
+    style_key: str,
+    image_source: str = "ai",
+    *,
+    series_lane: str | None = None,
+    hero_image: str | None = None,
+    color_intensity: str = DEFAULT_COLOR_INTENSITY,
+    visual_sources_out: list | None = None,
+) -> list:
+    """Generate one image per timed shot, preserving narrative order.
 
-    Stock mode queries Pexels with each scene's visual description instead of
-    generating with FAL, so cheap test runs stay scene-aligned too.
+    Legacy ``mixed`` mode may use a real article hero. Topic/category metadata
+    never decides sourcing; scene-based renders use referent facts above.
     """
+    # New scene records describe observable referent facts.  Once present,
+    # those facts—not topic, style, or series_lane—own visual sourcing.
+    if shots and any("referent" in (shot or {}) for shot in shots):
+        return generate_referent_scene_images(
+            shots,
+            color_intensity=color_intensity,
+            visual_sources_out=visual_sources_out,
+            hero_image=hero_image,
+        )
+
     if image_source == "stock":
-        logger.info(f"[Video] Fetching {len(scenes)} scene-aligned stock photos...")
+        logger.info(f"[Video] Fetching {len(shots)} shot-aligned stock photos...")
         images = []
-        for scene in scenes:
-            query = " ".join((scene.get("visual") or scene.get("speech") or "").split()[:6])
-            found = search_pexels_images(query or "science", 1)
-            images.append(found[0] if found else create_gradient_background())
+        query_offsets = {}
+        for index, shot in enumerate(shots):
+            base_query = " ".join(
+                (shot.get("visual") or shot.get("speech") or "").split()[:6]
+            )
+            base_query = base_query or "science"
+            shot_type = (
+                shot.get("_shot_type")
+                or SHOT_TYPES[index % len(SHOT_TYPES)]
+            )
+            offset = query_offsets.get(base_query.casefold(), 0)
+            query_offsets[base_query.casefold()] = offset + 1
+            found = search_pexels_images(
+                f"{base_query} {shot_type}",
+                min(len(SHOT_TYPES), offset + 1),
+            )
+            images.append(
+                found[offset % len(found)]
+                if found
+                else create_gradient_background()
+            )
         return images
 
     from visual_styles import apply_style
 
-    prompts = [apply_style(s.get("visual", ""), style_key, is_hook=False) for s in scenes]
-    logger.info(f"[Video] Generating {len(prompts)} scene images in style '{style_key}'...")
-    return _parallel_image_gen(prompts)
+    prompts = []
+    premium_flags = []
+    color_guidance = color_intensity_prompt_guidance(color_intensity)
+    for index, shot in enumerate(shots):
+        shot_type = shot.get("_shot_type") or SHOT_TYPES[index % len(SHOT_TYPES)]
+        visual = shot.get("visual") or shot.get("speech") or "science discovery"
+        prompts.append(
+            apply_style(
+                f"{visual}, {shot_type}, {color_guidance}",
+                style_key,
+                is_hook=False,
+            )
+        )
+        premium_flags.append(int(shot.get("_scene_index", index)) < 2)
+
+    logger.info(
+        "[Video] Generating %d shot images in style '%s' (source=%s)...",
+        len(prompts),
+        style_key,
+        image_source,
+    )
+    if image_source != "mixed":
+        if style_key == "illustrated_science":
+            unique_positions = []
+            scene_to_unique = {}
+            slot_to_unique = []
+            for index, shot in enumerate(shots):
+                try:
+                    scene_index = int(shot.get("_scene_index", index))
+                except (TypeError, ValueError):
+                    scene_index = index
+                if scene_index not in scene_to_unique:
+                    scene_to_unique[scene_index] = len(unique_positions)
+                    unique_positions.append(index)
+                slot_to_unique.append(scene_to_unique[scene_index])
+            unique_prompts = [prompts[index] for index in unique_positions]
+            unique_premium = [premium_flags[index] for index in unique_positions]
+            premium_count = sum(unique_premium)
+            body_count = len(unique_premium) - premium_count
+            logger.info(
+                "[Cost] Illustrated scenes: premium=%d body=%d reused_slots=%d estimated=$%.3f",
+                premium_count,
+                body_count,
+                len(shots) - len(unique_positions),
+                estimate_ai_still_cost(premium_count, body_count),
+            )
+            unique_images = _parallel_image_gen(
+                unique_prompts,
+                premium_flags=unique_premium,
+            )
+            return [unique_images[unique_index] for unique_index in slot_to_unique]
+        premium_count = sum(premium_flags)
+        body_count = len(premium_flags) - premium_count
+        logger.info(
+            "[Cost] Body stills: premium=%d body=%d real=0 estimated=$%.3f",
+            premium_count,
+            body_count,
+            estimate_ai_still_cost(premium_count, body_count),
+        )
+        return _parallel_image_gen(prompts, premium_flags=premium_flags)
+
+    from real_imagery import fetch_hero_image
+
+    desired_sources = ["ai"] * len(shots)
+    if hero_image and shots:
+        desired_sources[0] = "hero"
+
+    images = [None] * len(shots)
+    actual_sources = ["ai"] * len(shots)
+    def generate_slot(index: int):
+        source = desired_sources[index]
+        image = None
+        if source == "hero":
+            image = fetch_hero_image(
+                hero_image,
+                resize_fn=resize_and_crop_image,
+                target_width=VIDEO_WIDTH,
+                target_height=VIDEO_HEIGHT,
+            )
+        if image is not None:
+            return image, source
+
+        if premium_flags[index]:
+            image = generate_image_fal(
+                prompts[index],
+                model=FAL_HOOK_IMAGE_MODEL,
+                num_inference_steps=None,
+            )
+        else:
+            image = generate_image_fal(
+                prompts[index],
+                model=FAL_IMAGE_MODEL,
+                num_inference_steps=FAL_IMAGE_STEPS,
+            )
+        return image, "ai"
+
+    with ThreadPoolExecutor(max_workers=MAX_IMAGE_WORKERS) as executor:
+        future_to_idx = {
+            executor.submit(generate_slot, index): index
+            for index in range(len(shots))
+        }
+        for future in as_completed(future_to_idx):
+            index = future_to_idx[future]
+            try:
+                images[index], actual_sources[index] = future.result()
+            except Exception as exc:
+                logger.info(
+                    "[Video] Mixed image %d failed after fallback: %s",
+                    index + 1,
+                    exc,
+                )
+                images[index] = create_gradient_background()
+
+    logger.info(
+        "[Video] Mixed imagery used hero=%d NASA=%d AI=%d",
+        actual_sources.count("hero"),
+        actual_sources.count("nasa"),
+        actual_sources.count("ai"),
+    )
+    premium_ai = sum(
+        source == "ai" and premium_flags[index]
+        for index, source in enumerate(actual_sources)
+    )
+    body_ai = sum(
+        source == "ai" and not premium_flags[index]
+        for index, source in enumerate(actual_sources)
+    )
+    real_count = len(actual_sources) - premium_ai - body_ai
+    logger.info(
+        "[Cost] Body stills: premium=%d body=%d real=%d estimated=$%.3f",
+        premium_ai,
+        body_ai,
+        real_count,
+        estimate_ai_still_cost(premium_ai, body_ai),
+    )
+    return images
+
+
+def _credit_photo(image: Image.Image, source) -> Image.Image:
+    """Burn a compact credit for any licence that requires attribution."""
+    from real_imagery import _is_public_domain
+
+    if _is_public_domain(source.license):
+        return image
+    result = image.convert("RGB").copy()
+    draw = ImageDraw.Draw(result, "RGBA")
+    credit = "Image: " + " · ".join(
+        part for part in (source.author, source.license, source.source_name) if part
+    )
+    font = _load_caption_font(24)
+    max_width = VIDEO_WIDTH - 140
+    while draw.textbbox((0, 0), credit, font=font)[2] > max_width and len(credit) > 24:
+        credit = credit[:-2].rstrip() + "…"
+    box = draw.textbbox((0, 0), credit, font=font)
+    width = box[2] - box[0]
+    # Sit below the caption safe area rather than at the top, where the credit
+    # was landing directly on the hook line and stealing the opening frame.
+    top = VIDEO_HEIGHT - 96
+    draw.rounded_rectangle(
+        (VIDEO_WIDTH - width - 82, top, VIDEO_WIDTH - 52, top + 52),
+        radius=18,
+        fill=(8, 18, 27, 190),
+    )
+    draw.text(
+        (VIDEO_WIDTH - width - 67, top + 10),
+        credit,
+        font=font,
+        fill=(255, 255, 255, 225),
+    )
+    return result
+
+
+def _schematic_prompt(
+    scene: dict,
+    color_intensity: str,
+    article_title: str = "",
+) -> str:
+    visual = str(scene.get("visual") or scene.get("speech") or "science concept")
+    evidence_query = str(scene.get("evidence_query") or "").strip()
+    return (
+        f"Premium flat editorial science illustration for the story '{article_title}'. "
+        f"The exact discovery or evidence to keep central is '{evidence_query}'. "
+        f"Clearly communicate {visual}. Show the discovered thing or measured effect, "
+        "not merely the city, institution, building, or broad setting where it happened. "
+        "Warm off-white field, cobalt blue "
+        "shapes, restrained yellow highlight and red only for emphasis, simple geometric "
+        "silhouettes, intentionally illustrated, vertical 9:16. Show a recognizable focal "
+        "subject, not an empty composition or a lone abstract shape. No unrelated animals, "
+        "gods, or objects. No photorealism, no human "
+        "hands, no faces, no crowds, no signatures, no watermarks, no words, no letters, "
+        "no labels, no cutaway, no cross-section, no microscopy, no measurement scale. "
+        f"{color_intensity_prompt_guidance(color_intensity)}"
+    )
+
+
+def _symbolic_prompt(
+    scene: dict,
+    color_intensity: str,
+    article_title: str = "",
+) -> str:
+    """Prompt for scenes that must not depict structure.
+
+    Used for abstract subjects and for precise claims about things nobody has
+    photographed. ``_schematic_prompt`` says "schematic of X", which invites the
+    model to invent a diagram -- that is how an earlier render produced a whisker
+    follicle that looked like a plant root. This asks for mood and metaphor
+    instead, so the frame carries the narration without asserting a fact.
+    """
+    narration = str(scene.get("speech") or "discovery")
+    visual_reference = str(scene.get("visual") or narration)
+    evidence_query = str(scene.get("evidence_query") or "").strip()
+    return (
+        f"Premium editorial science illustration for the story '{article_title}'. "
+        f"The narration is: {narration}. Use this only as safe visual inspiration: "
+        f"{visual_reference}. The exact discovery or evidence to keep central is "
+        f"'{evidence_query}'. Show that finding, result, specimen, or mechanism rather "
+        "than merely the city, institution, building, or broad setting. Show a clear, "
+        "recognizable focal subject explicitly named "
+        "in the story or scene, using lighting, pose, scale, or environment to communicate "
+        "the idea. Never substitute an unrelated animal, deity, organ, machine, or object. "
+        "Do not output an empty composition, decorative-only geometry, or one lone abstract "
+        "shape. Warm off-white field, cobalt blue and restrained yellow, clean editorial "
+        "collage, intentionally illustrated, vertical 9:16. Symbolic and atmospheric only; "
+        "do not assert hidden structure. No technical diagram, no anatomy, no cutaway, no "
+        "cross-section, no microscopy, no measurement scale, no photorealism, no human "
+        "hands, no human faces, no crowds, no signatures, no watermarks, no words, no "
+        "letters, no labels. "
+        f"{color_intensity_prompt_guidance(color_intensity)}"
+    )
+
+
+def _documentary_photo_variant(
+    image: Image.Image,
+    shot: dict,
+    variant_index: int,
+) -> Image.Image:
+    """Create a distinct editorial crop without inventing visual evidence."""
+    source = resize_and_crop_image(image.convert("RGB"), VIDEO_WIDTH, VIDEO_HEIGHT)
+    shot_type = str((shot or {}).get("_shot_type") or "").casefold()
+    if "macro" in shot_type:
+        scale = 1.18
+    elif "close" in shot_type:
+        scale = 1.12
+    elif "wide" in shot_type:
+        scale = 1.035
+    else:
+        scale = 1.075 + (0.015 * (variant_index % 3))
+
+    width = max(VIDEO_WIDTH, int(round(VIDEO_WIDTH * scale)))
+    height = max(VIDEO_HEIGHT, int(round(VIDEO_HEIGHT * scale)))
+    enlarged = source.resize((width, height), Image.Resampling.LANCZOS)
+    max_x = max(0, width - VIDEO_WIDTH)
+    max_y = max(0, height - VIDEO_HEIGHT)
+    anchors = (
+        (0.50, 0.42),
+        (0.18, 0.30),
+        (0.82, 0.34),
+        (0.30, 0.72),
+        (0.70, 0.68),
+    )
+    anchor_x, anchor_y = anchors[variant_index % len(anchors)]
+    left = int(round(max_x * anchor_x))
+    top = int(round(max_y * anchor_y))
+    edited = enlarged.crop((left, top, left + VIDEO_WIDTH, top + VIDEO_HEIGHT))
+    edited = ImageEnhance.Contrast(edited).enhance(1.06)
+    edited = ImageEnhance.Color(edited).enhance(1.04)
+
+    # A restrained cinematic grade keeps captions readable while preserving
+    # the photograph as the visual—not a card, diagram, or generated scene.
+    rgba = edited.convert("RGBA")
+    overlay = Image.new("RGBA", rgba.size, (0, 0, 0, 0))
+    draw = ImageDraw.Draw(overlay)
+    draw.rectangle((0, 0, VIDEO_WIDTH, 250), fill=(7, 12, 25, 38))
+    draw.rectangle((0, 1450, VIDEO_WIDTH, VIDEO_HEIGHT), fill=(7, 12, 25, 54))
+    return Image.alpha_composite(rgba, overlay).convert("RGB")
+
+
+def _documentary_frame_image(
+    image: Image.Image,
+    target_width: int,
+    target_height: int,
+) -> Image.Image:
+    """Keep the photographed evidence visible in a polished vertical frame.
+
+    Archive and museum photographs are commonly landscape, square, or place
+    the subject away from the centre. A destructive 9:16 crop can therefore
+    turn a valid source into an apparently empty frame. Close-to-vertical
+    sources remain full bleed; other aspect ratios are shown intact over a
+    restrained, blurred extension of the same photograph.
+    """
+    source = image.convert("RGB")
+    source_ratio = source.width / max(1, source.height)
+    target_ratio = target_width / max(1, target_height)
+    if abs(source_ratio - target_ratio) <= 0.08:
+        return resize_and_crop_image(source, target_width, target_height)
+
+    # A moderately wide source is better cropped than pillarboxed: the blurred
+    # extension reads as letterboxing on a phone even though it is not black.
+    # Only genuinely wide or tall sources get the blurred surround.
+    if 0.62 <= source_ratio / max(0.01, target_ratio) <= 1.9:
+        return resize_and_crop_image(source, target_width, target_height)
+
+    background = resize_and_crop_image(source, target_width, target_height)
+    background = background.filter(
+        ImageFilter.GaussianBlur(radius=max(18, target_width // 28))
+    )
+    background = ImageEnhance.Brightness(background).enhance(0.66)
+    background = ImageEnhance.Color(background).enhance(0.82)
+
+    foreground = source.copy()
+    foreground.thumbnail(
+        (target_width, int(round(target_height * 0.9))),
+        Image.Resampling.LANCZOS,
+    )
+    x = (target_width - foreground.width) // 2
+    y = int(round((target_height - foreground.height) * 0.43))
+
+    framed = background.convert("RGBA")
+    shadow = Image.new("RGBA", framed.size, (0, 0, 0, 0))
+    shadow_box = Image.new(
+        "RGBA",
+        (foreground.width + 34, foreground.height + 34),
+        (0, 0, 0, 150),
+    ).filter(ImageFilter.GaussianBlur(18))
+    shadow.alpha_composite(shadow_box, (x - 17, y - 8))
+    framed = Image.alpha_composite(framed, shadow)
+    framed.alpha_composite(foreground.convert("RGBA"), (x, y))
+    return framed.convert("RGB")
+
+
+def _documentary_page_tones(image: Image.Image) -> tuple[float, float]:
+    """Return the near-white share and mid-tone share of an image."""
+    sample = image.convert("L")
+    sample.thumbnail((640, 640), Image.Resampling.BILINEAR)
+    histogram = sample.histogram()
+    total = max(1, sum(histogram))
+    return sum(histogram[220:]) / total, sum(histogram[80:220]) / total
+
+
+def _documentary_is_diagram_scan(image: Image.Image) -> bool:
+    """Detect a scanned schematic or labelled line diagram.
+
+    Ink on a white page is strongly bimodal: a large near-white ground, dark
+    strokes, and very little mid-tone. Photographs -- even bright ones like snow
+    or a pale specimen background -- keep most of their pixels in the mid range.
+    Measured tones rather than edge density, because edge density cannot tell a
+    labelled schematic from a detailed photograph of foliage or a crowd.
+
+    These frames are worth rejecting on their own terms: a viewer reads none of
+    the 6pt labels in three seconds on a phone, and the printed text collides
+    with the burned-in captions.
+    """
+    white_share, mid_share = _documentary_page_tones(image)
+    return (
+        white_share >= DOCUMENTARY_PAGE_WHITE_SHARE
+        and mid_share <= DOCUMENTARY_PAGE_MID_SHARE
+    )
+
+
+def _documentary_image_is_usable(image: Image.Image) -> bool:
+    """Reject empty frames and unreadable scanned diagrams."""
+    sample = image.convert("L")
+    sample.thumbnail((96, 96), Image.Resampling.BILINEAR)
+    contrast = float(ImageStat.Stat(sample).stddev[0])
+    edges = sample.filter(ImageFilter.FIND_EDGES)
+    if edges.width > 4 and edges.height > 4:
+        edges = edges.crop((2, 2, edges.width - 2, edges.height - 2))
+    edge_energy = float(ImageStat.Stat(edges).mean[0])
+    if not (contrast >= 20.0 or edge_energy >= 5.0):
+        return False
+    return not _documentary_is_diagram_scan(image)
+
+
+_DOCUMENTARY_QUERY_STOPWORDS = frozenset({
+    "ancient", "artwork", "close", "diagram", "egyptian", "for", "full", "image",
+    "launch", "manuscript", "moon", "night", "photo", "photograph", "relief",
+    "scene", "sky", "space", "temple", "the", "this", "view", "which", "wide",
+})
+
+_WEAK_EVIDENCE_TERMS = frozenset({
+    "better", "changed", "changes", "different", "discovery", "effect", "finding",
+    "found", "future", "important", "inside", "mystery", "new", "random", "research",
+    "result", "results", "scientists", "study", "surprising", "unknown", "why",
+})
+
+
+def _scene_visual_role(scene: dict) -> str:
+    role = str((scene or {}).get("visual_role") or "").strip().casefold()
+    if role in {"discovery", "evidence", "mechanism", "context"}:
+        return role
+    # Older saved scenes predate visual_role. Recognize obvious location-only
+    # queries so they remain confined to their one context beat.
+    referent_tokens = _expanded_reference_tokens(
+        str((scene or {}).get("referent_query") or "")
+    )
+    if referent_tokens & {
+        "building", "campus", "city", "institute", "laboratory", "university",
+    }:
+        return "context"
+    return "discovery"
+
+
+def _useful_evidence_query(value: str) -> str:
+    words = [
+        word
+        for word in re.findall(r"[A-Za-z0-9][A-Za-z0-9-]*", str(value or ""))
+        if len(word) >= 2
+    ][:8]
+    meaningful = [
+        word for word in words
+        if word.casefold() not in _DOCUMENTARY_QUERY_STOPWORDS
+        and word.casefold() not in _WEAK_EVIDENCE_TERMS
+        and word.casefold() not in {"their", "this", "that", "with", "from", "into", "over"}
+    ]
+    if not meaningful:
+        return ""
+    # A single exact scientific identifier (DNA, FGF21, K2-18b) is useful;
+    # a lone generic word is not.
+    if len(meaningful) == 1 and not (
+        any(char.isdigit() for char in meaningful[0])
+        or meaningful[0].isupper()
+        or "-" in meaningful[0]
+    ):
+        return ""
+    return " ".join(words).strip()
+
+
+def _scene_evidence_query(scene: dict, article_title: str = "") -> str:
+    """Return the discovery-first query used for search and generation.
+
+    New summaries provide ``evidence_query`` directly. The fallbacks keep older
+    saved articles renderable while preferring the actual result over a location.
+    """
+    scene = scene if isinstance(scene, dict) else {}
+    for value in (
+        scene.get("evidence_query"),
+        scene.get("graphic_payload"),
+        scene.get("focus_label"),
+        scene.get("referent_query"),
+    ):
+        query = _useful_evidence_query(str(value or ""))
+        if query:
+            return query
+
+    # Last resort for old scene JSON: combine a compact title subject with the
+    # concrete on-screen description. This guides illustration generation but is
+    # intentionally not allowed to degrade into a city-only query.
+    title_words = re.findall(r"[A-Za-z0-9][A-Za-z0-9-]*", str(article_title or ""))[:4]
+    visual_words = re.findall(
+        r"[A-Za-z0-9][A-Za-z0-9-]*",
+        str(scene.get("visual") or scene.get("speech") or ""),
+    )
+    combined = " ".join((*title_words, *visual_words[:4]))
+    return _useful_evidence_query(combined)
+
+
+def _documentary_proper_terms(*parts: str) -> list[str]:
+    """Return genuinely proper nouns from the given text segments.
+
+    A capitalised word that merely opens a sentence is not a proper noun.
+    Treating it as one produced anchors like "Individual", "Millions" and
+    "Cooperation", which then anchored two-word searches -- "Individual bundle"
+    -- that kept none of the subject. An archive answered that literally and a
+    story about cells bundling together got a photo of plastic bags.
+
+    Each part is scanned separately so a title running into a sentence cannot
+    hide the fact that a word is sitting in first position.
+    """
+    terms: list[str] = []
+    seen: set[str] = set()
+    for part in parts:
+        for sentence in re.split(r"(?<=[.!?])\s+|\n+", str(part or "")):
+            tokens = re.findall(r"[A-Za-z][A-Za-z0-9-]+", sentence)
+            for position, token in enumerate(tokens):
+                clean = token.strip("-")
+                if len(clean) < 3 or clean.casefold() in _DOCUMENTARY_QUERY_STOPWORDS:
+                    continue
+                if not (clean.isupper() or clean[:1].isupper()):
+                    continue
+                # Sentence-initial capitalisation carries no information unless
+                # the token is also an acronym.
+                if position == 0 and not clean.isupper():
+                    continue
+                if clean.casefold() in seen:
+                    continue
+                seen.add(clean.casefold())
+                terms.append(clean)
+    return terms
+
+
+def _documentary_query_variants(
+    scene: dict,
+    article_title: str,
+    query_override: str = "",
+) -> list[str]:
+    """Turn a multi-subject prompt into short, archive-friendly searches."""
+    query = " ".join(str(
+        query_override or (scene or {}).get("referent_query") or ""
+    ).split()[:8]).strip()
+    if not query:
+        return []
+    proper_terms = _documentary_proper_terms(
+        str(article_title or ""),
+        str((scene or {}).get("speech") or ""),
+        query,
+    )
+    anchor = proper_terms[-1] if proper_terms else ""
+    proper_keys = {term.casefold() for term in proper_terms}
+    candidate_terms = [
+        token
+        for token in re.findall(r"[a-z0-9-]+", query.casefold())
+        if len(token) >= 3
+        and token not in _DOCUMENTARY_QUERY_STOPWORDS
+        and token != anchor.casefold()
+    ]
+    # Pair the anchor with what the scene is *about*, not with another name from
+    # the same list. "Syracuse University Siena Szeged sperm research" otherwise
+    # yields "Szeged siena" and "Szeged university", which describe no subject at
+    # all; the topic words have to outrank the institution words.
+    subject_terms = [
+        token for token in candidate_terms if token not in proper_keys
+    ] + [
+        token for token in candidate_terms if token in proper_keys
+    ]
+    # Search the exact discovery phrase first. Broader variants are fallbacks,
+    # not substitutes; this prevents "Jerusalem" from outranking "DNA breaks".
+    variants = [query]
+    if anchor:
+        for term in subject_terms[:3]:
+            variants.append(f"{anchor} {term}")
+    return list(dict.fromkeys(variants))[:4]
+
+
+def _documentary_prefers_stock(query: str) -> bool:
+    """Use photography search for atmospheric context, not museum metadata."""
+    tokens = set(re.findall(r"[a-z0-9-]+", str(query or "").casefold()))
+    artifact_terms = {
+        "papyrus", "artifact", "relief", "temple", "sculpture", "statue",
+        "manuscript", "painting", "fossil", "apparatus", "instrument",
+    }
+    return bool(
+        tokens & {"desert", "night", "sky", "moon", "sunrise", "sunset"}
+    ) and not bool(tokens & artifact_terms)
+
+
+def _documentary_split_photo(left_image: Image.Image, right_image: Image.Image) -> Image.Image:
+    """Create a clean two-source comparison frame from real photographs."""
+    left = resize_and_crop_image(left_image.convert("RGB"), VIDEO_WIDTH, VIDEO_HEIGHT)
+    right = resize_and_crop_image(right_image.convert("RGB"), VIDEO_WIDTH, VIDEO_HEIGHT)
+    half = VIDEO_WIDTH // 2
+    result = Image.new("RGB", (VIDEO_WIDTH, VIDEO_HEIGHT), (7, 12, 25))
+    result.paste(left.crop((VIDEO_WIDTH // 4, 0, VIDEO_WIDTH // 4 + half, VIDEO_HEIGHT)), (0, 0))
+    result.paste(right.crop((VIDEO_WIDTH // 4, 0, VIDEO_WIDTH // 4 + half, VIDEO_HEIGHT)), (half, 0))
+    draw = ImageDraw.Draw(result)
+    draw.rectangle((half - 4, 0, half + 4, VIDEO_HEIGHT), fill=(255, 205, 54))
+    return result
+
+
+_REFERENCE_ALIAS_GROUPS = (
+    frozenset({"ibis", "bird", "birds", "beak", "feather", "feathers"}),
+    frozenset({"baboon", "baboons", "monkey", "primate", "fur", "coat"}),
+    frozenset({"whale", "whales", "orca", "orcas", "cetacean"}),
+    frozenset({"shark", "sharks", "fish"}),
+    frozenset({"moon", "lunar", "moonlight"}),
+    frozenset({"spacecraft", "satellite", "probe", "mission"}),
+    frozenset({"brain", "neuron", "neurons", "neural"}),
+)
+
+
+def _expanded_reference_tokens(value: str) -> set[str]:
+    tokens = {
+        token
+        for token in re.findall(r"[a-z0-9-]+", str(value or "").casefold())
+        if len(token) >= 3 and token not in _DOCUMENTARY_QUERY_STOPWORDS
+    }
+    expanded = set(tokens)
+    for group in _REFERENCE_ALIAS_GROUPS:
+        if tokens & group:
+            expanded.update(group)
+    return expanded
+
+
+def _story_reference_assets(
+    scenes: list[dict],
+    image_pool: list[tuple[Image.Image, dict]],
+    *,
+    limit: int = 2,
+) -> list[tuple[Image.Image, dict]]:
+    """Pick recurring verified subjects for later concept-scene edits."""
+    corpus_tokens = Counter()
+    for scene in scenes:
+        corpus_tokens.update(_expanded_reference_tokens(" ".join((
+            str(scene.get("speech") or ""),
+            str(scene.get("visual") or ""),
+            str(scene.get("referent_query") or ""),
+        ))))
+
+    ranked = []
+    seen_urls = set()
+    for position, asset in enumerate(image_pool):
+        _image, record = asset
+        if record.get("provider") == "Pexels":
+            continue
+        source_url = str(record.get("source_url") or "")
+        if source_url and source_url in seen_urls:
+            continue
+        query = str(record.get("search_query") or "")
+        query_tokens = _expanded_reference_tokens(query)
+        if not query_tokens:
+            continue
+        score = sum(corpus_tokens[token] for token in query_tokens)
+        if score <= 0:
+            continue
+        ranked.append((score, -position, asset))
+        seen_urls.add(source_url)
+    ranked.sort(key=lambda item: (item[0], item[1]), reverse=True)
+    return [asset for _score, _position, asset in ranked[:max(0, limit)]]
+
+
+def _reference_backed_scene_asset(
+    references: list[tuple[Image.Image, dict]],
+    edit_index: int,
+) -> tuple[Image.Image, dict] | None:
+    """Create varied edits while preserving the exact verified subject."""
+    if not references:
+        return None
+    if len(references) >= 2 and edit_index % 3 == 0:
+        left_image, left_record = references[0]
+        right_image, right_record = references[1]
+        record = dict(left_record)
+        record["edit"] = "reference-backed split comparison"
+        record["secondary_source_url"] = right_record.get("source_url", "")
+        record["secondary_provider"] = right_record.get("provider", "")
+        return _documentary_split_photo(left_image, right_image), record
+
+    image, base_record = references[edit_index % len(references)]
+    record = dict(base_record)
+    record["edit"] = "reference-backed subject close-up"
+    return image.copy(), record
+
+
+def _contextual_reference_comparison(
+    context_image: Image.Image,
+    references: list[tuple[Image.Image, dict]],
+) -> tuple[Image.Image, dict] | None:
+    """Combine real context with the two verified subjects of a question."""
+    if len(references) < 2:
+        return None
+    background = resize_and_crop_image(
+        context_image.convert("RGB"),
+        VIDEO_WIDTH,
+        VIDEO_HEIGHT,
+    )
+    background = ImageEnhance.Brightness(background).enhance(0.68).convert("RGBA")
+    comparison = _documentary_split_photo(references[0][0], references[1][0])
+    comparison = resize_and_crop_image(comparison, 960, 1280).convert("RGBA")
+    mask = Image.new("L", comparison.size, 0)
+    ImageDraw.Draw(mask).rounded_rectangle(
+        (0, 0, comparison.width - 1, comparison.height - 1),
+        radius=28,
+        fill=255,
+    )
+    shadow = Image.new("RGBA", background.size, (0, 0, 0, 0))
+    shadow_panel = Image.new("RGBA", (992, 1312), (0, 0, 0, 155)).filter(
+        ImageFilter.GaussianBlur(20)
+    )
+    shadow.alpha_composite(shadow_panel, (44, 352))
+    result = Image.alpha_composite(background, shadow)
+    result.paste(comparison, (60, 360), mask)
+
+    left_record = dict(references[0][1])
+    left_record["edit"] = "contextual reference-backed comparison"
+    left_record["secondary_source_url"] = references[1][1].get("source_url", "")
+    left_record["secondary_provider"] = references[1][1].get("provider", "")
+    return result.convert("RGB"), left_record
+
+
+def generate_referent_scene_images(
+    shots: list,
+    *,
+    color_intensity: str = DEFAULT_COLOR_INTENSITY,
+    visual_sources_out: list | None = None,
+    article_title: str = "",
+    hero_image: str | None = None,
+) -> list:
+    """Build a documentary edit from relevant real images, never placeholders."""
+    from real_imagery import fetch_hero_image, fetch_referent_image, _verify_subject
+    from visual_router import PHOTO, SCHEMATIC, route_scene
+
+    # Every subject check is anchored on the story, not on the per-scene search
+    # string, so an image that matches the words but not the topic is rejected.
+    story_subject = " ".join(str(article_title or "").split()) or "this science story"
+
+    unique_positions = []
+    scene_to_unique = {}
+    slot_to_unique = []
+    for index, shot in enumerate(shots):
+        try:
+            scene_index = int((shot or {}).get("_scene_index", index))
+        except (TypeError, ValueError):
+            scene_index = index
+        if scene_index not in scene_to_unique:
+            scene_to_unique[scene_index] = len(unique_positions)
+            unique_positions.append(index)
+        slot_to_unique.append(scene_to_unique[scene_index])
+
+    scenes = [shots[index] for index in unique_positions]
+    scene_assets: list[tuple[Image.Image, dict] | None] = [None] * len(scenes)
+    image_pool: list[tuple[Image.Image, dict]] = []
+
+    hero_asset: tuple[Image.Image, dict] | None = None
+    if hero_image:
+        hero = fetch_hero_image(
+            hero_image,
+            resize_fn=_documentary_frame_image,
+            target_width=VIDEO_WIDTH,
+            target_height=VIDEO_HEIGHT,
+        )
+        if hero is not None and _documentary_image_is_usable(hero):
+            hero_record = {
+                "lane": PHOTO,
+                "provider": "Source article",
+                "source_url": hero_image,
+                "license": "Source article image",
+                "author": "Source publisher",
+                "subject_verified": True,
+                "verification_method": "article hero",
+            }
+            hero_asset = (hero, hero_record)
+            image_pool.append(hero_asset)
+
+    # First collect exact attributable imagery for every scene, including
+    # diagrams, simulations, specimens, and scientific figures. A scene's
+    # discovery/evidence query outranks its place or institution. This means the
+    # opening can replace a vague article hero with a better image of the finding.
+    known_source_urls = {
+        str(record.get("source_url") or "")
+        for _image, record in image_pool
+        if record.get("source_url")
+    }
+    def search_scene(index: int, scene: dict):
+        found_assets = []
+        referent_query = str(scene.get("referent_query") or "").strip()
+        evidence_query = _scene_evidence_query(scene, article_title)
+        if not evidence_query:
+            return index, found_assets
+        archive_queries = (
+            []
+            if _documentary_prefers_stock(evidence_query)
+            else _documentary_query_variants(
+                scene,
+                article_title,
+                evidence_query,
+            )
+        )
+        for search_query in archive_queries:
+            source = fetch_referent_image(
+                search_query,
+                resize_fn=_documentary_frame_image,
+                target_width=VIDEO_WIDTH,
+                target_height=VIDEO_HEIGHT,
+                subject=story_subject,
+            )
+            if source is None or any(
+                str(record.get("source_url") or "") == source.source_url
+                for _image, record in found_assets
+            ):
+                continue
+            if not _documentary_image_is_usable(source.image):
+                logger.info(
+                    "[DocumentaryVisuals] Rejected low-information source for %r: %s",
+                    search_query,
+                    source.source_url,
+                )
+                continue
+            source_record = source.audit_record(lane=PHOTO)
+            source_record["search_query"] = search_query
+            source_record["evidence_query"] = evidence_query
+            source_record["visual_role"] = _scene_visual_role(scene)
+            asset = (_credit_photo(source.image, source), source_record)
+            found_assets.append(asset)
+            if len(found_assets) >= 2:
+                break
+        # Stock is useful for a photographable object or deliberate context.
+        # It is not evidence for an invisible mechanism or a precise discovery,
+        # and it must clear the same subject check as an archive image. Accepting
+        # unverified stock is how generic photographs reached slots whose scene
+        # they had nothing to do with.
+        if not found_assets and (
+            route_scene(scene) == PHOTO or _scene_visual_role(scene) == "context"
+        ):
+            stock_query = evidence_query or referent_query
+            for stock in search_pexels_images(stock_query, 2):
+                if not _documentary_image_is_usable(stock):
+                    continue
+                if _verify_subject(stock, stock_query, story_subject) is not True:
+                    logger.info(
+                        "[DocumentaryVisuals] Stock rejected for %r (subject %r)",
+                        stock_query,
+                        story_subject,
+                    )
+                    continue
+                stock_url = (
+                    "https://www.pexels.com/search/"
+                    + requests.utils.quote(stock_query)
+                    + "/"
+                )
+                stock_record = {
+                    "lane": PHOTO,
+                    "provider": "Pexels",
+                    "source_url": stock_url,
+                    "license": "Pexels license",
+                    "author": "Pexels contributor",
+                    "subject_verified": True,
+                    "verification_method": "stock search + subject vision check",
+                    "search_query": stock_query,
+                    "evidence_query": evidence_query,
+                    "visual_role": _scene_visual_role(scene),
+                }
+                stock_asset = (stock, stock_record)
+                found_assets.append(stock_asset)
+                break
+        return index, found_assets
+
+    # Archive searches are I/O-bound and each has its own hard deadline. Run a
+    # small bounded group concurrently so asking for ten distinct visuals does
+    # not make generation ten times slower.
+    search_results: dict[int, list[tuple[Image.Image, dict]]] = {}
+    with ThreadPoolExecutor(max_workers=min(4, max(1, len(scenes)))) as executor:
+        futures = [
+            executor.submit(search_scene, index, scene)
+            for index, scene in enumerate(scenes)
+            if scene_assets[index] is None
+        ]
+        for future in as_completed(futures):
+            try:
+                index, found_assets = future.result()
+                search_results[index] = found_assets
+            except Exception as exc:
+                logger.info("[DocumentaryVisuals] Scene search unavailable: %s", exc)
+
+    for index, scene in enumerate(scenes):
+        found_assets = []
+        for asset in search_results.get(index, []):
+            source_url = str(asset[1].get("source_url") or "")
+            if source_url and source_url in known_source_urls:
+                continue
+            found_assets.append(asset)
+            image_pool.append(asset)
+            if source_url:
+                known_source_urls.add(source_url)
+        if not found_assets:
+            continue
+        primary_image, primary_record = found_assets[0]
+        comparison_language = re.search(
+            r"\b(?:both|different|either|two|versus|vs)\b",
+            str(scene.get("speech") or ""),
+            flags=re.IGNORECASE,
+        )
+        if len(found_assets) > 1 and comparison_language:
+            secondary_image, secondary_record = found_assets[1]
+            primary_image = _documentary_split_photo(primary_image, secondary_image)
+            primary_record = dict(primary_record)
+            primary_record["edit"] = "split-screen comparison"
+            primary_record["secondary_source_url"] = secondary_record.get("source_url", "")
+            primary_record["secondary_provider"] = secondary_record.get("provider", "")
+        scene_assets[index] = (primary_image, primary_record)
+
+    # The article hero is useful context, but it is not automatically the best
+    # representation of the discovery. Use it only if the exact opening search
+    # did not find anything better.
+    if scenes and scene_assets[0] is None and hero_asset is not None:
+        scene_assets[0] = hero_asset
+
+    # Scenes with no exact photograph are generated as intentionally illustrated
+    # frames rather than recycled or abandoned. _schematic_prompt already bans the
+    # failure classes that made earlier renders read as fake: hands, faces, crowds,
+    # cutaways, cross-sections, microscopy, and measurement scales. What it still
+    # allows -- stylised, symbolic, atmospheric imagery -- is not the problem and is
+    # what carries watch time. A photo-led video may safely contain these, because
+    # the prompt forbids photorealism, so they read as deliberate illustration next
+    # to a photograph rather than as a failed imitation of one.
+    # The lane still decides *how* to generate. A scene that asserts structure it
+    # cannot show gets a symbolic frame, never a diagram -- that guardrail is the
+    # whole reason the plant-root follicle cannot recur.
+    references = _story_reference_assets(scenes, image_pool)
+
+    # A comparison question must show the established subjects, not a generic
+    # stock result or a newly invented animal. Preserve a real stock scene when
+    # it explains environment/context; replace only the explicit final choice.
+    if len(references) >= 2:
+        for index, asset in enumerate(scene_assets):
+            if asset is None:
+                continue
+            _image, record = asset
+            if record.get("provider") != "Pexels":
+                continue
+            if not re.search(
+                r"\b(?:which|better|versus|vs)\b",
+                str(scenes[index].get("speech") or ""),
+                flags=re.IGNORECASE,
+            ):
+                continue
+            replacement = _contextual_reference_comparison(
+                asset[0],
+                references,
+            )
+            if replacement is not None:
+                scene_assets[index] = replacement
+
+    missing = [index for index, asset in enumerate(scene_assets) if asset is None]
+    generated_indexes = []
+    for index in missing:
+        comparison_scene = bool(re.search(
+            r"\b(?:both|different|either|two|which|better|versus|vs)\b",
+            str(scenes[index].get("speech") or ""),
+            flags=re.IGNORECASE,
+        ))
+        scene_tokens = _expanded_reference_tokens(" ".join((
+            _scene_evidence_query(scenes[index], article_title),
+            str(scenes[index].get("speech") or ""),
+            str(scenes[index].get("visual") or ""),
+        )))
+        relevant_references = [
+            asset for asset in references
+            if scene_tokens & _expanded_reference_tokens(" ".join((
+                str(asset[1].get("search_query") or ""),
+                str(asset[1].get("evidence_query") or ""),
+            )))
+        ]
+        # Reuse is now a narrow editorial tool for an explicit comparison of
+        # already-established matching subjects. It is never a generic fallback.
+        reference_asset = (
+            _reference_backed_scene_asset(relevant_references[:2], 0)
+            if comparison_scene and len(relevant_references) >= 2
+            else None
+        )
+        if reference_asset is not None:
+            image, record = reference_asset
+            record = dict(record)
+            record["verification_method"] = (
+                str(record.get("verification_method") or "verified reference")
+                + "+reference-backed edit"
+            )
+            scene_assets[index] = (image, record)
+        else:
+            generated_indexes.append(index)
+
+    if generated_indexes:
+        generated = _parallel_image_gen([
+            _schematic_prompt(scenes[index], color_intensity, article_title)
+            if route_scene(scenes[index]) == SCHEMATIC
+            else _symbolic_prompt(scenes[index], color_intensity, article_title)
+            for index in generated_indexes
+        ], premium_flags=[True] * len(generated_indexes))
+        for index, image in zip(generated_indexes, generated):
+            if image is None or not _documentary_image_is_usable(image):
+                continue
+            generated_lane = route_scene(scenes[index])
+            scene_assets[index] = (image, {
+                "lane": generated_lane,
+                "provider": "FAL",
+                "source_url": "",
+                "license": "Generated illustration",
+                "author": "AI generated",
+                "subject_verified": False,
+                "verification_method": "generated illustration (non-photorealistic)",
+                "evidence_query": _scene_evidence_query(scenes[index], article_title),
+                "visual_role": _scene_visual_role(scenes[index]),
+            })
+
+    images = []
+    records = []
+    reuse_cursor = 0
+    for index, scene in enumerate(scenes):
+        asset = scene_assets[index]
+        reused = False
+        if asset is None:
+            # Only reached if generation also failed for this slot. A flat
+            # gradient used to be emitted here, which shipped a blank card in
+            # the middle of the edit -- at 2 seconds that reads as a broken
+            # video and costs the whole view. Any real image already earned by
+            # this story is better than a blank frame, so reuse before
+            # despairing: prefer one whose query overlaps this scene, else take
+            # the next pooled image in rotation so one photo is not repeated.
+            relevant_pool = [
+                candidate for candidate in image_pool
+                if _expanded_reference_tokens(_scene_evidence_query(scene, article_title))
+                & _expanded_reference_tokens(" ".join((
+                    str(candidate[1].get("search_query") or ""),
+                    str(candidate[1].get("evidence_query") or ""),
+                )))
+            ]
+            fallback_pool = relevant_pool or image_pool
+            if not fallback_pool:
+                # Nothing was found or generated for the entire story. There is
+                # no video worth publishing here, so fail loudly and let the
+                # caller mark the article failed rather than emit blank frames.
+                raise RuntimeError(
+                    "No usable imagery for any scene; refusing to render "
+                    "placeholder frames"
+                )
+            asset = fallback_pool[reuse_cursor % len(fallback_pool)]
+            reuse_cursor += 1
+            reused = True
+        image, base_record = asset
+        record = dict(base_record)
+        if reused:
+            record["editorial_reuse"] = True
+            record["verification_method"] = (
+                str(record.get("verification_method") or "documentary image")
+                + "+editorial crop"
+            )
+        images.append(image)
+        records.append(record)
+
+    if visual_sources_out is not None:
+        visual_sources_out.extend(records)
+    logger.info(
+        "[DocumentaryVisuals] scenes=%d photo=%d generated=%d reused=%d unique_sources=%d pool=%d",
+        len(records),
+        sum(record.get("lane") == PHOTO for record in records),
+        sum(record.get("provider") == "FAL" for record in records),
+        sum(bool(record.get("editorial_reuse")) for record in records),
+        len({
+            str(record.get("source_url") or f"generated:{index}")
+            for index, record in enumerate(records)
+        }),
+        len(image_pool),
+    )
+    return [
+        _documentary_photo_variant(
+            images[unique_index],
+            shot,
+            int((shot or {}).get("_shot_step", slot_index)),
+        )
+        for slot_index, (shot, unique_index) in enumerate(zip(shots, slot_to_unique))
+    ]
 
 
 def create_hook_clips(
@@ -1381,6 +2844,9 @@ def create_hook_clips(
     style_key: str = None,
     opening_visual: str = None,
     use_video_hook: bool | None = None,
+    color_intensity: str = DEFAULT_COLOR_INTENSITY,
+    opening_image: Image.Image | None = None,
+    opening_images: list[Image.Image] | None = None,
 ) -> list:
     """Create the hook sequence. Returns list[Clip].
 
@@ -1397,6 +2863,28 @@ def create_hook_clips(
     """
     # Anchor on the opening scene visual if we have one; else derive from title.
     anchor = (opening_visual or title).strip().rstrip(",.")
+    color_intensity = normalize_color_intensity(color_intensity)
+    color_guidance = color_intensity_prompt_guidance(color_intensity)
+
+    # Referent-routed videos reuse the already verified/code-rendered opening
+    # frame. A second generated hook would reintroduce the visual fabrication
+    # that this pipeline is designed to prevent.
+    documentary_openers = list(opening_images or [])
+    if not documentary_openers and opening_image is not None:
+        documentary_openers = [opening_image]
+    if documentary_openers:
+        clip_duration = duration / NUM_HOOK_IMAGES
+        return [
+            create_clip(
+                apply_color_intensity(
+                    documentary_openers[index % len(documentary_openers)],
+                    color_intensity,
+                ),
+                clip_duration,
+                zoom_factor=0.038 + (0.006 * (index % 3)),
+            )
+            for index in range(NUM_HOOK_IMAGES)
+        ]
 
     # Resolve which hook mode to run.
     if use_video_hook is True:
@@ -1418,15 +2906,18 @@ def create_hook_clips(
             video_prompt = apply_style(motion_prompt, style_key, is_hook=True)
         else:
             video_prompt = f"{motion_prompt}, cinematic lighting, vertical 9:16, high energy, no text"
+        video_prompt = f"{video_prompt}, {color_guidance}"
 
         local_mp4 = generate_hook_video_fal(video_prompt, video_model)
         if local_mp4:
             try:
                 vclip = load_hook_video_clip(local_mp4, duration)
-                # Stash temp path on the clip so generate_video's finally can unlink it.
-                vclip._scap_temp_path = local_mp4
+                motion_clips = split_motion_clip(vclip, duration)
+                # Stash the shared temp path once so cleanup never unlinks it
+                # before another slice has rendered.
+                motion_clips[0]._scap_temp_path = local_mp4
                 logger.info(f"[Hook] Using AI video hook ({duration:.1f}s)")
-                return [vclip]
+                return motion_clips
             except Exception as e:
                 logger.info(f"[Hook] Video clip load failed: {e}, falling back to image hook")
                 try:
@@ -1450,24 +2941,51 @@ def create_hook_clips(
             f"{anchor}, stark silhouette against explosive backdrop",
         ]
 
-        if style_key:
+        if style_key == "illustrated_science":
             from visual_styles import apply_style
-            hook_prompts = [apply_style(v, style_key, is_hook=True) for v in angle_variations]
+            hook_prompts = [
+                apply_style(
+                    f"{anchor}, one coherent teaching illustration, {color_guidance}",
+                    style_key,
+                    is_hook=True,
+                )
+            ]
+        elif style_key:
+            from visual_styles import apply_style
+            hook_prompts = [
+                apply_style(
+                    f"{variation}, {color_guidance}",
+                    style_key,
+                    is_hook=True,
+                )
+                for variation in angle_variations
+            ]
         else:
             # Legacy path (no style): use old generic punch prompts
             hook_prompts = [
-                f"extreme macro close-up shot, {title}, ultra sharp detail, dramatic rim lighting, shallow depth of field, cinematic 9:16, hyper-realistic",
-                f"impossible camera angle, {title}, bird's eye view mixed with dutch angle, dramatic shadows, high contrast neon accents, surreal perspective",
-                f"frozen action moment, {title}, motion blur trails, dynamic energy, explosive composition, vibrant saturated colors, dramatic backlighting",
-                f"bold graphic composition, {title}, stark contrast, complementary color explosion, minimalist but striking, professional advertising quality"
+                f"extreme macro close-up shot, {title}, ultra sharp detail, dramatic rim lighting, shallow depth of field, cinematic 9:16, hyper-realistic, {color_guidance}",
+                f"impossible camera angle, {title}, bird's eye view mixed with dutch angle, dramatic shadows, high contrast neon accents, surreal perspective, {color_guidance}",
+                f"frozen action moment, {title}, motion blur trails, dynamic energy, explosive composition, vibrant saturated colors, dramatic backlighting, {color_guidance}",
+                f"bold graphic composition, {title}, stark contrast, complementary color explosion, minimalist but striking, professional advertising quality, {color_guidance}"
             ]
 
-        logger.info(f"[Hook] Creating {NUM_HOOK_IMAGES} hook images in parallel (style: {style_key or 'legacy'})...")
-        images = [None] * NUM_HOOK_IMAGES
-        with ThreadPoolExecutor(max_workers=NUM_HOOK_IMAGES) as executor:
+        image_count = 1 if style_key == "illustrated_science" else NUM_HOOK_IMAGES
+        logger.info(f"[Hook] Creating {image_count} hook images in parallel (style: {style_key or 'legacy'})...")
+        logger.info(
+            "[Cost] Hook stills: premium=%d estimated=$%.3f",
+            image_count,
+            estimate_ai_still_cost(image_count, 0),
+        )
+        images = [None] * image_count
+        with ThreadPoolExecutor(max_workers=image_count) as executor:
             future_to_idx = {
-                executor.submit(generate_image_fal, prompt): i
-                for i, prompt in enumerate(hook_prompts[:NUM_HOOK_IMAGES])
+                executor.submit(
+                    generate_image_fal,
+                    prompt,
+                    model=FAL_HOOK_IMAGE_MODEL,
+                    num_inference_steps=None,
+                ): i
+                for i, prompt in enumerate(hook_prompts[:image_count])
             }
             for future in as_completed(future_to_idx):
                 idx = future_to_idx[future]
@@ -1476,6 +2994,7 @@ def create_hook_clips(
                 except Exception:
                     images[idx] = create_gradient_background()
 
+    images = apply_color_intensity_to_images(images, color_intensity)
     clips = [create_clip(img, clip_duration, zoom_factor=0.05) for img in images]
     logger.info(f"[Hook] Created {len(clips)} clips ({clip_duration:.2f}s each)")
     return clips
@@ -1500,7 +3019,7 @@ def select_motion_scene_indexes(scenes: list, limit: int) -> list:
     }
     ranked = []
     for index, scene in enumerate(scenes):
-        if index == 0:
+        if int(scene.get("_scene_index", index)) == 0:
             continue  # the hook already visualizes the opening scene
         emotion = _caption_token_key(scene.get("emotion", ""))
         score = 100 if any(term in emotion for term in _HIGH_IMPACT_EMOTIONS) else 0
@@ -1524,6 +3043,7 @@ def create_body_motion_clips(
     style_key: str,
     video_model: str,
     clip_limit: int,
+    color_intensity: str = DEFAULT_COLOR_INTENSITY,
 ) -> dict:
     """Generate selected body motion clips, returning ``{scene_index: clip}``.
 
@@ -1533,6 +3053,7 @@ def create_body_motion_clips(
     indexes = select_motion_scene_indexes(scenes, clip_limit)
     if not indexes:
         return {}
+    color_guidance = color_intensity_prompt_guidance(color_intensity)
 
     logger.info(
         "[Cost] Planning %d body motion clip(s), estimated $%.2f",
@@ -1553,6 +3074,7 @@ def create_body_motion_clips(
                 motion_prompt = apply_style(motion_prompt, style_key, is_hook=False)
             except Exception as exc:
                 logger.info(f"[BodyVideo] Style application failed for scene {index}: {exc}")
+        motion_prompt = f"{motion_prompt}, {color_guidance}"
 
         local_mp4 = generate_motion_video_fal(
             motion_prompt,
@@ -1562,7 +3084,12 @@ def create_body_motion_clips(
         if not local_mp4:
             return index, None
         try:
-            target_duration = durations[index] if index < len(durations) else DEFAULT_CHUNK_DURATION
+            target_duration = (
+                durations[index]
+                if index < len(durations)
+                else DEFAULT_CHUNK_DURATION
+            )
+            target_duration = min(MAX_SHOT_DURATION, target_duration)
             clip = load_hook_video_clip(local_mp4, target_duration)
             clip._scap_temp_path = local_mp4
             return index, clip
@@ -1593,26 +3120,46 @@ def create_body_motion_clips(
     return generated
 
 
-def create_clip(image: Image.Image, duration: float, zoom_factor: float = 0.03) -> VideoClip:
-    """Create a centered Ken Burns zoom while keeping every frame 1080x1920."""
+def create_clip(
+    image: Image.Image,
+    duration: float,
+    zoom_factor: float = 0.03,
+    motion: str = "push",
+) -> VideoClip:
+    """Create a smooth varied Ken Burns move with no exposed frame edges."""
     source = resize_and_crop_image(image.convert("RGB"), VIDEO_WIDTH, VIDEO_HEIGHT)
     duration = max(0.05, float(duration))
+    motion = motion if motion in SHOT_MOTIONS else "push"
 
     def make_frame(t: float) -> np.ndarray:
         progress = max(0.0, min(1.0, float(t) / duration))
-        scale = 1.0 + (max(0.0, zoom_factor) * progress)
+        zoom = max(0.0, zoom_factor)
+        if motion == "pull":
+            scale = 1.0 + (zoom * (1.0 - progress))
+        elif motion.startswith("pan-"):
+            scale = 1.0 + max(0.035, zoom * 1.5)
+        else:
+            scale = 1.0 + (zoom * progress)
         zoom_width = max(VIDEO_WIDTH, int(math.ceil(VIDEO_WIDTH * scale)))
         zoom_height = max(VIDEO_HEIGHT, int(math.ceil(VIDEO_HEIGHT * scale)))
         zoomed = source.resize((zoom_width, zoom_height), Image.Resampling.LANCZOS)
-        left = (zoom_width - VIDEO_WIDTH) // 2
-        top = (zoom_height - VIDEO_HEIGHT) // 2
+        max_x = zoom_width - VIDEO_WIDTH
+        max_y = zoom_height - VIDEO_HEIGHT
+        if motion == "pan-left":
+            left = int(round(max_x * (1.0 - progress)))
+            top = max_y // 2
+        elif motion == "pan-right":
+            left = int(round(max_x * progress))
+            top = max_y // 2
+        else:
+            left = max_x // 2
+            top = max_y // 2
         cropped = zoomed.crop(
             (left, top, left + VIDEO_WIDTH, top + VIDEO_HEIGHT)
         )
         return np.asarray(cropped, dtype=np.uint8)
 
     return VideoClip(make_frame=make_frame, duration=duration)
-
 
 
 def compute_durations(chunks: list, total_time: float) -> list:
@@ -1645,6 +3192,95 @@ def compute_scene_durations(scenes: list, total_time: float) -> list:
     return [max(0.3, d) for d in durations]
 
 
+def split_shot_duration(
+    duration: float,
+    max_duration: float = MAX_SHOT_DURATION,
+) -> list[float]:
+    """Split a visual hold without changing its total allocated time."""
+    duration = max(0.05, float(duration))
+    max_duration = max(0.05, float(max_duration))
+    count = max(1, int(math.ceil(duration / max_duration)))
+    piece = duration / count
+    durations = [piece] * count
+    durations[-1] += duration - sum(durations)
+    return durations
+
+
+def create_final_padding_clips(main_video, duration: float) -> list:
+    """Represent even sub-frame final padding as explicit, shot-capped edits."""
+    duration = float(duration)
+    if not math.isfinite(duration) or duration <= 0:
+        return []
+
+    count = max(1, int(math.ceil(duration / MAX_SHOT_DURATION)))
+    piece = duration / count
+    durations = [piece] * count
+    durations[-1] += duration - sum(durations)
+    last_frame_time = max(0.0, main_video.duration - (1.0 / FPS))
+    return [
+        main_video.to_ImageClip(t=last_frame_time).set_duration(piece)
+        for piece in durations
+    ]
+
+
+def build_scene_shot_plan(scenes: list, total_time: float) -> list:
+    """Expand narration scenes into deterministic, shot-capped visual beats."""
+    plan = []
+    scene_durations = compute_scene_durations(scenes, total_time)
+    for scene_index, scene in enumerate(scenes):
+        duration = (
+            scene_durations[scene_index]
+            if scene_index < len(scene_durations)
+            else DEFAULT_CHUNK_DURATION
+        )
+        shot_durations = split_shot_duration(duration)
+        for shot_step, shot_duration in enumerate(shot_durations):
+            shot = dict(scene)
+            shot["_scene_index"] = scene_index
+            shot["_shot_step"] = shot_step
+            shot["_scene_shot_count"] = len(shot_durations)
+            shot["_shot_type"] = SHOT_TYPES[len(plan) % len(SHOT_TYPES)]
+            shot["_duration"] = shot_duration
+            plan.append(shot)
+    return plan
+
+
+def build_legacy_shot_plan(chunks: list, total_time: float) -> list:
+    """Apply the same shot cap to pre-scene legacy scripts."""
+    plan = []
+    chunk_durations = compute_durations(chunks, total_time)
+    for chunk_index, chunk in enumerate(chunks):
+        duration = (
+            chunk_durations[chunk_index]
+            if chunk_index < len(chunk_durations)
+            else DEFAULT_CHUNK_DURATION
+        )
+        for shot_duration in split_shot_duration(duration):
+            plan.append(
+                {
+                    "speech": chunk,
+                    "_chunk_index": chunk_index,
+                    "_shot_type": SHOT_TYPES[len(plan) % len(SHOT_TYPES)],
+                    "_duration": shot_duration,
+                }
+            )
+    return plan
+
+
+def allocate_render_paths(article_id: int, videos_dir: Path) -> tuple[Path, Path]:
+    """Return collision-resistant output and private narration paths."""
+    render_token = uuid4().hex
+    timestamp = datetime.now().strftime("%Y%m%d_%H%M%S_%f")
+    output_path = (
+        videos_dir / f"article_{article_id}_{timestamp}_{render_token[:12]}.mp4"
+    )
+    narration_path = (
+        Path(tempfile.gettempdir())
+        / f"clipper_audio_{article_id}_{render_token}.wav"
+    )
+    return output_path, narration_path
+
+
 def generate_video(
     article_id: int,
     title: str,
@@ -1655,29 +3291,39 @@ def generate_video(
     style_key: str = None,
     emotion: str = None,
     use_video_hook: bool | None = None,
+    voice_tone: str = tts_engine.DEFAULT_VOICE_TONE,
+    cover_line: str | None = None,
+    series_lane: str | None = None,
+    hero_image: str | None = None,
+    color_intensity: str = DEFAULT_COLOR_INTENSITY,
+    visual_sources_out: list | None = None,
 ) -> str:
     """Generate TikTok-style video with parallel image generation.
 
     Preferred path: scenes + style_key + emotion provided (from summarizer).
-    Each scene produces one style-consistent image, and images play in
-    narrative order for their scene's proportional speech duration.
-    `emotion` drives TTS voice/speed (Kokoro) and delivery styling (Gemini).
+    Each scene expands into style-consistent shots no longer than 2.5 seconds,
+    which play in narrative order for the scene's proportional speech duration.
+    `voice_tone` drives TTS voice, speed, and delivery styling. `emotion`
+    remains scene metadata for visual storytelling.
 
     Fallback path: no scenes -> legacy themed-image generation with
     chunked text pacing.
 
     Args:
-        image_source: 'ai' for FAL.ai, 'stock' for Pexels stock photos.
+        image_source: 'ai' for FAL.ai, 'stock' for Pexels stock photos, or
+            'mixed' for real hero/NASA imagery with per-slot AI fallback.
         captions: Burn word-synced captions into the video when True.
         use_video_hook: True forces the AI video hook, False forces stills,
             None follows the HOOK_VIDEO_MODEL env default.
+        voice_tone: Narration preset id: controlled, energetic, or documentary.
+        color_intensity: Still-image color preset: natural, vivid, or electric.
+            Motion prompts receive matching palette guidance; motion files are
+            not filtered frame by frame.
     """
     videos_dir = Path("static/videos")
     videos_dir.mkdir(parents=True, exist_ok=True)
 
-    timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
-    output_path = videos_dir / f"article_{article_id}_{timestamp}.mp4"
-    temp_audio_path = videos_dir / f"temp_audio_{article_id}.mp3"
+    output_path, temp_audio_path = allocate_render_paths(article_id, videos_dir)
 
     audio = None
     main_video = None
@@ -1687,19 +3333,27 @@ def generate_video(
     music_resources = []
     actual_audio_path = None
     use_scenes = bool(scenes)
+    color_intensity = normalize_color_intensity(color_intensity)
+    from visual_styles import DEFAULT_STYLE
+    style_key = style_key or DEFAULT_STYLE
 
     try:
         logger.info(
             f"Generating video for article {article_id} "
             f"(images: {image_source}, mode: {'scene-based' if use_scenes else 'legacy'}, "
-            f"style: {style_key or 'auto'}, emotion: {emotion or 'default'})"
+            f"style: {style_key}, emotion: {emotion or 'default'}, "
+            f"voice tone: {voice_tone or tts_engine.DEFAULT_VOICE_TONE}, "
+            f"color: {color_intensity})"
         )
 
         # Step 1: TTS
         logger.info("Step 1: Generating voiceover...")
         narration_text = clean_text(script)
         actual_audio_path = tts_engine.synthesize(
-            narration_text, str(temp_audio_path), emotion=emotion
+            narration_text,
+            str(temp_audio_path),
+            emotion=emotion,
+            voice_tone=voice_tone,
         )
         audio = AudioFileClip(actual_audio_path)
         audio_duration = float(audio.duration)
@@ -1721,88 +3375,197 @@ def generate_video(
             logger.info("[Captions] Created %d caption groups", len(caption_groups))
 
         hook_len = min(HOOK_DURATION, max(2.0, audio_duration * 0.25))
+        remaining = max(0.1, audio_duration - hook_len)
+        chunks = []
+        if use_scenes:
+            body_shots = build_scene_shot_plan(scenes, remaining)
+        else:
+            chunks = chunk_text(script)
+            body_shots = build_legacy_shot_plan(chunks, remaining)
+        longest_body_shot = max(
+            (float(shot["_duration"]) for shot in body_shots),
+            default=0.0,
+        )
+        logger.info(
+            "[Pacing] Planned %d body shots; longest %.3fs",
+            len(body_shots),
+            longest_body_shot,
+        )
+        planned_still_cost = estimate_planned_still_cost(
+            body_shots,
+            use_scenes=use_scenes,
+            image_source=image_source,
+            style_key=style_key,
+        )
+        render_motion_clip_cap = _effective_motion_clip_cap(
+            _REQUESTED_MAX_VIDEO_CLIPS_PER_VIDEO,
+            VIDEO_CLIP_ESTIMATED_COST_USD,
+            base_cost=planned_still_cost,
+        )
+        logger.info(
+            "[Cost] Planned conservative still estimate=$%.3f "
+            "(source=%s, body shots=%d); per-render motion cap=%d",
+            planned_still_cost,
+            image_source,
+            len(body_shots),
+            render_motion_clip_cap,
+        )
 
         # Step 3: Resolve visual style. Always resolve when the video hook is on
         # (legacy path included) so the AI video clip is generated with the SAME
         # style preset as the body images — otherwise the hook looks alien next
         # to the rest of the video.
-        will_use_video_motion = (
+        will_use_video_motion = (not use_scenes) and (
             use_video_hook is True
             or (use_video_hook is None and bool(HOOK_VIDEO_MODEL))
-        ) and image_source != "stock" and MAX_VIDEO_CLIPS_PER_VIDEO > 0
+        ) and image_source != "stock" and render_motion_clip_cap > 0
         video_model = (
             HOOK_VIDEO_MODEL or DEFAULT_HOOK_VIDEO_MODEL
             if use_video_hook is True
             else HOOK_VIDEO_MODEL
         )
         if will_use_video_motion:
-            max_motion_cost = MAX_VIDEO_CLIPS_PER_VIDEO * VIDEO_CLIP_ESTIMATED_COST_USD
+            max_motion_cost = (
+                render_motion_clip_cap * VIDEO_CLIP_ESTIMATED_COST_USD
+            )
             logger.info(
                 "[Cost] Motion cap=%d clip(s); estimated max motion $%.2f, "
                 "estimated max video total $%.2f",
-                MAX_VIDEO_CLIPS_PER_VIDEO,
+                render_motion_clip_cap,
                 max_motion_cost,
-                BASE_VIDEO_ESTIMATED_COST_USD + max_motion_cost,
+                planned_still_cost + max_motion_cost,
             )
-        if (use_scenes or will_use_video_motion) and not style_key:
-            from visual_styles import auto_pick_style
-            style_key = auto_pick_style(title, script)
-            logger.info(f"[Video] Auto-picked style: {style_key}")
-
         # Step 4: Generate body images
         if use_scenes:
-            logger.info("Step 4: Generating scene-aligned images...")
-            themed_images = generate_scene_images(scenes, style_key, image_source=image_source)
+            logger.info("Step 4: Building documentary image edit...")
+            themed_images = generate_referent_scene_images(
+                body_shots,
+                color_intensity=color_intensity,
+                visual_sources_out=visual_sources_out,
+                article_title=title,
+                hero_image=hero_image,
+            )
+        elif image_source == "mixed":
+            logger.info("Step 4: Generating legacy mixed-source shot images...")
+            themed_images = generate_scene_images(
+                body_shots,
+                style_key,
+                image_source=image_source,
+                series_lane=series_lane,
+                hero_image=hero_image,
+                color_intensity=color_intensity,
+            )
         else:
             logger.info("Step 4: Generating themed images (legacy)...")
-            themed_images = generate_themed_images(title, script, num_images=NUM_BODY_IMAGES, image_source=image_source)
+            themed_images = generate_themed_images(
+                title,
+                script,
+                num_images=NUM_BODY_IMAGES,
+                image_source=image_source,
+                color_intensity=color_intensity,
+            )
+        themed_images = apply_color_intensity_to_images(
+            themed_images,
+            color_intensity,
+        )
 
         # Step 5: Hook clips (AI video hook or rapid-fire image sequence)
         logger.info("Step 5: Creating hook sequence...")
         opening_visual = scenes[0].get("visual") if use_scenes else None
+        hook_opening_image = themed_images[0] if themed_images else None
+        hook_opening_images = []
+        if use_scenes and themed_images:
+            seen_scenes = set()
+            seen_sources = set()
+            for slot, shot in enumerate(body_shots):
+                if slot >= len(themed_images):
+                    break
+                scene_index = int(shot.get("_scene_index", slot))
+                if scene_index in seen_scenes:
+                    continue
+                seen_scenes.add(scene_index)
+                source_records = visual_sources_out or []
+                source = (
+                    source_records[scene_index]
+                    if scene_index < len(source_records)
+                    else {}
+                )
+                source_key = (
+                    str(source.get("source_url") or ""),
+                    str(source.get("secondary_source_url") or ""),
+                )
+                if source_key != ("", "") and source_key in seen_sources:
+                    continue
+                seen_sources.add(source_key)
+                hook_opening_images.append(themed_images[slot])
+                if len(hook_opening_images) >= NUM_HOOK_IMAGES:
+                    break
+            if not hook_opening_images:
+                hook_opening_images = [themed_images[0]]
+
         hook_clips = create_hook_clips(
             title,
             duration=hook_len,
             image_source=image_source,
             style_key=style_key,
             opening_visual=opening_visual,
-            use_video_hook=(use_video_hook if MAX_VIDEO_CLIPS_PER_VIDEO > 0 else False),
+            use_video_hook=(
+                False if use_scenes else (
+                    use_video_hook if render_motion_clip_cap > 0 else False
+                )
+            ),
+            color_intensity=color_intensity,
+            opening_image=(hook_opening_image if use_scenes else None),
+            opening_images=(hook_opening_images if use_scenes else None),
         )
         clips.extend(hook_clips)
         logger.info(f"Hook: {hook_len:.1f}s")
 
         # Step 6: Body clips
         logger.info("Step 6: Creating body clips...")
-        remaining = max(0.1, audio_duration - hook_len)
 
         if use_scenes:
-            durations = compute_scene_durations(scenes, remaining)
+            durations = [float(shot["_duration"]) for shot in body_shots]
             generated_hook_count = sum(
                 1 for clip in hook_clips if getattr(clip, "_scap_temp_path", None)
             )
             remaining_motion_slots = max(
-                0, MAX_VIDEO_CLIPS_PER_VIDEO - generated_hook_count
+                0, render_motion_clip_cap - generated_hook_count
             )
             body_motion_clips = {}
             if will_use_video_motion and video_model and remaining_motion_slots:
                 body_motion_clips = create_body_motion_clips(
-                    scenes,
+                    body_shots,
                     durations,
                     style_key,
                     video_model,
                     remaining_motion_slots,
+                    color_intensity=color_intensity,
                 )
-            for i, scene in enumerate(scenes):
+            for i, shot in enumerate(body_shots):
                 img = themed_images[i] if i < len(themed_images) else themed_images[-1]
                 dur = durations[i] if i < len(durations) else DEFAULT_CHUNK_DURATION
-                clips.append(body_motion_clips.get(i) or create_clip(img, dur))
+                clips.append(
+                    body_motion_clips.get(i)
+                    or create_clip(
+                        img,
+                        dur,
+                        zoom_factor=0.045,
+                        motion=SHOT_MOTIONS[i % len(SHOT_MOTIONS)],
+                    )
+                )
         else:
-            chunks = chunk_text(script)
-            durations = compute_durations(chunks, remaining)
-            for i in range(len(chunks)):
+            for i, shot in enumerate(body_shots):
                 img = themed_images[i % len(themed_images)]
-                dur = durations[i] if i < len(durations) else DEFAULT_CHUNK_DURATION
-                clips.append(create_clip(img, dur))
+                dur = float(shot["_duration"])
+                clips.append(
+                    create_clip(
+                        img,
+                        dur,
+                        zoom_factor=0.045,
+                        motion=SHOT_MOTIONS[i % len(SHOT_MOTIONS)],
+                    )
+                )
 
         # Step 7: Assemble visuals and PIL text overlays
         logger.info("Step 7: Assembling...")
@@ -1812,17 +3575,36 @@ def generate_video(
             main_video = main_video.subclip(0, audio_duration)
         elif main_video.duration < audio_duration:
             pad = audio_duration - main_video.duration
-            if pad < (1.0 / FPS):
-                main_video = main_video.set_duration(audio_duration)
-            else:
-                last_frame_time = max(0.0, main_video.duration - (1.0 / FPS))
-                last_hold = main_video.to_ImageClip(t=last_frame_time).set_duration(pad)
-                main_video = concatenate_videoclips(
-                    [main_video, last_hold],
-                    method="compose",
-                )
+            pad_clips = create_final_padding_clips(main_video, pad)
+            clips.extend(pad_clips)
+            main_video = concatenate_videoclips(
+                [main_video, *pad_clips],
+                method="compose",
+            )
 
-        headline_clip = create_headline_clip(title, min(HEADLINE_DURATION, audio_duration))
+        longest_visual_shot = max(
+            (
+                float(getattr(clip, "duration", 0.0) or 0.0)
+                for clip in clips
+            ),
+            default=0.0,
+        )
+        if longest_visual_shot > MAX_SHOT_DURATION + 1e-7:
+            raise RuntimeError(
+                f"Visual shot exceeded {MAX_SHOT_DURATION:.1f}s cap: "
+                f"{longest_visual_shot:.6f}s"
+            )
+        logger.info(
+            "[Pacing] Longest final visual shot %.3fs (cap %.3fs)",
+            longest_visual_shot,
+            MAX_SHOT_DURATION,
+        )
+
+        headline_clip = create_headline_clip(
+            title,
+            min(HEADLINE_DURATION, audio_duration),
+            cover_line=cover_line,
+        )
         if headline_clip:
             overlay_clips.append(headline_clip)
         if captions and caption_groups:
@@ -1901,14 +3683,23 @@ def generate_video(
                 c.close()
             except Exception:
                 pass
+            parent_clip = getattr(c, "_scap_parent_clip", None)
+            if parent_clip:
+                try:
+                    parent_clip.close()
+                except Exception:
+                    pass
             temp_path = getattr(c, "_scap_temp_path", None)
             if temp_path:
                 try:
                     Path(temp_path).unlink(missing_ok=True)
                 except OSError:
                     pass
+        audio_paths_to_remove = {temp_audio_path}
         if actual_audio_path:
+            audio_paths_to_remove.add(Path(actual_audio_path))
+        for audio_path in audio_paths_to_remove:
             try:
-                Path(actual_audio_path).unlink(missing_ok=True)
+                audio_path.unlink(missing_ok=True)
             except OSError:
                 pass

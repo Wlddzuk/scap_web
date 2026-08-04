@@ -23,9 +23,19 @@ from app import (
     scrape_url_content,
     validate_url,
 )
-from models import Article, VideoMetrics
+from models import (
+    Article,
+    find_matching_hook_index,
+    valid_hook_index,
+    VideoMetrics,
+)
 from summarizer import summarize_article
-from video_generator import generate_video, get_groq_client
+from video_generator import (
+    DEFAULT_COLOR_INTENSITY,
+    generate_video,
+    get_groq_client,
+    normalize_color_intensity,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -85,6 +95,7 @@ class StoryCandidate:
     viral_score: Optional[float] = None
     score_reason: str = ""
     use_rss_fallback: bool = False
+    hero_image: str = ""
 
     def to_dict(self) -> dict:
         return asdict(self)
@@ -105,6 +116,12 @@ class CandidateScrapeError(RuntimeError):
     def __init__(self, reason: str):
         super().__init__(reason)
         self.reason = reason
+
+
+class StoryScoringError(RuntimeError):
+    """Raised when stories exist but no configured ranker can score them."""
+
+    error_code = "scoring_unavailable"
 
 
 def _request_with_retry(url: str, **kwargs) -> requests.Response:
@@ -302,6 +319,24 @@ def _feed_candidates(source: str, feed_url: str) -> list[StoryCandidate]:
             url = (entry.get("link") or entry.get("id") or "").strip()
             if not title or not _canonical_url(url):
                 continue
+            hero_image = ""
+            media_candidates = []
+            media_candidates.extend(entry.get("media_content") or [])
+            media_candidates.extend(entry.get("media_thumbnail") or [])
+            media_candidates.extend(entry.get("enclosures") or [])
+            for media in media_candidates:
+                if not isinstance(media, dict):
+                    continue
+                media_url = str(media.get("url") or media.get("href") or "").strip()
+                media_type = str(media.get("type") or "").casefold()
+                if media_url and (
+                    media_type.startswith("image/")
+                    or media_url.lower().split("?", 1)[0].endswith(
+                        (".jpg", ".jpeg", ".png", ".webp")
+                    )
+                ):
+                    hero_image = media_url
+                    break
             candidates.append(
                 StoryCandidate(
                     title=title,
@@ -313,6 +348,7 @@ def _feed_candidates(source: str, feed_url: str) -> list[StoryCandidate]:
                     published=str(
                         entry.get("published") or entry.get("updated") or ""
                     ),
+                    hero_image=hero_image,
                 )
             )
         logger.info("[Discovery] %s returned %d candidates", source, len(candidates))
@@ -527,24 +563,8 @@ def _performance_examples(
     }
 
 
-def score_candidates(candidates: Iterable[StoryCandidate]) -> list[StoryCandidate]:
-    """Score every candidate in one batched Groq request, retrying once."""
-    candidates = list(candidates)
-    if not candidates:
-        return []
-
-    client = get_groq_client()
-    if not client:
-        logger.error("[Discovery] GROQ_API_KEY is required for viral scoring")
-        return []
-    # Groq's SDK retries transport/rate-limit failures by default. Disable those
-    # hidden retries so this function performs exactly the one explicit retry.
-    scoring_client = (
-        client.with_options(max_retries=0)
-        if hasattr(client, "with_options")
-        else client
-    )
-
+def _scoring_prompts(candidates: list[StoryCandidate]) -> tuple[str, str]:
+    """Build the shared strict-JSON prompt used by every scoring provider."""
     compact_candidates = [
         {
             "id": index,
@@ -575,45 +595,167 @@ def score_candidates(candidates: Iterable[StoryCandidate]) -> list[StoryCandidat
         ensure_ascii=False,
         separators=(",", ":"),
     )
+    return system_prompt, user_prompt
 
-    last_error = None
-    for attempt in range(2):
-        try:
-            response = scoring_client.chat.completions.create(
-                model="llama-3.3-70b-versatile",
-                messages=[
-                    {"role": "system", "content": system_prompt},
-                    {"role": "user", "content": user_prompt},
-                ],
-                temperature=0.1,
-                max_tokens=4000,
-                response_format={"type": "json_object"},
-                timeout=SCORING_TIMEOUT,
-            )
-            parsed = _parse_scores(
-                response.choices[0].message.content.strip(),
-                candidates,
-            )
-            for index, candidate in enumerate(candidates):
-                candidate.viral_score = parsed[index]["score"]
-                candidate.score_reason = parsed[index]["reason"]
-            return sorted(
-                candidates,
-                key=lambda candidate: candidate.viral_score or 0,
-                reverse=True,
-            )
-        except Exception as exc:
-            last_error = exc
-            logger.warning(
-                "[Discovery] Batched Groq scoring attempt %d/2 failed: %s",
-                attempt + 1,
-                exc,
-            )
-            if attempt == 0:
-                time.sleep(1)
 
-    logger.error("[Discovery] Scoring failed after one retry: %s", last_error)
-    return []
+def _groq_scoring_content(system_prompt: str, user_prompt: str) -> str:
+    client = get_groq_client()
+    if not client:
+        raise RuntimeError("Groq scoring is not configured")
+    # The outer provider loop owns retries; disable hidden SDK retries.
+    scoring_client = (
+        client.with_options(max_retries=0)
+        if hasattr(client, "with_options")
+        else client
+    )
+    response = scoring_client.chat.completions.create(
+        model="llama-3.3-70b-versatile",
+        messages=[
+            {"role": "system", "content": system_prompt},
+            {"role": "user", "content": user_prompt},
+        ],
+        temperature=0.1,
+        max_tokens=4000,
+        response_format={"type": "json_object"},
+        timeout=SCORING_TIMEOUT,
+    )
+    return response.choices[0].message.content.strip()
+
+
+def _openrouter_scoring_content(system_prompt: str, user_prompt: str) -> str:
+    api_key = os.getenv("OPENROUTER_API_KEY", "").strip()
+    if not api_key:
+        raise RuntimeError("OpenRouter scoring is not configured")
+    response = requests.post(
+        "https://openrouter.ai/api/v1/chat/completions",
+        headers={
+            "Authorization": f"Bearer {api_key}",
+            "Content-Type": "application/json",
+            "HTTP-Referer": os.getenv("PUBLIC_BASE_URL", "http://localhost:5050"),
+            "X-Title": "Clipper",
+        },
+        json={
+            "model": "moonshotai/kimi-k2",
+            "messages": [
+                {"role": "system", "content": system_prompt},
+                {"role": "user", "content": user_prompt},
+            ],
+            "temperature": 0.1,
+            "max_tokens": 4000,
+            "response_format": {"type": "json_object"},
+        },
+        timeout=SCORING_TIMEOUT,
+    )
+    response.raise_for_status()
+    payload = response.json()
+    if payload.get("error"):
+        raise RuntimeError("OpenRouter rejected the scoring request")
+    try:
+        return payload["choices"][0]["message"]["content"].strip()
+    except (KeyError, IndexError, TypeError, AttributeError) as error:
+        raise ValueError("OpenRouter returned an invalid scoring response") from error
+
+
+def _gemini_scoring_model_name() -> str:
+    return (
+        os.getenv("GEMINI_SCORING_MODEL", "").strip()
+        or "gemini-flash-latest"
+    )
+
+
+def _gemini_scoring_content(system_prompt: str, user_prompt: str) -> str:
+    api_key = os.getenv("GEMINI_API_KEY", "").strip()
+    if not api_key:
+        raise RuntimeError("Gemini scoring is not configured")
+
+    import google.generativeai as genai
+
+    genai.configure(api_key=api_key)
+    model = genai.GenerativeModel(_gemini_scoring_model_name())
+    response = model.generate_content(
+        f"{system_prompt}\n\n{user_prompt}",
+        generation_config={
+            "temperature": 0.1,
+            "max_output_tokens": 4000,
+            "response_mime_type": "application/json",
+        },
+        request_options={"timeout": SCORING_TIMEOUT},
+    )
+    content = getattr(response, "text", "")
+    if not isinstance(content, str) or not content.strip():
+        raise ValueError("Gemini returned an empty scoring response")
+    return content.strip()
+
+
+def _provider_status_code(error: Exception) -> int | None:
+    status_code = getattr(error, "status_code", None)
+    if isinstance(status_code, int):
+        return status_code
+    response = getattr(error, "response", None)
+    status_code = getattr(response, "status_code", None)
+    return status_code if isinstance(status_code, int) else None
+
+
+def score_candidates(candidates: Iterable[StoryCandidate]) -> list[StoryCandidate]:
+    """Score one candidate batch with provider fallback and honest failure."""
+    candidates = list(candidates)
+    if not candidates:
+        return []
+
+    system_prompt, user_prompt = _scoring_prompts(candidates)
+    providers = []
+    if os.getenv("GROQ_API_KEY", "").strip():
+        providers.append(("Groq", _groq_scoring_content, 2))
+    if os.getenv("OPENROUTER_API_KEY", "").strip():
+        providers.append(("OpenRouter", _openrouter_scoring_content, 1))
+    if os.getenv("GEMINI_API_KEY", "").strip():
+        providers.append(("Gemini", _gemini_scoring_content, 1))
+
+    if not providers:
+        logger.error("[Discovery] No AI provider is configured for viral scoring")
+        raise StoryScoringError("No story-scoring provider is configured")
+
+    provider_errors = {}
+    for provider_name, scorer, max_attempts in providers:
+        for attempt in range(max_attempts):
+            try:
+                parsed = _parse_scores(
+                    scorer(system_prompt, user_prompt),
+                    candidates,
+                )
+                for index, candidate in enumerate(candidates):
+                    candidate.viral_score = parsed[index]["score"]
+                    candidate.score_reason = parsed[index]["reason"]
+                logger.info("[Discovery] %s ranked %d candidates", provider_name, len(candidates))
+                return sorted(
+                    candidates,
+                    key=lambda candidate: candidate.viral_score or 0,
+                    reverse=True,
+                )
+            except Exception as error:
+                provider_errors[provider_name] = error
+                logger.warning(
+                    "[Discovery] Batched %s scoring attempt %d/%d failed: %s",
+                    provider_name,
+                    attempt + 1,
+                    max_attempts,
+                    error,
+                )
+                # Authentication and permission failures will not improve with
+                # an immediate retry. Move to the next configured provider.
+                if _provider_status_code(error) in {400, 401, 403, 404}:
+                    break
+                if attempt + 1 < max_attempts:
+                    time.sleep(1)
+
+    logger.error(
+        "[Discovery] All configured scoring providers failed: %s",
+        ", ".join(
+            f"{provider}={error.__class__.__name__}"
+            for provider, error in provider_errors.items()
+        ),
+    )
+    raise StoryScoringError("All configured story-scoring providers failed")
 
 
 def discover_and_score() -> list[StoryCandidate]:
@@ -642,7 +784,7 @@ def _rss_scrape_payload(candidate: StoryCandidate) -> dict:
         "url": candidate.url,
         "title": candidate.title,
         "content": content,
-        "hero_image": None,
+        "hero_image": candidate.hero_image or None,
         "site_name": candidate.source,
         "content_source": "rss_summary",
     }
@@ -707,8 +849,12 @@ def _pipeline_failure_result(
     }
 
 
-def _process_candidate(candidate: StoryCandidate) -> dict:
+def _process_candidate(
+    candidate: StoryCandidate,
+    color_intensity: str = DEFAULT_COLOR_INTENSITY,
+) -> dict:
     """Run one selected story through the existing persisted video pipeline."""
+    color_intensity = normalize_color_intensity(color_intensity)
     article_id = None
     stage = "scrape"
     failure_reason = ""
@@ -757,13 +903,23 @@ def _process_candidate(candidate: StoryCandidate) -> dict:
             article.bullets = json.dumps(summary["bullets"])
             article.video_script = summary["video_script"]
             article.hashtags = json.dumps(summary.get("hashtags", []))
+            article.cover_line = summary.get("cover_line") or None
+            article.cta_question = summary.get("cta_question") or None
+            article.search_caption = summary.get("search_caption") or None
+            article.series_lane = summary.get("series_lane") or None
 
             # Engagement metadata (scene-based generation)
             from visual_styles import STYLES as VISUAL_STYLES
             scenes = summary.get("scenes") or []
             article.scenes = json.dumps(scenes) if scenes else None
+            article.visual_sources = None
             hook_variants = summary.get("hook_variants") or []
             article.hook_variants = json.dumps(hook_variants) if hook_variants else None
+            article.best_hook_index = valid_hook_index(
+                summary.get("best_hook_index"),
+                hook_variants,
+            )
+            article.hook_index_used = None
             article.dominant_emotion = summary.get("dominant_emotion") or None
             suggested = summary.get("suggested_style")
             if suggested and suggested in VISUAL_STYLES:
@@ -777,8 +933,12 @@ def _process_candidate(candidate: StoryCandidate) -> dict:
             article_scenes = scenes or None
             article_style = article.style
             article_emotion = article.dominant_emotion
+            article_cover_line = getattr(article, "cover_line", None)
+            article_series_lane = getattr(article, "series_lane", None)
+            article_hero_image = getattr(article, "hero_image", None)
 
         stage = "render"
+        visual_sources = []
         video_path = generate_video(
             article_id=article_id,
             title=title,
@@ -787,11 +947,22 @@ def _process_candidate(candidate: StoryCandidate) -> dict:
             scenes=article_scenes,
             style_key=article_style,
             emotion=article_emotion,
+            cover_line=article_cover_line,
+            series_lane=article_series_lane,
+            hero_image=article_hero_image,
+            color_intensity=color_intensity,
+            visual_sources_out=visual_sources,
         )
 
         with app.app_context():
             article = db.session.get(Article, article_id)
             article.video_path = Path(video_path).name
+            article.color_intensity = color_intensity
+            article.visual_sources = json.dumps(visual_sources)
+            article.hook_index_used = find_matching_hook_index(
+                hook_variants,
+                article_scenes or [],
+            )
             article.status = "video_done"
             article.video_generated_at = datetime.now(timezone.utc)
             db.session.commit()

@@ -254,6 +254,8 @@ class GenerationBudgetTests(unittest.TestCase):
             payload = generation_budget.get_generation_budget()
 
         self.assertAlmostEqual(payload["limiting_balance_usd"], 0.2)
+        # Illustrated Science reuses each scene image and needs one hook still,
+        # so twenty cents safely covers a standard render.
         self.assertTrue(payload["standard_video_affordable"])
         self.assertFalse(payload["max_motion_video_affordable"])
         self.assertEqual(payload["severity"], "critical")

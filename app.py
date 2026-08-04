@@ -14,6 +14,7 @@ from concurrent.futures import ThreadPoolExecutor, as_completed
 from datetime import datetime, timezone, timedelta
 from urllib.parse import urlparse, urlencode, quote
 from threading import Event, Lock, Thread
+from tempfile import TemporaryDirectory
 import shutil
 import zipfile
 from io import BytesIO
@@ -31,15 +32,32 @@ load_dotenv()
 from models import (
     db,
     Article,
+    find_matching_hook_index,
     PlatformPost,
     PublisherAccount,
     TikTokAccount,
+    valid_hook_index,
     VideoMetrics,
 )
-from summarizer import summarize_article
-from video_generator import generate_video
+from summarizer import (
+    HASHTAG_MAX_CHARS,
+    SEARCH_CAPTION_MAX_CHARS,
+    CTA_QUESTION_MAX_CHARS,
+    summarize_article,
+)
+from video_generator import (
+    DEFAULT_COLOR_INTENSITY,
+    generate_video,
+    normalize_color_intensity,
+)
+import tts_engine
 from carousel_generator import generate_carousel
-from visual_styles import list_styles, get_style, STYLES as VISUAL_STYLES
+from visual_styles import (
+    DEFAULT_STYLE,
+    STYLES as VISUAL_STYLES,
+    get_style,
+    list_styles,
+)
 from tiktok_service import (
     AUTH_URL as TIKTOK_AUTH_URL,
     TikTokAPIError,
@@ -75,6 +93,12 @@ logging.basicConfig(
     format='%(asctime)s - %(name)s - %(levelname)s - %(message)s'
 )
 logger = logging.getLogger(__name__)
+
+VOICE_TONES = frozenset(tts_engine.VOICE_TONE_PRESETS)
+VOICE_PREVIEW_TEXT = (
+    "A single bolt of lightning can heat the air five times hotter than the "
+    "surface of the sun. The surrounding air expands so fast that we hear thunder."
+)
 
 
 # ============================================================
@@ -261,8 +285,16 @@ def _migrate_schema():
     new_cols = [
         ("scenes", "TEXT"),
         ("hook_variants", "TEXT"),
+        ("best_hook_index", "INTEGER"),
+        ("hook_index_used", "INTEGER"),
         ("dominant_emotion", "VARCHAR(32)"),
         ("style", "VARCHAR(32)"),
+        ("color_intensity", "VARCHAR(16)"),
+        ("visual_sources", "TEXT"),
+        ("cover_line", "VARCHAR(128)"),
+        ("cta_question", "VARCHAR(512)"),
+        ("search_caption", "TEXT"),
+        ("series_lane", "VARCHAR(32)"),
         ("substack_post", "TEXT"),
         ("carousel_dir", "VARCHAR(512)"),
         ("carousel_audio", "VARCHAR(512)"),
@@ -794,20 +826,33 @@ def _video_duration_seconds(video_path):
 
 
 def suggested_tiktok_caption(article):
-    """Build the same title + hashtag caption used by the dashboard."""
+    """Build search copy + CTA + three hashtags for the posting dialog."""
     hashtags = []
     if article.hashtags:
         try:
             parsed = json.loads(article.hashtags)
             if isinstance(parsed, list):
-                hashtags = [str(tag) for tag in parsed if str(tag).strip()]
+                hashtags = [
+                    str(tag).strip()[:HASHTAG_MAX_CHARS].rstrip()
+                    for tag in parsed
+                    if str(tag).strip()
+                ][:3]
         except (json.JSONDecodeError, TypeError):
             pass
-    hashtag_text = ' '.join(hashtags)
-    caption = article.title
-    if hashtag_text:
-        caption += f'\n\n{hashtag_text}'
-    return caption[:2_200]
+    search_caption = str(
+        getattr(article, 'search_caption', None) or article.title
+    ).strip()[:SEARCH_CAPTION_MAX_CHARS].rstrip()
+    cta_question = str(
+        getattr(article, 'cta_question', None) or ''
+    ).strip()[:CTA_QUESTION_MAX_CHARS].rstrip()
+    # Bound each field before joining instead of slicing the final block. That
+    # keeps the required CTA and three hashtags intact at the tail.
+    caption_parts = [
+        search_caption,
+        cta_question,
+        ' '.join(hashtags),
+    ]
+    return '\n\n'.join(part for part in caption_parts if part)
 
 
 def _make_tiktok_publisher():
@@ -1952,12 +1997,25 @@ def run_summarize_in_background(app_context, article_id):
             article.bullets = json.dumps(result['bullets'])
             article.video_script = result['video_script']
             article.hashtags = json.dumps(result.get('hashtags', []))
+            article.cover_line = result.get('cover_line') or None
+            article.cta_question = result.get('cta_question') or None
+            article.search_caption = result.get('search_caption') or None
+            article.series_lane = result.get('series_lane') or None
 
             # Engagement metadata
             scenes = result.get('scenes') or []
             article.scenes = json.dumps(scenes) if scenes else None
+            article.visual_sources = None
             hook_variants = result.get('hook_variants') or []
             article.hook_variants = json.dumps(hook_variants) if hook_variants else None
+            article.best_hook_index = valid_hook_index(
+                result.get('best_hook_index'),
+                hook_variants,
+            )
+            # Re-summarizing replaces the hook options, so an index attributed
+            # to the previous list can no longer identify the old MP4's opening
+            # accurately. The next successful render restores attribution.
+            article.hook_index_used = None
             article.dominant_emotion = result.get('dominant_emotion') or None
             suggested = result.get('suggested_style')
             if suggested and suggested in VISUAL_STYLES:
@@ -1983,7 +2041,9 @@ def run_video_in_background(
     image_source="ai",
     style_override=None,
     use_video_hook=None,
+    voice_tone="controlled",
     generation_token=None,
+    color_intensity=DEFAULT_COLOR_INTENSITY,
 ):
     """Run video generation in a background thread, with a watchdog timeout.
 
@@ -1994,6 +2054,7 @@ def run_video_in_background(
     watchdog already declared failure.
     """
     from threading import Timer
+    color_intensity = normalize_color_intensity(color_intensity)
 
     def _watchdog_fire():
         # Runs in a separate thread — needs its own app context.
@@ -2025,8 +2086,12 @@ def run_video_in_background(
 
             try:
                 scenes = json.loads(article.scenes) if article.scenes else None
-                style_key = style_override or article.style or None
+                # First renders use the channel's Illustrated Science identity.
+                # A style is changed only when the user explicitly chooses one
+                # in the existing manual picker.
+                style_key = style_override or DEFAULT_STYLE
 
+                visual_sources = []
                 video_path = generate_video(
                     article_id=article.id,
                     title=article.title,
@@ -2036,6 +2101,12 @@ def run_video_in_background(
                     style_key=style_key,
                     emotion=article.dominant_emotion,
                     use_video_hook=use_video_hook,
+                    voice_tone=voice_tone,
+                    cover_line=article.cover_line,
+                    series_lane=article.series_lane,
+                    hero_image=article.hero_image,
+                    color_intensity=color_intensity,
+                    visual_sources_out=visual_sources,
                 )
 
                 # Re-fetch: watchdog may have already marked us failed while we
@@ -2057,12 +2128,18 @@ def run_video_in_background(
                         pass
                     return
 
-                # Persist the style that was actually used (in case it was auto-picked inside)
-                if style_override:
-                    article.style = style_override
+                article.style = style_key
+                article.color_intensity = color_intensity
+                article.visual_sources = json.dumps(visual_sources)
 
                 relative_path = os.path.basename(video_path)
                 article.video_path = relative_path
+                article.hook_index_used = find_matching_hook_index(
+                    json.loads(article.hook_variants)
+                    if article.hook_variants
+                    else [],
+                    json.loads(article.scenes) if article.scenes else [],
+                )
                 article.status = 'video_done'
                 article.video_generation_token = None
                 article.video_generated_at = datetime.now(timezone.utc)
@@ -2734,11 +2811,148 @@ def summarize_article_endpoint(article_id):
     }), 202
 
 
+@app.route('/api/articles/<int:article_id>/hook', methods=['POST'])
+def select_article_hook(article_id):
+    """Select one generated hook and keep scenes/script in exact alignment."""
+    article = db.session.get(Article, article_id)
+    if not article:
+        return jsonify({'error': 'Article not found'}), 404
+
+    processing_statuses = {
+        'summarizing',
+        'generating_video',
+        'generating_carousel',
+    }
+    if article.status in processing_statuses:
+        return jsonify({'error': 'Article is already being processed'}), 409
+
+    payload = request.get_json(silent=True)
+    if not isinstance(payload, dict) or 'hook_index' not in payload:
+        return jsonify({'error': 'hook_index is required'}), 400
+    hook_index = payload['hook_index']
+    if type(hook_index) is not int:
+        return jsonify({'error': 'hook_index must be an integer'}), 400
+
+    try:
+        hook_variants = json.loads(article.hook_variants) if article.hook_variants else []
+    except (TypeError, ValueError):
+        return jsonify({'error': 'Stored hook options are invalid; re-summarize this article'}), 409
+    if not isinstance(hook_variants, list) or not hook_variants:
+        return jsonify({'error': 'Article has no hook options; re-summarize it first'}), 400
+    if hook_index < 0 or hook_index >= len(hook_variants):
+        return jsonify({'error': 'hook_index is out of range'}), 400
+
+    selected_hook = hook_variants[hook_index]
+    if not isinstance(selected_hook, str) or not selected_hook.strip():
+        return jsonify({'error': 'Selected hook is empty; re-summarize this article'}), 409
+    selected_hook = selected_hook.strip()
+
+    original_scenes_json = article.scenes
+    try:
+        scenes = json.loads(original_scenes_json) if original_scenes_json else []
+    except (TypeError, ValueError):
+        return jsonify({'error': 'Stored scenes are invalid; re-summarize this article'}), 409
+    if not isinstance(scenes, list) or not scenes:
+        return jsonify({'error': 'Article has no scenes; re-summarize it first'}), 409
+    if any(
+        not isinstance(scene, dict)
+        or not isinstance(scene.get('speech'), str)
+        or not scene['speech'].strip()
+        for scene in scenes
+    ):
+        return jsonify({'error': 'Stored scenes are incomplete; re-summarize this article'}), 409
+
+    previous_script = (article.video_script or '').strip()
+    previous_opening = scenes[0]['speech'].strip()
+    scenes[0] = {**scenes[0], 'speech': selected_hook}
+    rewritten_script = ' '.join(scene['speech'].strip() for scene in scenes)
+    requires_regeneration = bool(
+        article.video_path
+        and (
+            previous_opening != selected_hook
+            or previous_script != rewritten_script
+        )
+    )
+
+    # Match the generation endpoint's optimistic ownership pattern so a hook
+    # change cannot race a render that claims the same Article.
+    current_status = article.status
+    update = Article.query.filter(
+        Article.id == article_id,
+        Article.scenes == original_scenes_json,
+    )
+    if current_status is None:
+        update = update.filter(Article.status.is_(None))
+    else:
+        update = update.filter(Article.status == current_status)
+    updated = update.update(
+        {
+            Article.scenes: json.dumps(scenes),
+            Article.video_script: rewritten_script,
+        },
+        synchronize_session=False,
+    )
+    if updated != 1:
+        db.session.rollback()
+        return jsonify({'error': 'Article is already being processed'}), 409
+    db.session.commit()
+
+    article = db.session.get(Article, article_id)
+    message = f'Hook {hook_index + 1} selected'
+    if requires_regeneration:
+        message += '. Regenerate the video to use it.'
+    return jsonify({
+        'message': message,
+        'requires_regeneration': requires_regeneration,
+        'article': article.to_dict(),
+    })
+
+
+@app.route('/api/tts/preview', methods=['POST'])
+def preview_voice_tone():
+    """Return a short WAV preview for one of Clipper's voice-tone presets."""
+    payload = request.get_json(silent=True)
+    if payload is None:
+        payload = {}
+    elif not isinstance(payload, dict):
+        return jsonify({'error': 'JSON body must be an object'}), 400
+    voice_tone = payload.get('voice_tone', 'controlled')
+    if not isinstance(voice_tone, str) or voice_tone not in VOICE_TONES:
+        return jsonify({'error': 'Unknown voice tone'}), 400
+
+    try:
+        with TemporaryDirectory(prefix='clipper-voice-preview-') as temp_dir:
+            requested_path = os.path.join(temp_dir, f'{voice_tone}.wav')
+            audio_path = tts_engine.synthesize(
+                VOICE_PREVIEW_TEXT,
+                requested_path,
+                voice_tone=voice_tone,
+            )
+            with open(audio_path, 'rb') as audio_file:
+                audio_bytes = audio_file.read()
+
+        return send_file(
+            BytesIO(audio_bytes),
+            mimetype='audio/wav',
+            as_attachment=False,
+            download_name=f'{voice_tone}-voice-preview.wav',
+        )
+    except Exception:
+        logger.error(
+            "Failed to generate voice preview for tone=%s",
+            voice_tone,
+            exc_info=True,
+        )
+        return jsonify({
+            'error': 'Voice preview is unavailable right now. Please try again.'
+        }), 503
+
+
 @app.route('/api/articles/<int:article_id>/video', methods=['POST'])
 def generate_video_endpoint(article_id):
     """Trigger video generation for an article (runs in background).
 
-    Optional JSON body: {"style": "manga"} overrides the auto-picked style.
+    Optional JSON body may override the visual style and voice tone.
     """
     article = db.session.get(Article, article_id)
     if not article:
@@ -2750,15 +2964,35 @@ def generate_video_endpoint(article_id):
     if article.status in ('summarizing', 'generating_video', 'generating_carousel'):
         return jsonify({'error': 'Article is already being processed'}), 409
 
-    payload = request.get_json(silent=True) or {}
+    payload = request.get_json(silent=True)
+    if payload is None:
+        payload = {}
+    elif not isinstance(payload, dict):
+        return jsonify({'error': 'JSON body must be an object'}), 400
 
     image_source = payload.get('image_source', 'ai')
-    if image_source not in ('ai', 'stock'):
+    if image_source not in ('ai', 'stock', 'mixed'):
         image_source = 'ai'
 
     style_override = payload.get('style')
     if style_override and style_override not in VISUAL_STYLES:
         return jsonify({'error': f'Unknown style: {style_override}'}), 400
+
+    voice_tone = payload.get('voice_tone', 'controlled')
+    if not isinstance(voice_tone, str) or voice_tone not in VOICE_TONES:
+        return jsonify({'error': 'Unknown voice tone'}), 400
+
+    raw_color_intensity = payload.get(
+        'color_intensity',
+        DEFAULT_COLOR_INTENSITY,
+    )
+    if (
+        not isinstance(raw_color_intensity, str)
+        or raw_color_intensity.strip().lower()
+        not in {'natural', 'vivid', 'electric'}
+    ):
+        return jsonify({'error': 'Unknown color intensity'}), 400
+    color_intensity = normalize_color_intensity(raw_color_intensity)
 
     # `use_video_hook` is a tri-state: True/False/None.
     #   True  -> AI video hook (FAL); False -> image hook; None -> env default.
@@ -2796,8 +3030,10 @@ def generate_video_endpoint(article_id):
             image_source,
             style_override,
             use_video_hook,
+            voice_tone,
             generation_token,
-        )
+        ),
+        kwargs={'color_intensity': color_intensity},
     )
     thread.daemon = True
     thread.start()

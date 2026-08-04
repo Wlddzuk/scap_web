@@ -14,6 +14,34 @@ let searchQuery = '';
 let initialLoadDone = false;
 let availableStyles = [];       // loaded from /api/styles
 let selectedStyleByArticle = {}; // { [articleId]: 'manga' } — user override
+const DEFAULT_VISUAL_STYLE = 'illustrated_science';
+let selectedVoiceToneByArticle = {}; // { [articleId]: 'controlled' | 'energetic' | 'documentary' }
+let selectedColorIntensityByArticle = {}; // { [articleId]: 'natural' | 'vivid' | 'electric' }
+let voicePreviewAudioContext = null;
+let activeVoicePreviewSource = null;
+let activeVoicePreviewAudio = null;
+let activeVoicePreviewObjectUrl = null;
+const VOICE_TONES = {
+    controlled: {
+        label: 'Controlled',
+        description: 'Curious energy — strong hook, natural middle, lifted reveal.'
+    },
+    energetic: {
+        label: 'Energetic',
+        description: 'Brighter and faster for playful, high-momentum stories.'
+    },
+    documentary: {
+        label: 'Documentary',
+        description: 'Measured and authoritative for serious or complex stories.'
+    }
+};
+const COLOR_INTENSITIES = {
+    natural: 'Natural',
+    vivid: 'Vivid (Recommended)',
+    electric: 'Electric (maximum color)'
+};
+const COLOR_INTENSITY_STORAGE_KEY = 'clipper_color_intensity';
+const DEFAULT_COLOR_INTENSITY = 'vivid';
 let platformConnections = {
     tiktok: { configured: false, connected: false },
     instagram: { configured: false, connected: false },
@@ -295,6 +323,9 @@ function articlesChanged(prev, next) {
             prev[i].carousel_dir !== next[i].carousel_dir ||
             prev[i].tiktok_publish_status !== next[i].tiktok_publish_status ||
             prev[i].tiktok_publish_error !== next[i].tiktok_publish_error ||
+            prev[i].hook_index_used !== next[i].hook_index_used ||
+            prev[i].best_hook_index !== next[i].best_hook_index ||
+            prev[i].video_script !== next[i].video_script ||
             JSON.stringify(prev[i].platform_posts || []) !== JSON.stringify(next[i].platform_posts || []) ||
             prev[i].tldr !== next[i].tldr) {
             return true;
@@ -444,6 +475,7 @@ async function disconnectPlatform(platform) {
 async function fetchDiscoveryCandidates(quiet = false) {
     if (discoveryRequestInFlight) return false;
     discoveryRequestInFlight = true;
+    const previousDiscoveryStatus = discoveryState.status;
     const previousStatuses = new Map(
         (discoveryState.candidates || []).map(candidate => [candidate.candidate_id, candidate.pipeline_status])
     );
@@ -459,6 +491,9 @@ async function fetchDiscoveryCandidates(quiet = false) {
         if (changed) {
             discoveryRenderSignature = nextSignature;
             renderDiscovery();
+        }
+        if (previousDiscoveryStatus === 'running' && data.status === 'failed') {
+            showToast(data.error || 'Story discovery failed. Please try again.', 'error');
         }
 
         let pipelineCompleted = false;
@@ -527,6 +562,13 @@ async function runStoryDiscovery() {
     }
 }
 
+function focusStoryDiscovery() {
+    const button = document.getElementById('discovery-run-btn');
+    if (!button) return;
+    button.scrollIntoView({ behavior: 'smooth', block: 'center' });
+    window.setTimeout(() => button.focus({ preventScroll: true }), 450);
+}
+
 async function makeDiscoveryVideo(candidateId) {
     const button = document.querySelector(`[data-discovery-video="${candidateId}"]`);
     if (button) {
@@ -535,9 +577,14 @@ async function makeDiscoveryVideo(candidateId) {
     }
 
     try {
+        const colorIntensity = getColorIntensityPref();
         const response = await fetch(
             `${API_BASE}/api/discovery/candidates/${candidateId}/make-video`,
-            { method: 'POST' }
+            {
+                method: 'POST',
+                headers: { 'Content-Type': 'application/json' },
+                body: JSON.stringify({ color_intensity: colorIntensity })
+            }
         );
         const data = await response.json();
         if (!response.ok) throw new Error(data.error || 'Could not start video creation');
@@ -615,10 +662,16 @@ function renderDiscovery() {
 
     const focusDescriptor = captureDiscoveryFocus(container);
     if (!candidates.length) {
-        container.innerHTML = discoveryState.status === 'complete'
+        const isComplete = discoveryState.status === 'complete';
+        const isFailed = discoveryState.status === 'failed';
+        container.innerHTML = isComplete
             ? '<div class="discovery-empty">No unseen stories are waiting right now.</div>'
-            : '';
-        container.classList.toggle('hidden', discoveryState.status !== 'complete');
+            : isFailed
+                ? `<div class="discovery-empty">${escapeHtml(
+                    discoveryState.error || 'Story discovery failed. Please try again.'
+                )}</div>`
+                : '';
+        container.classList.toggle('hidden', !isComplete && !isFailed);
         restoreDiscoveryFocus(container, focusDescriptor);
         return;
     }
@@ -781,6 +834,161 @@ function selectStyle(articleId, styleKey) {
     }
 }
 
+async function selectHook(event, articleId, hookIndex) {
+    if (event) event.stopPropagation();
+    const picker = document.querySelector(
+        `.hook-variants[data-article-id="${articleId}"]`
+    );
+    const buttons = picker ? Array.from(picker.querySelectorAll('.hook-variant')) : [];
+    buttons.forEach(button => {
+        button.disabled = true;
+    });
+
+    try {
+        const response = await fetch(`${API_BASE}/api/articles/${articleId}/hook`, {
+            method: 'POST',
+            headers: { 'Content-Type': 'application/json' },
+            body: JSON.stringify({ hook_index: hookIndex })
+        });
+        const data = await response.json();
+        if (!response.ok) throw new Error(data.error || 'Could not select this hook');
+
+        const articleIndex = articles.findIndex(article => article.id === articleId);
+        if (articleIndex !== -1 && data.article) {
+            articles[articleIndex] = data.article;
+        }
+        expandedArticles.add(articleId);
+        renderArticles();
+        showToast(
+            data.message || `Hook ${hookIndex + 1} selected`,
+            data.requires_regeneration ? 'info' : 'success'
+        );
+    } catch (error) {
+        console.error('Hook selection failed:', error);
+        showToast(error.message || 'Could not select this hook', 'error');
+        buttons.forEach(button => {
+            button.disabled = false;
+        });
+    }
+}
+
+function selectVoiceTone(articleId, voiceTone) {
+    if (!VOICE_TONES[voiceTone]) return;
+    selectedVoiceToneByArticle[articleId] = voiceTone;
+    const description = document.querySelector(
+        `[data-voice-tone-description="${articleId}"]`
+    );
+    if (description) description.textContent = VOICE_TONES[voiceTone].description;
+}
+
+function stopActiveVoicePreview() {
+    if (activeVoicePreviewSource) {
+        try {
+            activeVoicePreviewSource.stop();
+        } catch (_error) {
+            // The source may already have ended.
+        }
+        activeVoicePreviewSource = null;
+    }
+    if (activeVoicePreviewAudio) {
+        activeVoicePreviewAudio.pause();
+        activeVoicePreviewAudio = null;
+    }
+    if (activeVoicePreviewObjectUrl) {
+        URL.revokeObjectURL(activeVoicePreviewObjectUrl);
+        activeVoicePreviewObjectUrl = null;
+    }
+}
+
+async function previewVoiceTone(event, articleId) {
+    if (event) event.stopPropagation();
+    const button = event && event.currentTarget;
+    const select = document.querySelector(`[data-voice-tone-select="${articleId}"]`);
+    const voiceTone = select && VOICE_TONES[select.value] ? select.value : 'controlled';
+    selectedVoiceToneByArticle[articleId] = voiceTone;
+
+    stopActiveVoicePreview();
+    if (button) {
+        button.disabled = true;
+        button.textContent = 'Loading…';
+    }
+
+    try {
+        const AudioContextType = window.AudioContext || window.webkitAudioContext;
+        if (AudioContextType) {
+            if (!voicePreviewAudioContext || voicePreviewAudioContext.state === 'closed') {
+                voicePreviewAudioContext = new AudioContextType();
+            }
+            if (voicePreviewAudioContext.state === 'suspended') {
+                await voicePreviewAudioContext.resume();
+            }
+        }
+
+        const response = await fetch(`${API_BASE}/api/tts/preview`, {
+            method: 'POST',
+            headers: { 'Content-Type': 'application/json' },
+            body: JSON.stringify({ voice_tone: voiceTone })
+        });
+
+        if (!response.ok) {
+            let data = {};
+            try {
+                data = await response.json();
+            } catch (_error) {
+                // The generic fallback below covers non-JSON server errors.
+            }
+            throw new Error(data.error || 'Voice preview is unavailable right now.');
+        }
+
+        const audioBuffer = await response.arrayBuffer();
+        if (voicePreviewAudioContext) {
+            const decoded = await voicePreviewAudioContext.decodeAudioData(audioBuffer.slice(0));
+            const source = voicePreviewAudioContext.createBufferSource();
+            source.buffer = decoded;
+            source.connect(voicePreviewAudioContext.destination);
+            activeVoicePreviewSource = source;
+            source.onended = () => {
+                if (activeVoicePreviewSource === source) activeVoicePreviewSource = null;
+                if (button && button.isConnected) {
+                    button.disabled = false;
+                    button.textContent = '▶ Preview';
+                }
+            };
+            source.start(0);
+        } else {
+            const blob = new Blob([audioBuffer], { type: 'audio/wav' });
+            activeVoicePreviewObjectUrl = URL.createObjectURL(blob);
+            const audio = new Audio(activeVoicePreviewObjectUrl);
+            activeVoicePreviewAudio = audio;
+            audio.addEventListener('ended', () => {
+                if (activeVoicePreviewAudio === audio) activeVoicePreviewAudio = null;
+                if (activeVoicePreviewObjectUrl) {
+                    URL.revokeObjectURL(activeVoicePreviewObjectUrl);
+                    activeVoicePreviewObjectUrl = null;
+                }
+                if (button && button.isConnected) {
+                    button.disabled = false;
+                    button.textContent = '▶ Preview';
+                }
+            }, { once: true });
+            await audio.play();
+        }
+
+        if (button) button.textContent = 'Playing…';
+    } catch (error) {
+        console.error('Voice preview failed:', error);
+        stopActiveVoicePreview();
+        showToast(
+            error.message || 'Voice preview is unavailable right now. Please try again.',
+            'error'
+        );
+        if (button && button.isConnected) {
+            button.disabled = false;
+            button.textContent = '▶ Preview';
+        }
+    }
+}
+
 function getVideoHookPref() {
     // localStorage value is the source of truth; checkbox is its UI mirror.
     return localStorage.getItem('clipper_video_hook') === '1';
@@ -797,7 +1005,56 @@ function syncHookToggle() {
     if (cb) cb.checked = getVideoHookPref();
 }
 
-async function generateVideo(articleId, imageSource = 'ai') {
+function normalizeColorIntensity(value) {
+    return Object.hasOwn(COLOR_INTENSITIES, value)
+        ? value
+        : DEFAULT_COLOR_INTENSITY;
+}
+
+function getColorIntensityPref() {
+    return normalizeColorIntensity(localStorage.getItem(COLOR_INTENSITY_STORAGE_KEY));
+}
+
+function onColorIntensityChange() {
+    const select = document.getElementById('color-intensity-select');
+    if (!select) return;
+    const colorIntensity = normalizeColorIntensity(select.value);
+    select.value = colorIntensity;
+    localStorage.setItem(COLOR_INTENSITY_STORAGE_KEY, colorIntensity);
+}
+
+function syncColorIntensityControl() {
+    const select = document.getElementById('color-intensity-select');
+    if (select) select.value = getColorIntensityPref();
+}
+
+function articleColorIntensity(article) {
+    return normalizeColorIntensity(
+        selectedColorIntensityByArticle[article.id]
+        || article.color_intensity
+        || getColorIntensityPref()
+    );
+}
+
+function selectColorIntensity(articleId, value) {
+    const colorIntensity = normalizeColorIntensity(value);
+    selectedColorIntensityByArticle[articleId] = colorIntensity;
+    const select = document.querySelector(
+        `[data-color-intensity-select="${articleId}"]`
+    );
+    if (select) select.value = colorIntensity;
+}
+
+function renderColorIntensityOptions(selectedValue) {
+    const selected = normalizeColorIntensity(selectedValue);
+    return Object.entries(COLOR_INTENSITIES).map(([value, label]) => `
+        <option value="${value}" ${selected === value ? 'selected' : ''}>
+            ${escapeHtml(label)}
+        </option>
+    `).join('');
+}
+
+async function generateVideo(articleId, imageSource = 'ai', requestedColorIntensity = null) {
     const btn = document.querySelector(`[data-video="${articleId}"]`);
     if (btn) {
         btn.disabled = true;
@@ -805,17 +1062,29 @@ async function generateVideo(articleId, imageSource = 'ai') {
     }
 
     const article = articles.find(a => a.id === articleId);
-    const chosenStyle = selectedStyleByArticle[articleId] || (article && article.style) || null;
+    const chosenStyle = selectedStyleByArticle[articleId] || DEFAULT_VISUAL_STYLE;
+    const voiceTone = selectedVoiceToneByArticle[articleId] || 'controlled';
     const useVideoHook = getVideoHookPref();
+    const colorIntensity = normalizeColorIntensity(
+        requestedColorIntensity
+        || (article && articleColorIntensity(article))
+        || getColorIntensityPref()
+    );
 
     const hookLabel = useVideoHook ? ' · AI video hook' : '';
-    showToast(`Generating video${chosenStyle ? ' (' + chosenStyle + ')' : ''}${hookLabel} — this may take a few minutes`, 'info');
+    const voiceLabel = VOICE_TONES[voiceTone].label;
+    showToast(
+        `Generating video · ${voiceLabel} voice · ${COLOR_INTENSITIES[colorIntensity]} color${chosenStyle ? ' · ' + chosenStyle : ''}${hookLabel} — this may take a few minutes`,
+        'info'
+    );
 
     try {
         const body = {};
         if (chosenStyle) body.style = chosenStyle;
         body.use_video_hook = useVideoHook;
         body.image_source = imageSource;
+        body.voice_tone = voiceTone;
+        body.color_intensity = colorIntensity;
 
         const response = await fetch(`${API_BASE}/api/articles/${articleId}/video`, {
             method: 'POST',
@@ -876,12 +1145,19 @@ async function generateCarousel(articleId, imageSource = 'ai') {
 function generateOutput(articleId) {
     const formatSelect = document.querySelector(`[data-format-select="${articleId}"]`);
     const sourceSelect = document.querySelector(`[data-source-select="${articleId}"]`);
+    const colorIntensitySelect = document.querySelector(
+        `[data-color-intensity-select="${articleId}"]`
+    );
     const format = formatSelect ? formatSelect.value : 'video';
     const imageSource = sourceSelect ? sourceSelect.value : 'ai';
+    const colorIntensity = normalizeColorIntensity(
+        colorIntensitySelect ? colorIntensitySelect.value : getColorIntensityPref()
+    );
+    selectedColorIntensityByArticle[articleId] = colorIntensity;
     if (format === 'carousel') {
         generateCarousel(articleId, imageSource);
     } else {
-        generateVideo(articleId, imageSource);
+        generateVideo(articleId, imageSource, colorIntensity);
     }
 }
 
@@ -1002,8 +1278,24 @@ function formatPublishStatus(status) {
 }
 
 function suggestedShareCaption(article) {
-    const hashtags = (article.hashtags || []).join(' ');
-    return `${article.title}${hashtags ? `\n\n${hashtags}` : ''}`;
+    const hashtags = Array.isArray(article.hashtags)
+        ? article.hashtags
+            .slice(0, 3)
+            .map(tag => String(tag || '').trim().slice(0, 64))
+            .filter(Boolean)
+            .join(' ')
+        : '';
+    const searchCaption = String(
+        article.search_caption || article.title || ''
+    ).trim().slice(0, 220).trim();
+    const ctaQuestion = String(
+        article.cta_question || ''
+    ).trim().slice(0, 220).trim();
+    return [
+        searchCaption,
+        ctaQuestion,
+        hashtags
+    ].filter(Boolean).join('\n\n');
 }
 
 function sharePlatformDisabledReason(platform, connection) {
@@ -1694,8 +1986,8 @@ function getStatusBadges(article) {
 
 function renderStylePicker(article) {
     if (!availableStyles.length) return '';
-    const currentStyle = selectedStyleByArticle[article.id] || article.style || null;
-    const suggested = article.style;
+    const currentStyle = selectedStyleByArticle[article.id] || DEFAULT_VISUAL_STYLE;
+    const suggested = DEFAULT_VISUAL_STYLE;
 
     return `
         <div class="summary-section">
@@ -1726,19 +2018,63 @@ function renderStylePicker(article) {
 }
 
 function renderHookVariants(article) {
-    const variants = article.hook_variants || [];
+    const variants = Array.isArray(article.hook_variants) ? article.hook_variants : [];
     if (variants.length === 0) return '';
+    const firstSceneSpeech = article.scenes && article.scenes[0]
+        ? String(article.scenes[0].speech || '').trim()
+        : '';
+    const inferredIndex = variants.findIndex(
+        hook => typeof hook === 'string' && hook.trim() === firstSceneSpeech
+    );
+    // Scene one is selected for the next render. hook_index_used is reserved
+    // for the MP4 that most recently completed successfully.
+    const selectedIndex = inferredIndex >= 0
+        ? inferredIndex
+        : (Number.isInteger(article.hook_index_used)
+            ? article.hook_index_used
+            : null);
+    const bestIndex = Number.isInteger(article.best_hook_index)
+        ? article.best_hook_index
+        : null;
+    const isProcessing = ['summarizing', 'generating_video', 'generating_carousel']
+        .includes(article.status);
     return `
         <div class="summary-section">
-            <div class="summary-label">Hook Options (AI wrote ${variants.length})</div>
-            <ol class="hook-variants">
+            <div class="summary-label">Opening Hook</div>
+            <p class="hook-picker-help">Choose the first line, then generate the video.</p>
+            <div
+                class="hook-variants"
+                data-article-id="${article.id}"
+                role="group"
+                aria-label="Opening hook options"
+            >
                 ${variants.map((h, i) => `
-                    <li class="hook-variant">
+                    <button
+                        type="button"
+                        class="hook-variant ${selectedIndex === i ? 'selected' : ''}"
+                        data-hook-index="${i}"
+                        aria-pressed="${selectedIndex === i ? 'true' : 'false'}"
+                        onclick="selectHook(event, ${article.id}, ${i})"
+                        ${isProcessing ? 'disabled' : ''}
+                    >
                         <span class="hook-index">${i + 1}</span>
                         <span class="hook-text">${escapeHtml(h)}</span>
-                    </li>
+                        <span class="hook-tags">
+                            ${bestIndex === i ? '<span class="hook-tag ai-pick">AI pick</span>' : ''}
+                            ${selectedIndex === i ? '<span class="hook-tag selected-hook">Selected</span>' : ''}
+                            ${article.video_path && article.hook_index_used === i && selectedIndex !== i
+                                ? '<span class="hook-tag rendered-hook">Rendered</span>'
+                                : ''}
+                        </span>
+                    </button>
                 `).join('')}
-            </ol>
+            </div>
+            ${article.video_path && article.hook_index_used !== selectedIndex ? `
+                <p class="hook-regeneration-note">
+                    This selection updates the script, not the existing video.
+                    Regenerate the video to render and attribute this hook.
+                </p>
+            ` : ''}
         </div>
     `;
 }
@@ -1858,6 +2194,8 @@ function renderActions(article) {
     const canSummarize = article.status !== 'summarizing';
     const canGenerate = article.video_script && !['generating_video', 'generating_carousel'].includes(article.status);
     const isProcessing = ['summarizing', 'generating_video', 'generating_carousel'].includes(article.status);
+    const voiceTone = selectedVoiceToneByArticle[article.id] || 'controlled';
+    const colorIntensity = articleColorIntensity(article);
 
     return `
         <div class="article-actions">
@@ -1871,12 +2209,58 @@ function renderActions(article) {
             </button>
 
             <div class="generate-group">
+                <label class="voice-tone-control">
+                    <span class="voice-tone-label">Voice tone</span>
+                    <span class="voice-tone-row">
+                        <select
+                            class="output-format-select voice-tone-select"
+                            data-voice-tone-select="${article.id}"
+                            onchange="selectVoiceTone(${article.id}, this.value)"
+                            ${!canGenerate || isProcessing ? 'disabled' : ''}
+                        >
+                            ${Object.entries(VOICE_TONES).map(([key, preset]) => `
+                                <option value="${key}" ${voiceTone === key ? 'selected' : ''}>
+                                    ${escapeHtml(preset.label)}
+                                </option>
+                            `).join('')}
+                        </select>
+                        <button
+                            type="button"
+                            class="btn btn-action voice-preview-btn"
+                            onclick="previewVoiceTone(event, ${article.id})"
+                            ${!canGenerate || isProcessing ? 'disabled' : ''}
+                        >
+                            ▶ Preview
+                        </button>
+                    </span>
+                    <span
+                        class="voice-tone-description"
+                        data-voice-tone-description="${article.id}"
+                    >${escapeHtml(VOICE_TONES[voiceTone].description)}</span>
+                </label>
+                <label class="color-intensity-control article-color-intensity-control">
+                    <span class="color-intensity-label">Color intensity</span>
+                    <select
+                        class="output-format-select color-intensity-select"
+                        data-color-intensity-select="${article.id}"
+                        aria-describedby="color-intensity-help-${article.id}"
+                        onchange="selectColorIntensity(${article.id}, this.value)"
+                        ${!canGenerate || isProcessing ? 'disabled' : ''}
+                    >
+                        ${renderColorIntensityOptions(colorIntensity)}
+                    </select>
+                    <span
+                        class="color-intensity-help"
+                        id="color-intensity-help-${article.id}"
+                    >Vivid is punchy but balanced. Electric is the neon cyan, magenta, and red reference look.</span>
+                </label>
                 <select class="output-format-select" data-format-select="${article.id}" ${!canGenerate || isProcessing ? 'disabled' : ''}>
                     <option value="video">Classic Video</option>
                     <option value="carousel">Photo Carousel</option>
                 </select>
                 <select class="output-format-select" data-source-select="${article.id}" ${!canGenerate || isProcessing ? 'disabled' : ''}>
                     <option value="ai">🤖 AI Images</option>
+                    <option value="mixed">🛰️ Mixed Real + AI</option>
                     <option value="stock">📷 Stock Photos</option>
                 </select>
                 <button
@@ -2181,6 +2565,7 @@ document.addEventListener('DOMContentLoaded', () => {
     document.getElementById('empty-state').classList.add('hidden');
 
     syncHookToggle();
+    syncColorIntensityControl();
     loadStyles();
     loadPublisherStatus();
     loadGenerationBudget();
