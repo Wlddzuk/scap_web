@@ -17,6 +17,28 @@ import re
 
 
 STYLES = {
+    "illustrated_science": {
+        "name": "Illustrated Science",
+        "emoji": "🔬",
+        "description": "Flat editorial science schematics for safe, non-photographic scenes",
+        "palette": ["#f4f0e6", "#145da0", "#f4c542", "#d64541"],
+        "base": (
+            "intentional hand-drawn editorial science illustration on warm off-white "
+            "paper, confident cobalt-blue ink contours and simplified blue shapes, "
+            "one selective yellow focus highlight, restrained red instructional accent, "
+            "clean schematic composition, expressive and memorable without looking childish, "
+            "one clear central subject, generous negative space, premium "
+            "animated documentary art direction, clearly an illustration, flat 2D artwork, "
+            "vertical 9:16, no photography, no photorealism, no 3D render, no glossy CGI, "
+            "no hands, no faces, no crowds, no signatures, no watermarks, no text, no labels, "
+            "no words, no cutaway, no cross-section, no microscopy, no measurement scale"
+        ),
+        "hook_modifier": (
+            "bold consequence-first composition, partially revealed focal detail, "
+            "strong silhouette, immediate visual question, clean open annotation space"
+        ),
+        "good_for": ["science", "education", "discovery", "nature", "space", "health"],
+    },
     "manga": {
         "name": "Manga / Anime Panel",
         "emoji": "📘",
@@ -155,7 +177,7 @@ STYLES = {
     },
 }
 
-DEFAULT_STYLE = "3d_pixar"
+DEFAULT_STYLE = "illustrated_science"
 
 
 def list_styles() -> list:
@@ -193,7 +215,17 @@ def apply_style(visual_concept: str, style_key: str, is_hook: bool = False) -> s
 
 
 def auto_pick_style(title: str, script: str) -> str:
-    """Ask an LLM to pick the best style for this article. Falls back to default."""
+    """Return the brand's automatic first-render style.
+
+    The manual picker can still override this. Keeping automatic generation on
+    one recognizable visual language also avoids an extra LLM call before the
+    first paid image request.
+    """
+    return DEFAULT_STYLE
+
+
+def _legacy_auto_pick_style(title: str, script: str) -> str:
+    """Legacy content-aware picker retained for explicit future experiments."""
     try:
         from groq import Groq
         api_key = os.getenv("GROQ_API_KEY")
