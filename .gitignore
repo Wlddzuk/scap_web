@@ -57,3 +57,6 @@ htmlcov/
 # Deployment
 *.pem
 *.key
+
+# Nested project with its own git history
+website/
