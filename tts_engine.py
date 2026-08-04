@@ -13,7 +13,7 @@ import threading
 import time
 import wave
 from pathlib import Path
-from typing import Callable
+from typing import Callable, TypedDict
 
 import numpy as np
 from dotenv import load_dotenv
@@ -23,15 +23,79 @@ load_dotenv()
 logger = logging.getLogger(__name__)
 
 GEMINI_TTS_MODEL = "gemini-3.1-flash-tts-preview"
-GEMINI_DEFAULT_VOICE = "Puck"
+GEMINI_DEFAULT_VOICE = "Achird"
 KOKORO_DEFAULT_VOICE = "af_heart"
 QWEN3_DEFAULT_MODEL = "Qwen/Qwen3-TTS-12Hz-0.6B-CustomVoice"
 QWEN3_DEFAULT_VOICE = "Ryan"
 
-TTS_STYLE_INSTRUCTION = (
-    "Read this in a fast-paced, energetic, excited tone, like a young science "
-    "content creator on TikTok. Never sound flat or monotone:"
-)
+DEFAULT_VOICE_TONE = "controlled"
+
+
+class VoiceTonePreset(TypedDict):
+    """Voice and delivery settings for one stable narration preset."""
+
+    label: str
+    concept: str
+    description: str
+    gemini_voice: str
+    kokoro_voice: str
+    kokoro_speed: float
+    instruction: str
+
+
+# Stable narration presets shared by full video generation and the web preview
+# controls. ``controlled`` is Clipper's default "Curious Energy" delivery: the
+# hook earns attention, the explanation sounds human, and the reveal gets the
+# emphasis instead of every sentence being shouted.
+VOICE_TONE_PRESETS: dict[str, VoiceTonePreset] = {
+    "controlled": {
+        "label": "Controlled",
+        "concept": "Curious Energy",
+        "description": "Strong-curiosity hook, conversational middle, lifted reveal.",
+        "gemini_voice": "Achird",
+        "kokoro_voice": "af_heart",
+        "kokoro_speed": 1.05,
+        "instruction": (
+            "Use a bright, engaged science-creator voice. Deliver the opening "
+            "sentence with strong curiosity and momentum. Then settle into a "
+            "natural conversational rhythm. Raise the energy for the main "
+            "reveal. Never shout or use a breathless sales cadence. Emphasize "
+            "specific facts, names, and numbers. Use natural pauses and "
+            "controlled pitch changes."
+        ),
+    },
+    "energetic": {
+        "label": "Energetic",
+        "concept": "Bright Energy",
+        "description": "Faster and brighter, while staying clear and conversational.",
+        "gemini_voice": "Puck",
+        "kokoro_voice": "af_bella",
+        "kokoro_speed": 1.10,
+        "instruction": (
+            "Use a lively, confident science-creator voice with quick momentum. "
+            "Make the opening immediate and make the main reveal land, while "
+            "keeping every word clear. Stay human and conversational. Never "
+            "shout, squeal, or use a breathless sales cadence. Use brief natural "
+            "pauses."
+        ),
+    },
+    "documentary": {
+        "label": "Documentary",
+        "concept": "Measured Intrigue",
+        "description": "Grounded, informative delivery with measured emphasis.",
+        "gemini_voice": "Charon",
+        "kokoro_voice": "am_michael",
+        "kokoro_speed": 1.00,
+        "instruction": (
+            "Use a clear, grounded documentary voice. Start with quiet intrigue, "
+            "explain the evidence conversationally, and add measured emphasis "
+            "to the main reveal. Keep the pace steady and confident. Never sound "
+            "theatrical, ominous, or breathless."
+        ),
+    },
+}
+
+TTS_STYLE_INSTRUCTION = VOICE_TONE_PRESETS[DEFAULT_VOICE_TONE]["instruction"]
 
 # These are intentionally kept public for the preview tool.
 KOKORO_VOICES = [
@@ -68,6 +132,51 @@ EMOTION_SPEED_MAP = {
     "funny":      1.12,
 }
 DEFAULT_KOKORO_SPEED = 1.10
+
+
+def normalize_voice_tone(voice_tone: str | None) -> str:
+    """Return a stable preset id, falling back to Curious Energy."""
+    key = (voice_tone or DEFAULT_VOICE_TONE).strip().lower()
+    if key not in VOICE_TONE_PRESETS:
+        logger.warning(
+            "[TTS] Unknown voice tone %s; using %s",
+            voice_tone,
+            DEFAULT_VOICE_TONE,
+        )
+        return DEFAULT_VOICE_TONE
+    return key
+
+
+def voice_tone_options() -> list[dict[str, str]]:
+    """Return browser-safe preset metadata in display order."""
+    return [
+        {
+            "id": key,
+            "label": preset["label"],
+            "concept": preset["concept"],
+            "description": preset["description"],
+        }
+        for key, preset in VOICE_TONE_PRESETS.items()
+    ]
+
+
+def style_instruction_for_tone(voice_tone: str | None) -> str:
+    """Return the delivery direction for a narration preset."""
+    key = normalize_voice_tone(voice_tone)
+    return VOICE_TONE_PRESETS[key]["instruction"]
+
+
+def pick_voice_for_tone(voice_tone: str | None) -> tuple[str, float]:
+    """Return the Kokoro voice and speed for a narration preset."""
+    key = normalize_voice_tone(voice_tone)
+    preset = VOICE_TONE_PRESETS[key]
+    return preset["kokoro_voice"], preset["kokoro_speed"]
+
+
+def gemini_voice_for_tone(voice_tone: str | None) -> str:
+    """Return the Gemini voice for a narration preset."""
+    key = normalize_voice_tone(voice_tone)
+    return VOICE_TONE_PRESETS[key]["gemini_voice"]
 
 
 def pick_voice_for_emotion(emotion: str | None) -> tuple[str, float]:
@@ -175,7 +284,13 @@ def _decode_gemini_audio(data) -> bytes:
     raise TypeError(f"Unsupported Gemini audio payload type: {type(data).__name__}")
 
 
-def _synthesize_gemini_once(text: str, output_path: str, voice: str | None, emotion: str | None = None) -> str:
+def _synthesize_gemini_once(
+    text: str,
+    output_path: str,
+    voice: str | None,
+    emotion: str | None = None,
+    voice_tone: str | None = DEFAULT_VOICE_TONE,
+) -> str:
     api_key = os.getenv("GEMINI_API_KEY", "").strip()
     if not api_key or api_key.lower().startswith("your_"):
         raise TTSUnavailableError("GEMINI_API_KEY is not configured")
@@ -188,11 +303,12 @@ def _synthesize_gemini_once(text: str, output_path: str, voice: str | None, emot
             "Gemini TTS requires google-genai; run: pip install -r requirements.txt"
         ) from exc
 
-    selected_voice = voice or os.getenv("GEMINI_TTS_VOICE", GEMINI_DEFAULT_VOICE)
-    style_instruction = TTS_STYLE_INSTRUCTION
-    hint = EMOTION_STYLE_HINTS.get((emotion or "").strip().lower())
-    if hint:
-        style_instruction = f"{TTS_STYLE_INSTRUCTION} {hint}"
+    selected_voice = (
+        voice
+        or os.getenv("GEMINI_TTS_VOICE", "").strip()
+        or gemini_voice_for_tone(voice_tone)
+    )
+    style_instruction = style_instruction_for_tone(voice_tone)
     prompt = f"{style_instruction}\n\n{text}"
     client = None
     try:
@@ -233,11 +349,23 @@ def _synthesize_gemini_once(text: str, output_path: str, voice: str | None, emot
                 pass
 
 
-def synthesize_gemini(text: str, output_path: str, voice: str | None = None, emotion: str | None = None) -> str:
+def synthesize_gemini(
+    text: str,
+    output_path: str,
+    voice: str | None = None,
+    emotion: str | None = None,
+    voice_tone: str | None = DEFAULT_VOICE_TONE,
+) -> str:
     """Generate Gemini TTS with a 60s timeout and exactly one caller retry."""
     return _run_with_retry(
         "gemini",
-        lambda: _synthesize_gemini_once(text, output_path, voice, emotion),
+        lambda: _synthesize_gemini_once(
+            text,
+            output_path,
+            voice,
+            emotion,
+            voice_tone,
+        ),
     )
 
 
@@ -254,27 +382,38 @@ def _get_kokoro_pipeline():
     return _KOKORO_PIPELINE
 
 
-def _synthesize_kokoro_once(text: str, output_path: str, voice: str | None, emotion: str | None = None) -> str:
+def _synthesize_kokoro_once(
+    text: str,
+    output_path: str,
+    voice: str | None,
+    emotion: str | None = None,
+    voice_tone: str | None = DEFAULT_VOICE_TONE,
+) -> str:
     import soundfile as sf
 
-    emo_voice, emo_speed = pick_voice_for_emotion(emotion)
-    # Precedence: explicit arg > KOKORO_VOICE env (fixed brand voice) > emotion map.
-    selected_voice = voice or os.getenv("KOKORO_VOICE", "").strip() or emo_voice
+    tone_voice, tone_speed = pick_voice_for_tone(voice_tone)
+    # Precedence: explicit arg > KOKORO_VOICE env (fixed brand voice) > tone preset.
+    selected_voice = (
+        voice or os.getenv("KOKORO_VOICE", "").strip() or tone_voice
+    )
     if selected_voice not in KOKORO_VOICES:
         logger.warning(
             "[TTS:kokoro] Unknown voice %s; using %s",
             selected_voice,
-            KOKORO_DEFAULT_VOICE,
+            tone_voice,
         )
-        selected_voice = KOKORO_DEFAULT_VOICE
+        selected_voice = tone_voice
 
     with _KOKORO_LOCK:
         pipeline = _get_kokoro_pipeline()
         logger.info(
-            "[TTS:kokoro] voice=%s speed=%.2f emotion=%s",
-            selected_voice, emo_speed, emotion or "default",
+            "[TTS:kokoro] voice=%s speed=%.2f tone=%s emotion=%s",
+            selected_voice,
+            tone_speed,
+            normalize_voice_tone(voice_tone),
+            emotion or "default",
         )
-        generator = pipeline(text, voice=selected_voice, speed=emo_speed)
+        generator = pipeline(text, voice=selected_voice, speed=tone_speed)
         chunks = [
             np.asarray(audio_chunk, dtype=np.float32).reshape(-1)
             for _gs, _ps, audio_chunk in generator
@@ -293,11 +432,23 @@ def _synthesize_kokoro_once(text: str, output_path: str, voice: str | None, emot
     return str(path)
 
 
-def synthesize_kokoro(text: str, output_path: str, voice: str | None = None, emotion: str | None = None) -> str:
-    """Generate local Kokoro audio; deterministic emotion-aware voice selection."""
+def synthesize_kokoro(
+    text: str,
+    output_path: str,
+    voice: str | None = None,
+    emotion: str | None = None,
+    voice_tone: str | None = DEFAULT_VOICE_TONE,
+) -> str:
+    """Generate local Kokoro audio with deterministic tone selection."""
     return _run_with_retry(
         "kokoro",
-        lambda: _synthesize_kokoro_once(text, output_path, voice, emotion),
+        lambda: _synthesize_kokoro_once(
+            text,
+            output_path,
+            voice,
+            emotion,
+            voice_tone,
+        ),
     )
 
 
@@ -328,7 +479,13 @@ def _get_qwen3_model(model_name: str):
     return _QWEN3_MODEL
 
 
-def _synthesize_qwen3_once(text: str, output_path: str, voice: str | None, emotion: str | None = None) -> str:
+def _synthesize_qwen3_once(
+    text: str,
+    output_path: str,
+    voice: str | None,
+    emotion: str | None = None,
+    voice_tone: str | None = DEFAULT_VOICE_TONE,
+) -> str:
     import soundfile as sf
 
     model_name = os.getenv("QWEN3_TTS_MODEL", QWEN3_DEFAULT_MODEL).strip()
@@ -338,10 +495,7 @@ def _synthesize_qwen3_once(text: str, output_path: str, voice: str | None, emoti
         )
 
     selected_voice = voice or QWEN3_DEFAULT_VOICE
-    instruct = TTS_STYLE_INSTRUCTION
-    hint = EMOTION_STYLE_HINTS.get((emotion or "").strip().lower())
-    if hint:
-        instruct = f"{TTS_STYLE_INSTRUCTION} {hint}"
+    instruct = style_instruction_for_tone(voice_tone)
     logger.warning("[TTS:qwen3] CPU synthesis will take a few minutes")
     with _QWEN3_LOCK:
         model = _get_qwen3_model(model_name)
@@ -365,7 +519,13 @@ def _synthesize_qwen3_once(text: str, output_path: str, voice: str | None, emoti
     return str(path)
 
 
-def synthesize_qwen3(text: str, output_path: str, voice: str | None = None, emotion: str | None = None) -> str:
+def synthesize_qwen3(
+    text: str,
+    output_path: str,
+    voice: str | None = None,
+    emotion: str | None = None,
+    voice_tone: str | None = DEFAULT_VOICE_TONE,
+) -> str:
     """Generate optional Qwen3 TTS locally on CPU with one retry."""
     if importlib.util.find_spec("qwen_tts") is None:
         message = "Qwen3 TTS is optional and not installed; run: pip install -U qwen-tts"
@@ -373,7 +533,13 @@ def synthesize_qwen3(text: str, output_path: str, voice: str | None = None, emot
         raise TTSUnavailableError(message)
     return _run_with_retry(
         "qwen3",
-        lambda: _synthesize_qwen3_once(text, output_path, voice, emotion),
+        lambda: _synthesize_qwen3_once(
+            text,
+            output_path,
+            voice,
+            emotion,
+            voice_tone,
+        ),
     )
 
 
@@ -397,13 +563,20 @@ def engine_availability(engine: str) -> tuple[bool, str]:
     return False, f"unknown engine: {engine}"
 
 
-def default_voice_for_engine(engine: str) -> str:
+def default_voice_for_engine(
+    engine: str,
+    voice_tone: str | None = DEFAULT_VOICE_TONE,
+) -> str:
     """Return the configured stable voice used by an engine."""
     engine = engine.strip().lower()
     if engine == "gemini":
-        return os.getenv("GEMINI_TTS_VOICE", GEMINI_DEFAULT_VOICE)
+        return (
+            os.getenv("GEMINI_TTS_VOICE", "").strip()
+            or gemini_voice_for_tone(voice_tone)
+        )
     if engine == "kokoro":
-        return os.getenv("KOKORO_VOICE", KOKORO_DEFAULT_VOICE)
+        tone_voice, _speed = pick_voice_for_tone(voice_tone)
+        return os.getenv("KOKORO_VOICE", "").strip() or tone_voice
     if engine == "qwen3":
         return QWEN3_DEFAULT_VOICE
     raise ValueError(f"Unknown TTS engine: {engine}")
@@ -415,6 +588,7 @@ def synthesize_with_engine(
     output_path: str,
     voice: str | None = None,
     emotion: str | None = None,
+    voice_tone: str | None = DEFAULT_VOICE_TONE,
 ) -> str:
     """Synthesize with one explicit engine and no cross-engine fallback.
 
@@ -429,14 +603,26 @@ def synthesize_with_engine(
     }
     if engine not in functions:
         raise ValueError(f"Unknown TTS engine: {engine}")
-    return functions[engine](text, output_path, voice, emotion)
+    return functions[engine](
+        text,
+        output_path,
+        voice,
+        emotion,
+        voice_tone,
+    )
 
 
-def synthesize(text: str, output_path: str, voice: str | None = None, emotion: str | None = None) -> str:
+def synthesize(
+    text: str,
+    output_path: str,
+    voice: str | None = None,
+    emotion: str | None = None,
+    voice_tone: str | None = DEFAULT_VOICE_TONE,
+) -> str:
     """Synthesize speech using configured selection with terminal Kokoro fallback.
 
-    `emotion` (the summarizer's dominant_emotion) steers voice/speed on Kokoro
-    and delivery styling on Gemini/Qwen3; it is safe to pass None.
+    `voice_tone` governs narration delivery. `emotion` remains accepted for
+    backwards compatibility and visual metadata, but does not override tone.
     """
     configured = os.getenv("TTS_ENGINE", "auto").strip().lower()
     if configured not in SUPPORTED_ENGINES:
@@ -454,7 +640,14 @@ def synthesize(text: str, output_path: str, voice: str | None = None, emotion: s
     for index, engine in enumerate(engines):
         try:
             logger.info("[TTS] Trying engine=%s", engine)
-            return synthesize_with_engine(engine, text, output_path, voice, emotion)
+            return synthesize_with_engine(
+                engine,
+                text,
+                output_path,
+                voice,
+                emotion,
+                voice_tone,
+            )
         except Exception as exc:
             last_error = exc
             if index + 1 < len(engines):

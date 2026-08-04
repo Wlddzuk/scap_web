@@ -57,8 +57,17 @@ logger = logging.getLogger("clipper.bot")
 # Flask app (imported for DB + pipeline access)
 # ============================================================
 
-from app import app, db, scrape_url_content
-from models import Article
+from app import (
+    app,
+    db,
+    scrape_url_content,
+    start_tiktok_status_poller,
+)
+from models import (
+    Article,
+    find_matching_hook_index,
+    valid_hook_index,
+)
 from summarizer import summarize_article
 from video_generator import generate_video
 from tts_preview import format_results_table, render_previews
@@ -76,6 +85,9 @@ bot = commands.Bot(command_prefix="!", intents=intents)
 # Track active jobs to avoid duplicates
 active_jobs = set()
 discovery_task = None
+# ``python app.py`` sets this before connecting the embedded bot because its
+# APScheduler is then the single owner of daily discovery.
+DISCOVERY_SCHEDULER_MANAGED_EXTERNALLY = False
 
 # URL regex
 URL_PATTERN = re.compile(r"https?://[^\s<>\"']+")
@@ -118,7 +130,11 @@ async def process_article_url(
                     await progress_msg.edit(
                         content=f"**Already processed:** {url}\n> Re-posting existing video."
                     )
-                    await _post_video(output_channel, existing, video_file)
+                    await _post_video(
+                        output_channel,
+                        existing,
+                        video_file,
+                    )
                     await trigger_message.add_reaction("\u2705")
                     return
 
@@ -163,12 +179,21 @@ async def process_article_url(
             article.bullets = json.dumps(result["bullets"])
             article.video_script = result["video_script"]
             article.hashtags = json.dumps(result.get("hashtags", []))
+            article.cover_line = result.get("cover_line") or None
+            article.cta_question = result.get("cta_question") or None
+            article.search_caption = result.get("search_caption") or None
+            article.series_lane = result.get("series_lane") or None
 
             # Engagement metadata (scene-based generation)
             scenes = result.get("scenes") or []
             article.scenes = json.dumps(scenes) if scenes else None
             hook_variants = result.get("hook_variants") or []
             article.hook_variants = json.dumps(hook_variants) if hook_variants else None
+            article.best_hook_index = valid_hook_index(
+                result.get("best_hook_index"),
+                hook_variants,
+            )
+            article.hook_index_used = None
             article.dominant_emotion = result.get("dominant_emotion") or None
             suggested = result.get("suggested_style")
             if suggested and suggested in VISUAL_STYLES:
@@ -184,6 +209,9 @@ async def process_article_url(
             article_scenes = scenes or None
             article_style = article.style
             article_emotion = article.dominant_emotion
+            article_cover_line = article.cover_line
+            article_series_lane = article.series_lane
+            article_hero_image = article.hero_image
 
         await progress_msg.edit(
             content=(
@@ -202,11 +230,18 @@ async def process_article_url(
                 scenes=article_scenes,
                 style_key=article_style,
                 emotion=article_emotion,
+                cover_line=article_cover_line,
+                series_lane=article_series_lane,
+                hero_image=article_hero_image,
             )
 
             article = db.session.get(Article, article_id)
             relative_path = os.path.basename(video_path)
             article.video_path = relative_path
+            article.hook_index_used = find_matching_hook_index(
+                hook_variants,
+                article_scenes or [],
+            )
             article.status = "video_done"
             article.video_generated_at = datetime.now(timezone.utc)
             db.session.commit()
@@ -222,7 +257,11 @@ async def process_article_url(
         with app.app_context():
             article = db.session.get(Article, article_id)
             video_file = Path("static/videos") / article.video_path
-            await _post_video(output_channel, article, video_file)
+            await _post_video(
+                output_channel,
+                article,
+                video_file,
+            )
 
         # Mark success
         await trigger_message.add_reaction("\u2705")  # checkmark
@@ -244,7 +283,11 @@ async def process_article_url(
         active_jobs.discard(url)
 
 
-async def _post_video(channel: discord.TextChannel, article, video_file: Path):
+async def _post_video(
+    channel: discord.TextChannel,
+    article,
+    video_file: Path,
+):
     """Post the final video with metadata to the output channel."""
     with app.app_context():
         hashtags = []
@@ -267,15 +310,17 @@ async def _post_video(channel: discord.TextChannel, article, video_file: Path):
     # Discord file upload limit is 25MB (or 50MB for boosted servers)
     file_size = video_file.stat().st_size
     if file_size > 25 * 1024 * 1024:
-        await channel.send(
+        message = await channel.send(
             f"{caption}\n\n> Video too large for Discord upload ({file_size / 1024 / 1024:.1f}MB). "
             f"Access it from the web dashboard."
         )
     else:
-        await channel.send(
+        message = await channel.send(
             content=caption,
             file=discord.File(str(video_file), filename=f"{article.title[:50]}.mp4"),
         )
+
+    return message
 
 
 # ============================================================
@@ -324,7 +369,11 @@ async def _scheduled_discovery_run():
                     else None
                 )
             if article and video_file and video_file.exists():
-                await _post_video(output_channel, article, video_file)
+                await _post_video(
+                    output_channel,
+                    article,
+                    video_file,
+                )
                 completed += 1
 
         await processing_channel.send(
@@ -356,6 +405,10 @@ async def _discovery_scheduler():
         await _scheduled_discovery_run()
 
 
+def _discord_discovery_scheduler_enabled():
+    return DISCOVERY_ENABLED and not DISCOVERY_SCHEDULER_MANAGED_EXTERNALLY
+
+
 @bot.event
 async def on_ready():
     global discovery_task
@@ -363,7 +416,11 @@ async def on_ready():
     logger.info(f"  Input channel:      {CHANNEL_INPUT}")
     logger.info(f"  Processing channel:  {CHANNEL_PROCESSING}")
     logger.info(f"  Output channel:      {CHANNEL_OUTPUT}")
-    if DISCOVERY_ENABLED and (discovery_task is None or discovery_task.done()):
+    start_tiktok_status_poller()
+    if (
+        _discord_discovery_scheduler_enabled()
+        and (discovery_task is None or discovery_task.done())
+    ):
         discovery_task = asyncio.create_task(
             _discovery_scheduler(),
             name="clipper-daily-discovery",

@@ -17,10 +17,25 @@ import feedparser
 import requests
 from bs4 import BeautifulSoup
 
-from app import app, db, scrape_url_content
-from models import Article
+from app import (
+    app,
+    db,
+    scrape_url_content,
+    validate_url,
+)
+from models import (
+    Article,
+    find_matching_hook_index,
+    valid_hook_index,
+    VideoMetrics,
+)
 from summarizer import summarize_article
-from video_generator import generate_video, get_groq_client
+from video_generator import (
+    DEFAULT_COLOR_INTENSITY,
+    generate_video,
+    get_groq_client,
+    normalize_color_intensity,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -32,12 +47,39 @@ FEEDS = {
 }
 REDDIT_URL = "https://www.reddit.com/r/science/top.json?t=day&limit=25"
 USER_AGENT = "ClipperStoryFinder/1.0 (+https://github.com/clipper; science-video-discovery)"
+BROWSER_HEADERS = {
+    "User-Agent": (
+        "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) "
+        "AppleWebKit/537.36 (KHTML, like Gecko) "
+        "Chrome/126.0.0.0 Safari/537.36"
+    ),
+    "Accept": (
+        "text/html,application/xhtml+xml,application/xml;q=0.9,"
+        "image/avif,image/webp,*/*;q=0.8"
+    ),
+    "Accept-Language": "en-US,en;q=0.9",
+}
 NETWORK_TIMEOUT = 15
+PREFLIGHT_TIMEOUT = (3.05, 6)
 SCORING_TIMEOUT = 60
 MAX_FEED_ITEMS = 10
 MAX_REDDIT_ITEMS = 10
+MIN_RSS_FALLBACK_CHARS = 200
 TRACKING_QUERY_PREFIXES = ("utm_",)
 TRACKING_QUERY_KEYS = {"fbclid", "gclid", "mc_cid", "mc_eid"}
+
+PIPELINE_FAILURE_MESSAGES = {
+    "scrape": "Scrape failed: the source article could not be read.",
+    "summarize": "Summary failed: the story could not be summarized.",
+    "render": "Video render failed: the video could not be created.",
+}
+SCRAPE_FAILURE_MESSAGES = {
+    "source_blocked": (
+        "Scrape failed: the source blocked automated access and its feed "
+        "summary was too short to use."
+    ),
+    "not_enough_text": "Scrape failed: the source did not contain enough readable text.",
+}
 
 
 @dataclass
@@ -52,9 +94,34 @@ class StoryCandidate:
     reddit_score: int = 0
     viral_score: Optional[float] = None
     score_reason: str = ""
+    use_rss_fallback: bool = False
+    hero_image: str = ""
 
     def to_dict(self) -> dict:
         return asdict(self)
+
+
+class CandidateReachabilityError(RuntimeError):
+    """A classified discovery pre-flight failure safe to reason about."""
+
+    def __init__(self, reason: str, status_code: int | None = None):
+        super().__init__(reason)
+        self.reason = reason
+        self.status_code = status_code
+
+
+class CandidateScrapeError(RuntimeError):
+    """A scrape-stage failure with a stable, non-provider-specific reason."""
+
+    def __init__(self, reason: str):
+        super().__init__(reason)
+        self.reason = reason
+
+
+class StoryScoringError(RuntimeError):
+    """Raised when stories exist but no configured ranker can score them."""
+
+    error_code = "scoring_unavailable"
 
 
 def _request_with_retry(url: str, **kwargs) -> requests.Response:
@@ -108,6 +175,126 @@ def _canonical_url(url: str) -> str:
         return ""
 
 
+def _candidate_domain(candidate: StoryCandidate) -> str:
+    key = _canonical_url(candidate.url)
+    return (urlsplit(key).hostname or "").lower() if key else ""
+
+
+def _has_usable_rss_summary(candidate: StoryCandidate) -> bool:
+    return (
+        candidate.source != "Reddit r/science"
+        and len(_plain_text(candidate.summary, limit=10_000))
+        >= MIN_RSS_FALLBACK_CHARS
+    )
+
+
+def _preflight_candidate(candidate: StoryCandidate) -> None:
+    """Confirm that an article can be fetched without downloading its body.
+
+    A streamed GET is used instead of HEAD because several publisher CDNs
+    reject HEAD even though their article pages are readable. At most one
+    transient retry is attempted, and no response body is consumed.
+    """
+    try:
+        url = validate_url(candidate.url)
+    except ValueError as exc:
+        raise CandidateReachabilityError("invalid_url") from exc
+
+    last_error: Exception | None = None
+    for attempt in range(2):
+        response = None
+        try:
+            response = requests.get(
+                url,
+                headers=BROWSER_HEADERS,
+                timeout=PREFLIGHT_TIMEOUT,
+                allow_redirects=True,
+                stream=True,
+            )
+            if response.status_code == 403:
+                error = requests.HTTPError(
+                    "article source returned HTTP 403",
+                    response=response,
+                )
+                raise CandidateReachabilityError("source_blocked", 403) from error
+            response.raise_for_status()
+            if response.url != url:
+                validate_url(response.url)
+            return
+        except CandidateReachabilityError:
+            raise
+        except ValueError as exc:
+            raise CandidateReachabilityError("unsafe_redirect") from exc
+        except requests.RequestException as exc:
+            last_error = exc
+            status_code = getattr(getattr(exc, "response", None), "status_code", None)
+            # Retrying a caller/auth/policy response is wasteful. Reserve the
+            # one retry for transport problems and server-side failures.
+            if status_code is not None and status_code < 500:
+                break
+            if attempt == 0:
+                time.sleep(0.25)
+        finally:
+            if response is not None:
+                response.close()
+
+    status_code = getattr(getattr(last_error, "response", None), "status_code", None)
+    raise CandidateReachabilityError("unreachable", status_code) from last_error
+
+
+def preflight_candidates(
+    candidates: Iterable[StoryCandidate],
+) -> list[StoryCandidate]:
+    """Keep only candidates that can reach the scrape/summarize pipeline.
+
+    When a publisher blocks the first article with HTTP 403, the domain is not
+    contacted again during this discovery run. Feed summaries that are long
+    enough remain eligible because the selected-story worker can summarize
+    them directly; short summaries are removed before ranking.
+    """
+    candidates = list(candidates)
+    usable: list[StoryCandidate] = []
+    blocked_domains: set[str] = set()
+
+    for candidate in candidates:
+        domain = _candidate_domain(candidate)
+        if domain in blocked_domains:
+            if _has_usable_rss_summary(candidate):
+                candidate.use_rss_fallback = True
+                usable.append(candidate)
+            continue
+
+        try:
+            _preflight_candidate(candidate)
+            usable.append(candidate)
+        except CandidateReachabilityError as exc:
+            if exc.reason == "source_blocked" and domain:
+                blocked_domains.add(domain)
+                logger.warning(
+                    "[Discovery] %s blocks article scraping (HTTP 403); "
+                    "suppressing further checks for this domain in this run",
+                    domain,
+                    exc_info=True,
+                )
+                if _has_usable_rss_summary(candidate):
+                    candidate.use_rss_fallback = True
+                    usable.append(candidate)
+            else:
+                logger.warning(
+                    "[Discovery] Dropping unreachable candidate %s (%s)",
+                    candidate.url,
+                    exc.reason,
+                    exc_info=True,
+                )
+
+    logger.info(
+        "[Discovery] %d/%d candidates passed article reachability pre-flight",
+        len(usable),
+        len(candidates),
+    )
+    return usable
+
+
 def _existing_url_keys() -> set[str]:
     with app.app_context():
         return {
@@ -132,6 +319,24 @@ def _feed_candidates(source: str, feed_url: str) -> list[StoryCandidate]:
             url = (entry.get("link") or entry.get("id") or "").strip()
             if not title or not _canonical_url(url):
                 continue
+            hero_image = ""
+            media_candidates = []
+            media_candidates.extend(entry.get("media_content") or [])
+            media_candidates.extend(entry.get("media_thumbnail") or [])
+            media_candidates.extend(entry.get("enclosures") or [])
+            for media in media_candidates:
+                if not isinstance(media, dict):
+                    continue
+                media_url = str(media.get("url") or media.get("href") or "").strip()
+                media_type = str(media.get("type") or "").casefold()
+                if media_url and (
+                    media_type.startswith("image/")
+                    or media_url.lower().split("?", 1)[0].endswith(
+                        (".jpg", ".jpeg", ".png", ".webp")
+                    )
+                ):
+                    hero_image = media_url
+                    break
             candidates.append(
                 StoryCandidate(
                     title=title,
@@ -143,6 +348,7 @@ def _feed_candidates(source: str, feed_url: str) -> list[StoryCandidate]:
                     published=str(
                         entry.get("published") or entry.get("updated") or ""
                     ),
+                    hero_image=hero_image,
                 )
             )
         logger.info("[Discovery] %s returned %d candidates", source, len(candidates))
@@ -212,7 +418,7 @@ def collect_candidates() -> list[StoryCandidate]:
         "[Discovery] %d unseen candidates after database/run deduplication",
         len(unseen),
     )
-    return unseen
+    return preflight_candidates(unseen)
 
 
 def _parse_scores(payload: str, candidates: list[StoryCandidate]) -> dict[int, dict]:
@@ -249,24 +455,116 @@ def _parse_scores(payload: str, candidates: list[StoryCandidate]) -> dict[int, d
     return parsed
 
 
-def score_candidates(candidates: Iterable[StoryCandidate]) -> list[StoryCandidate]:
-    """Score every candidate in one batched Groq request, retrying once."""
-    candidates = list(candidates)
-    if not candidates:
-        return []
+def _as_utc(value: datetime) -> datetime:
+    """Normalize SQLite's naive datetimes to UTC for age comparisons."""
+    if value.tzinfo is None:
+        return value.replace(tzinfo=timezone.utc)
+    return value.astimezone(timezone.utc)
 
-    client = get_groq_client()
-    if not client:
-        logger.error("[Discovery] GROQ_API_KEY is required for viral scoring")
-        return []
-    # Groq's SDK retries transport/rate-limit failures by default. Disable those
-    # hidden retries so this function performs exactly the one explicit retry.
-    scoring_client = (
-        client.with_options(max_retries=0)
-        if hasattr(client, "with_options")
-        else client
+
+def _performance_min_age_hours() -> float:
+    """Return the minimum observation window before a post can teach scoring."""
+    try:
+        return max(1.0, float(os.getenv("TIKTOK_PERFORMANCE_MIN_AGE_HOURS", "24")))
+    except (TypeError, ValueError):
+        return 24.0
+
+
+def _performance_examples(
+    limit: int = 3,
+    *,
+    now: datetime | None = None,
+    min_age_hours: float | None = None,
+) -> dict[str, list[dict]]:
+    """Return compact top/bottom examples for the story-scoring prompt.
+
+    The feedback is deliberately evidence-only: mapped-but-unfetched rows and
+    newly published videos are excluded. Mature posts are ranked by views per
+    day so raw lifetime totals do not automatically favor the oldest upload.
+    """
+    try:
+        with app.app_context():
+            rows = (
+                db.session.query(VideoMetrics, Article)
+                .join(Article, Article.id == VideoMetrics.article_id)
+                .filter(
+                    VideoMetrics.fetched_at.isnot(None),
+                    Article.tiktok_publish_status == "PUBLISH_COMPLETE",
+                    Article.tiktok_published_at.isnot(None),
+                )
+                .all()
+            )
+    except Exception:
+        logger.error("[Discovery] Could not load performance feedback", exc_info=True)
+        return {"top_performers": [], "bottom_performers": []}
+
+    reference_time = _as_utc(now or datetime.now(timezone.utc))
+    maturity_hours = (
+        _performance_min_age_hours()
+        if min_age_hours is None
+        else max(1.0, float(min_age_hours))
     )
+    mature_rows = []
+    for metrics, article in rows:
+        published_at = _as_utc(article.tiktok_published_at)
+        fetched_at = min(_as_utc(metrics.fetched_at), reference_time)
+        # Judge maturity at the moment represented by the counters. A stale
+        # zero-view snapshot fetched one hour after posting must not become
+        # "mature" merely because the calendar later passed 24 hours.
+        age_hours = (fetched_at - published_at).total_seconds() / 3600
+        if age_hours < maturity_hours:
+            continue
+        views = int(metrics.views or 0)
+        engagements = (
+            int(metrics.likes or 0)
+            + int(metrics.comments or 0)
+            + int(metrics.shares or 0)
+        )
+        age_days = max(age_hours / 24, 1 / 24)
+        mature_rows.append(
+            {
+                "metrics": metrics,
+                "article": article,
+                "age_days": age_days,
+                "views_per_day": views / age_days,
+                "engagement_rate": engagements / views if views else 0,
+            }
+        )
 
+    if len(mature_rows) < 2:
+        return {"top_performers": [], "bottom_performers": []}
+
+    def compact(row):
+        metrics = row["metrics"]
+        article = row["article"]
+        views = int(metrics.views or 0)
+        return {
+            "title": article.title[:180],
+            "source": article.site_name or "unknown",
+            "views": views,
+            "age_days": round(row["age_days"], 1),
+            "views_per_day": round(row["views_per_day"], 1),
+            "engagement_rate": round(row["engagement_rate"], 4),
+        }
+
+    ranked = sorted(
+        mature_rows,
+        key=lambda row: (
+            row["views_per_day"],
+            row["engagement_rate"],
+            int(row["metrics"].views or 0),
+        ),
+        reverse=True,
+    )
+    sample_size = min(limit, max(1, len(ranked) // 2))
+    return {
+        "top_performers": [compact(row) for row in ranked[:sample_size]],
+        "bottom_performers": [compact(row) for row in reversed(ranked[-sample_size:])],
+    }
+
+
+def _scoring_prompts(candidates: list[StoryCandidate]) -> tuple[str, str]:
+    """Build the shared strict-JSON prompt used by every scoring provider."""
     compact_candidates = [
         {
             "id": index,
@@ -277,58 +575,187 @@ def score_candidates(candidates: Iterable[StoryCandidate]) -> list[StoryCandidat
         }
         for index, candidate in enumerate(candidates)
     ]
+    performance_feedback = _performance_examples()
     system_prompt = (
         "You are the story editor for @60s.science2, a Gen-Z science TikTok "
         "channel. Score every supplied candidate from 0 to 100 using wow-factor, "
         "visual-ness, broad appeal, curiosity gap, and fit for a compelling "
         "60-second video. Return strict JSON only with exactly this schema: "
         '{"scores":[{"id":0,"score":87,"reason":"brief reason"}]}. '
+        "The supplied historical examples include only mature posts and are "
+        "ranked by age-normalized views per day. Use them as a weak signal, not "
+        "a rule; topic novelty and current story quality still matter most. "
         "Return every id exactly once. Do not add keys or markdown."
     )
     user_prompt = "Score this complete candidate batch:\n" + json.dumps(
-        compact_candidates,
+        {
+            "historical_performance": performance_feedback,
+            "candidates": compact_candidates,
+        },
         ensure_ascii=False,
         separators=(",", ":"),
     )
+    return system_prompt, user_prompt
 
-    last_error = None
-    for attempt in range(2):
-        try:
-            response = scoring_client.chat.completions.create(
-                model="llama-3.3-70b-versatile",
-                messages=[
-                    {"role": "system", "content": system_prompt},
-                    {"role": "user", "content": user_prompt},
-                ],
-                temperature=0.1,
-                max_tokens=4000,
-                response_format={"type": "json_object"},
-                timeout=SCORING_TIMEOUT,
-            )
-            parsed = _parse_scores(
-                response.choices[0].message.content.strip(),
-                candidates,
-            )
-            for index, candidate in enumerate(candidates):
-                candidate.viral_score = parsed[index]["score"]
-                candidate.score_reason = parsed[index]["reason"]
-            return sorted(
-                candidates,
-                key=lambda candidate: candidate.viral_score or 0,
-                reverse=True,
-            )
-        except Exception as exc:
-            last_error = exc
-            logger.warning(
-                "[Discovery] Batched Groq scoring attempt %d/2 failed: %s",
-                attempt + 1,
-                exc,
-            )
-            if attempt == 0:
-                time.sleep(1)
 
-    logger.error("[Discovery] Scoring failed after one retry: %s", last_error)
-    return []
+def _groq_scoring_content(system_prompt: str, user_prompt: str) -> str:
+    client = get_groq_client()
+    if not client:
+        raise RuntimeError("Groq scoring is not configured")
+    # The outer provider loop owns retries; disable hidden SDK retries.
+    scoring_client = (
+        client.with_options(max_retries=0)
+        if hasattr(client, "with_options")
+        else client
+    )
+    response = scoring_client.chat.completions.create(
+        model="llama-3.3-70b-versatile",
+        messages=[
+            {"role": "system", "content": system_prompt},
+            {"role": "user", "content": user_prompt},
+        ],
+        temperature=0.1,
+        max_tokens=4000,
+        response_format={"type": "json_object"},
+        timeout=SCORING_TIMEOUT,
+    )
+    return response.choices[0].message.content.strip()
+
+
+def _openrouter_scoring_content(system_prompt: str, user_prompt: str) -> str:
+    api_key = os.getenv("OPENROUTER_API_KEY", "").strip()
+    if not api_key:
+        raise RuntimeError("OpenRouter scoring is not configured")
+    response = requests.post(
+        "https://openrouter.ai/api/v1/chat/completions",
+        headers={
+            "Authorization": f"Bearer {api_key}",
+            "Content-Type": "application/json",
+            "HTTP-Referer": os.getenv("PUBLIC_BASE_URL", "http://localhost:5050"),
+            "X-Title": "Clipper",
+        },
+        json={
+            "model": "moonshotai/kimi-k2",
+            "messages": [
+                {"role": "system", "content": system_prompt},
+                {"role": "user", "content": user_prompt},
+            ],
+            "temperature": 0.1,
+            "max_tokens": 4000,
+            "response_format": {"type": "json_object"},
+        },
+        timeout=SCORING_TIMEOUT,
+    )
+    response.raise_for_status()
+    payload = response.json()
+    if payload.get("error"):
+        raise RuntimeError("OpenRouter rejected the scoring request")
+    try:
+        return payload["choices"][0]["message"]["content"].strip()
+    except (KeyError, IndexError, TypeError, AttributeError) as error:
+        raise ValueError("OpenRouter returned an invalid scoring response") from error
+
+
+def _gemini_scoring_model_name() -> str:
+    return (
+        os.getenv("GEMINI_SCORING_MODEL", "").strip()
+        or "gemini-flash-latest"
+    )
+
+
+def _gemini_scoring_content(system_prompt: str, user_prompt: str) -> str:
+    api_key = os.getenv("GEMINI_API_KEY", "").strip()
+    if not api_key:
+        raise RuntimeError("Gemini scoring is not configured")
+
+    import google.generativeai as genai
+
+    genai.configure(api_key=api_key)
+    model = genai.GenerativeModel(_gemini_scoring_model_name())
+    response = model.generate_content(
+        f"{system_prompt}\n\n{user_prompt}",
+        generation_config={
+            "temperature": 0.1,
+            "max_output_tokens": 4000,
+            "response_mime_type": "application/json",
+        },
+        request_options={"timeout": SCORING_TIMEOUT},
+    )
+    content = getattr(response, "text", "")
+    if not isinstance(content, str) or not content.strip():
+        raise ValueError("Gemini returned an empty scoring response")
+    return content.strip()
+
+
+def _provider_status_code(error: Exception) -> int | None:
+    status_code = getattr(error, "status_code", None)
+    if isinstance(status_code, int):
+        return status_code
+    response = getattr(error, "response", None)
+    status_code = getattr(response, "status_code", None)
+    return status_code if isinstance(status_code, int) else None
+
+
+def score_candidates(candidates: Iterable[StoryCandidate]) -> list[StoryCandidate]:
+    """Score one candidate batch with provider fallback and honest failure."""
+    candidates = list(candidates)
+    if not candidates:
+        return []
+
+    system_prompt, user_prompt = _scoring_prompts(candidates)
+    providers = []
+    if os.getenv("GROQ_API_KEY", "").strip():
+        providers.append(("Groq", _groq_scoring_content, 2))
+    if os.getenv("OPENROUTER_API_KEY", "").strip():
+        providers.append(("OpenRouter", _openrouter_scoring_content, 1))
+    if os.getenv("GEMINI_API_KEY", "").strip():
+        providers.append(("Gemini", _gemini_scoring_content, 1))
+
+    if not providers:
+        logger.error("[Discovery] No AI provider is configured for viral scoring")
+        raise StoryScoringError("No story-scoring provider is configured")
+
+    provider_errors = {}
+    for provider_name, scorer, max_attempts in providers:
+        for attempt in range(max_attempts):
+            try:
+                parsed = _parse_scores(
+                    scorer(system_prompt, user_prompt),
+                    candidates,
+                )
+                for index, candidate in enumerate(candidates):
+                    candidate.viral_score = parsed[index]["score"]
+                    candidate.score_reason = parsed[index]["reason"]
+                logger.info("[Discovery] %s ranked %d candidates", provider_name, len(candidates))
+                return sorted(
+                    candidates,
+                    key=lambda candidate: candidate.viral_score or 0,
+                    reverse=True,
+                )
+            except Exception as error:
+                provider_errors[provider_name] = error
+                logger.warning(
+                    "[Discovery] Batched %s scoring attempt %d/%d failed: %s",
+                    provider_name,
+                    attempt + 1,
+                    max_attempts,
+                    error,
+                )
+                # Authentication and permission failures will not improve with
+                # an immediate retry. Move to the next configured provider.
+                if _provider_status_code(error) in {400, 401, 403, 404}:
+                    break
+                if attempt + 1 < max_attempts:
+                    time.sleep(1)
+
+    logger.error(
+        "[Discovery] All configured scoring providers failed: %s",
+        ", ".join(
+            f"{provider}={error.__class__.__name__}"
+            for provider, error in provider_errors.items()
+        ),
+    )
+    raise StoryScoringError("All configured story-scoring providers failed")
 
 
 def discover_and_score() -> list[StoryCandidate]:
@@ -348,21 +775,89 @@ def format_shortlist(candidates: Iterable[StoryCandidate], limit: int = 8) -> st
     return "\n".join(lines) or "No unseen candidates were available."
 
 
-def _scrape_with_retry(url: str) -> dict:
-    last_error = None
+def _rss_scrape_payload(candidate: StoryCandidate) -> dict:
+    """Build the normal scrape contract from a sufficiently detailed feed summary."""
+    content = _plain_text(candidate.summary, limit=10_000)
+    if not _has_usable_rss_summary(candidate):
+        raise CandidateScrapeError("source_blocked")
+    return {
+        "url": candidate.url,
+        "title": candidate.title,
+        "content": content,
+        "hero_image": candidate.hero_image or None,
+        "site_name": candidate.source,
+        "content_source": "rss_summary",
+    }
+
+
+def _is_forbidden_response(error: Exception) -> bool:
+    response = getattr(error, "response", None)
+    return getattr(response, "status_code", None) == 403
+
+
+def _scrape_with_retry(candidate: StoryCandidate) -> dict:
+    if candidate.use_rss_fallback:
+        return _rss_scrape_payload(candidate)
+
+    last_error: Exception | None = None
     for attempt in range(2):
         try:
-            return scrape_url_content(url)
+            return scrape_url_content(candidate.url)
         except Exception as exc:
             last_error = exc
+            if _is_forbidden_response(exc):
+                if _has_usable_rss_summary(candidate):
+                    logger.info(
+                        "[Discovery] Using RSS summary because %s returned HTTP 403",
+                        _candidate_domain(candidate) or candidate.source,
+                    )
+                    return _rss_scrape_payload(candidate)
+                raise CandidateScrapeError("source_blocked") from exc
             if attempt == 0:
                 time.sleep(1)
-    raise last_error
+    raise CandidateScrapeError("unreachable") from last_error
 
 
-def _process_candidate(candidate: StoryCandidate) -> dict:
+def _pipeline_failure_message(stage: str, reason: str = "") -> str:
+    if stage == "scrape" and reason in SCRAPE_FAILURE_MESSAGES:
+        return SCRAPE_FAILURE_MESSAGES[reason]
+    return PIPELINE_FAILURE_MESSAGES.get(
+        stage,
+        "Video pipeline failed before it could finish.",
+    )
+
+
+def _pipeline_failure_result(
+    candidate: StoryCandidate,
+    stage: str,
+    article_id: int | None,
+    reason: str = "",
+) -> dict:
+    message = _pipeline_failure_message(stage, reason)
+    return {
+        "status": "failed",
+        "url": candidate.url,
+        "title": candidate.title,
+        "article_id": article_id,
+        "failure_stage": stage,
+        "failure_code": reason or None,
+        # ``pipeline_error`` is explicit for the discovery UI; ``error`` is
+        # retained for existing callers of run_discovery(). Both are safe,
+        # deliberately generic messages rather than upstream response text.
+        "pipeline_error": message,
+        "error": message,
+    }
+
+
+def _process_candidate(
+    candidate: StoryCandidate,
+    color_intensity: str = DEFAULT_COLOR_INTENSITY,
+) -> dict:
     """Run one selected story through the existing persisted video pipeline."""
+    color_intensity = normalize_color_intensity(color_intensity)
     article_id = None
+    stage = "scrape"
+    failure_reason = ""
     try:
         with app.app_context():
             existing = Article.query.filter_by(url=candidate.url).first()
@@ -375,9 +870,9 @@ def _process_candidate(candidate: StoryCandidate) -> dict:
                     "reason": "already exists",
                 }
 
-        scraped = _scrape_with_retry(candidate.url)
+        scraped = _scrape_with_retry(candidate)
         if not scraped.get("content") or len(scraped["content"]) < 100:
-            raise ValueError("Could not extract at least 100 characters of article content")
+            raise CandidateScrapeError("not_enough_text")
 
         with app.app_context():
             existing = Article.query.filter_by(url=scraped["url"]).first()
@@ -402,18 +897,29 @@ def _process_candidate(candidate: StoryCandidate) -> dict:
             db.session.commit()
             article_id = article.id
 
+            stage = "summarize"
             summary = summarize_article(article.title, article.content)
             article.tldr = summary["tldr"]
             article.bullets = json.dumps(summary["bullets"])
             article.video_script = summary["video_script"]
             article.hashtags = json.dumps(summary.get("hashtags", []))
+            article.cover_line = summary.get("cover_line") or None
+            article.cta_question = summary.get("cta_question") or None
+            article.search_caption = summary.get("search_caption") or None
+            article.series_lane = summary.get("series_lane") or None
 
             # Engagement metadata (scene-based generation)
             from visual_styles import STYLES as VISUAL_STYLES
             scenes = summary.get("scenes") or []
             article.scenes = json.dumps(scenes) if scenes else None
+            article.visual_sources = None
             hook_variants = summary.get("hook_variants") or []
             article.hook_variants = json.dumps(hook_variants) if hook_variants else None
+            article.best_hook_index = valid_hook_index(
+                summary.get("best_hook_index"),
+                hook_variants,
+            )
+            article.hook_index_used = None
             article.dominant_emotion = summary.get("dominant_emotion") or None
             suggested = summary.get("suggested_style")
             if suggested and suggested in VISUAL_STYLES:
@@ -427,7 +933,12 @@ def _process_candidate(candidate: StoryCandidate) -> dict:
             article_scenes = scenes or None
             article_style = article.style
             article_emotion = article.dominant_emotion
+            article_cover_line = getattr(article, "cover_line", None)
+            article_series_lane = getattr(article, "series_lane", None)
+            article_hero_image = getattr(article, "hero_image", None)
 
+        stage = "render"
+        visual_sources = []
         video_path = generate_video(
             article_id=article_id,
             title=title,
@@ -436,11 +947,22 @@ def _process_candidate(candidate: StoryCandidate) -> dict:
             scenes=article_scenes,
             style_key=article_style,
             emotion=article_emotion,
+            cover_line=article_cover_line,
+            series_lane=article_series_lane,
+            hero_image=article_hero_image,
+            color_intensity=color_intensity,
+            visual_sources_out=visual_sources,
         )
 
         with app.app_context():
             article = db.session.get(Article, article_id)
             article.video_path = Path(video_path).name
+            article.color_intensity = color_intensity
+            article.visual_sources = json.dumps(visual_sources)
+            article.hook_index_used = find_matching_hook_index(
+                hook_variants,
+                article_scenes or [],
+            )
             article.status = "video_done"
             article.video_generated_at = datetime.now(timezone.utc)
             db.session.commit()
@@ -453,8 +975,11 @@ def _process_candidate(candidate: StoryCandidate) -> dict:
                 "viral_score": article.viral_score,
             }
     except Exception as exc:
+        if isinstance(exc, CandidateScrapeError):
+            failure_reason = exc.reason
         logger.error(
-            "[Discovery] Pipeline failed for %s: %s",
+            "[Discovery] %s stage failed for %s: %s",
+            stage,
             candidate.url,
             exc,
             exc_info=True,
@@ -465,13 +990,12 @@ def _process_candidate(candidate: StoryCandidate) -> dict:
                 if article:
                     article.status = "failed"
                     db.session.commit()
-        return {
-            "status": "failed",
-            "url": candidate.url,
-            "title": candidate.title,
-            "article_id": article_id,
-            "error": str(exc)[:300],
-        }
+        return _pipeline_failure_result(
+            candidate,
+            stage,
+            article_id,
+            failure_reason,
+        )
 
 
 def run_discovery(
