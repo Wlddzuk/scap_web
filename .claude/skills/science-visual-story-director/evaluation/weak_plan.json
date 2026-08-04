@@ -1,0 +1,28 @@
+{
+  "_comment": "PLAN B (weak) from strong-vs-weak.md. Expected: many failures - 11 beats, 100% AI, every shot 3.5s, object referents routed to AI, no justifications, no anchor reuse.",
+  "narration_seconds": 48.0,
+  "beats": [
+    {"id": 1, "idea": "cute water bear in space", "referent": "object", "source": "ai", "image": "B1",
+     "shots": [{"start": 0.0, "end": 3.5, "motion": "push"}]},
+    {"id": 2, "idea": "frozen in glowing ice", "referent": "object", "source": "ai", "image": "B2",
+     "shots": [{"start": 0.0, "end": 3.5, "motion": "push"}]},
+    {"id": 3, "idea": "a satellite orbiting earth", "referent": "object", "source": "ai", "image": "B3",
+     "shots": [{"start": 0.0, "end": 3.5, "motion": "push"}]},
+    {"id": 4, "idea": "scientists looking at monitors", "referent": "object", "source": "ai", "image": "B4",
+     "shots": [{"start": 0.0, "end": 3.5, "motion": "push"}]},
+    {"id": 5, "idea": "a tardigrade waking up", "referent": "object", "source": "ai", "image": "B5",
+     "shots": [{"start": 0.0, "end": 3.5, "motion": "push"}]},
+    {"id": 6, "idea": "cells drying out", "referent": "unphotographable", "source": "ai", "image": "B6",
+     "shots": [{"start": 0.0, "end": 3.5, "motion": "push"}]},
+    {"id": 7, "idea": "magical glowing sugar crystals", "referent": "abstract", "source": "ai", "image": "B7",
+     "shots": [{"start": 0.0, "end": 3.5, "motion": "push"}]},
+    {"id": 8, "idea": "standing still, dramatic", "referent": "object", "source": "ai", "image": "B8",
+     "shots": [{"start": 0.0, "end": 3.5, "motion": "push"}]},
+    {"id": 9, "idea": "water droplet slow motion", "referent": "object", "source": "ai", "image": "B9",
+     "shots": [{"start": 0.0, "end": 3.5, "motion": "push"}]},
+    {"id": 10, "idea": "happy tardigrade walking away", "referent": "object", "source": "ai", "image": "B10",
+     "shots": [{"start": 0.0, "end": 3.5, "motion": "push"}]},
+    {"id": 11, "idea": "question mark over stars", "referent": "abstract", "source": "ai", "image": "B11",
+     "shots": [{"start": 0.0, "end": 3.5, "motion": "push"}]}
+  ]
+}

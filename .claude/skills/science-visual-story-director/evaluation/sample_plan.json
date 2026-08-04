@@ -1,0 +1,78 @@
+{
+  "_comment": "PLAN A (strong) from strong-vs-weak.md, encoded for check_plan.py. Expected: all mechanical checks pass.",
+  "narration_seconds": 48.0,
+  "beats": [
+    {
+      "id": 1,
+      "idea": "the animal itself, and its scale",
+      "referent": "object",
+      "source": "real",
+      "image": "A1",
+      "query": "tardigrade scanning electron micrograph",
+      "shots": [
+        {"start": 0.0, "end": 2.3, "motion": "push", "note": "whole animal, claws visible"},
+        {"start": 2.3, "end": 4.4, "motion": "detail crop", "note": "hard cut to the claws"},
+        {"start": 4.4, "end": 6.4, "motion": "pan-right", "note": "along the segmented body"},
+        {"start": 6.4, "end": 8.4, "motion": "pull", "note": "animal small, scale implied"}
+      ]
+    },
+    {
+      "id": 2,
+      "idea": "the ESA orbital exposure experiment",
+      "referent": "object",
+      "source": "real",
+      "image": "A3",
+      "query": "ESA BIOPAN exposure facility Foton satellite",
+      "shots": [
+        {"start": 0.0, "end": 2.4, "motion": "push", "note": "hard cut to the exposure tray"},
+        {"start": 2.4, "end": 4.5, "motion": "detail crop", "note": "sample wells"},
+        {"start": 4.5, "end": 6.6, "motion": "pull", "note": "tray on the satellite exterior"},
+        {"start": 6.6, "end": 8.6, "motion": "pan-left", "note": "across the hull"},
+        {"start": 8.6, "end": 10.6, "motion": "pull", "note": "satellite against Earth limb"}
+      ]
+    },
+    {
+      "id": 3,
+      "idea": "the tun state - drying out almost completely",
+      "referent": "object",
+      "source": "real",
+      "image": "A2",
+      "query": "tardigrade tun state desiccated SEM",
+      "shots": [
+        {"start": 0.0, "end": 2.3, "motion": "push", "note": "hard cut to the contracted tun"},
+        {"start": 2.3, "end": 4.4, "motion": "detail crop", "note": "collapsed body wall"},
+        {"start": 4.4, "end": 6.5, "motion": "pull", "note": "tun beside A1 at matched scale"},
+        {"start": 6.5, "end": 8.7, "motion": "push", "note": "back into the tun"},
+        {"start": 8.7, "end": 11.2, "motion": "detail crop", "note": "the sealed surface"}
+      ]
+    },
+    {
+      "id": 4,
+      "idea": "the sugar glass holding every protein in place",
+      "referent": "unphotographable",
+      "source": "ai",
+      "image": "A4",
+      "ai_justification": "intracellular vitrification has no public micrograph that reads at short-form scale",
+      "shots": [
+        {"start": 0.0, "end": 2.4, "motion": "push", "note": "the matrix, proteins immobile"},
+        {"start": 2.4, "end": 4.5, "motion": "detail crop", "note": "one locked protein"},
+        {"start": 4.5, "end": 6.6, "motion": "pull", "note": "the full matrix"},
+        {"start": 6.6, "end": 8.8, "motion": "push", "note": "stillness held"}
+      ]
+    },
+    {
+      "id": 5,
+      "idea": "add water and it walks away - then the question",
+      "referent": "object",
+      "source": "real",
+      "image": "A1",
+      "query": "tardigrade scanning electron micrograph",
+      "shots": [
+        {"start": 0.0, "end": 2.2, "motion": "push", "note": "hard cut back to the hydrated animal"},
+        {"start": 2.2, "end": 4.3, "motion": "detail crop", "note": "a leg mid-step"},
+        {"start": 4.3, "end": 6.5, "motion": "pan-right", "note": "the animal moving"},
+        {"start": 6.5, "end": 9.0, "motion": "pull", "note": "widest frame, holds under the CTA"}
+      ]
+    }
+  ]
+}
