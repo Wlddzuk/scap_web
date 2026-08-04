@@ -135,7 +135,7 @@ BEAT 11 · scene 11 · 3.5s AI: "question mark over a starry background"
 | 6 | Coherent visual world + anchor reuse | **2** — A1 bookends, A1/A2 matched scale | **0** — 11 unrelated images |
 | 7 | Scale ladder is deliberate | **2** — orbit → animal → cell → matrix | **0** — random |
 | 8 | No off-world / mascot / stock imagery | **2** — explicitly excluded | **0** — "cute water bear", "cartoon style" |
-| 9 | Abstract ideas routed to graphics, not fake photos | **2** — the one AI is a real mechanism | **0** — "magical sugar crystals" |
+| 9 | Abstract ideas resolved to a pointable physical proxy, not a chart and not a fake photo | **2** — the one AI is a real mechanism | **0** — "magical sugar crystals" |
 | 10 | Nothing asserted that the source does not support | **2** | **0** — "glowing", "magical", "happy" invent facts |
 | | **Total /20** | **20** | **0** |
 

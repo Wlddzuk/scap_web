@@ -96,11 +96,41 @@ on the beat's `referent`:
 |---|---|---|
 | `object` | **Real image.** Write a search query. | It exists and was photographed. A generated fake is strictly worse and quietly dishonest. |
 | `unphotographable` | **Real scientific figure first** (diagram, scan, micrograph, simulation still). AI illustration only if none exists. | Real microscopic/internal/extinct subjects usually *do* have authoritative imagery. |
-| `abstract` | **Graphic.** A number, comparison, or 2-4 step process rendered as a card. | A concept has no photograph. Generating one invents a fact. |
+| `abstract` | **Find the physical proxy.** See the ladder below. | A concept has no photograph — but it almost always has a *thing* that makes it real. |
 
 The rule that follows: **AI images are a fallback, not a default.** Every AI
 prompt in your plan needs a one-line justification of why no real image exists.
 If you cannot write that line, search harder.
+
+### Making abstract beats worth watching
+
+A number card is not a visual. Nobody has ever stayed for a bar chart. But the
+answer is not to fabricate a photorealistic image of a statistic either — that
+invents a fact.
+
+The answer is to **turn the number into an object.** Work down this ladder and
+stop at the first rung that works:
+
+1. **A real object at true scale.** The pre-Bötzinger complex is *the size of a
+   grain of rice* — so shoot a grain of rice. This routes to `real`, it is
+   honest, and it is far more watchable than "7,000 neurons" in type. Always try
+   this rung first.
+2. **Two real objects at true relative scale.** For comparisons: the thing and
+   what it is being compared against, photographed together, actual proportions.
+3. **A designed AI illustration of the comparison made physical** — a small pile
+   against a huge pile, a thin sliver against a full disc. Legitimate, because it
+   reads as a constructed diagram rather than a fake document. Justify it like any
+   other AI image.
+4. **A number on screen** — only as 1-2s of punctuation *over* a real image you
+   are already holding. Never as a beat of its own.
+
+The test: **can the viewer point at something?** "A hundred watts" is not
+pointable. A lightbulb is. If your abstract beat has nothing pointable in it, you
+have not finished directing it.
+
+This is also a quality lever. An abstract beat resolved to rung 1 or 2 costs a
+search and looks like a real photograph. Resolved to rung 4 it looks like a
+slide.
 
 ### Step 5 — Write the queries
 

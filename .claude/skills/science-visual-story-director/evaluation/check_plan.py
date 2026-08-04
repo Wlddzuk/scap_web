@@ -41,11 +41,13 @@ MOTIONS = {"push", "pull", "pan-left", "pan-right", "detail crop"}
 REFERENTS = {"object", "unphotographable", "abstract"}
 SOURCES = {"real", "ai", "graphic"}
 
-# referent -> sources that are defensible for it
+# referent -> sources that are defensible for it.
+# `abstract` may resolve to a real physical proxy (ladder rungs 1-2), a designed
+# AI illustration of the comparison (rung 3), or a bare graphic (rung 4).
 ROUTING = {
     "object": {"real"},
     "unphotographable": {"real", "ai"},
-    "abstract": {"graphic"},
+    "abstract": {"real", "ai", "graphic"},
 }
 
 
@@ -86,6 +88,15 @@ def check(plan):
                     f"beat {bid}: referent {referent!r} must route to "
                     f"{'/'.join(sorted(allowed))}, got {source!r}"
                 )
+
+        # --- physical proxy ladder ---------------------------------------
+        # A bare graphic is rung 4: allowed, but it is the rung that loses
+        # viewers, so it never passes silently.
+        if referent == "abstract" and source == "graphic":
+            warn.append(
+                f"beat {bid}: abstract routed to a bare graphic (ladder rung 4) - "
+                f"look for a real object at true scale first; a chart is a scroll-away"
+            )
 
         # --- required justification --------------------------------------
         if source == "real" and not (beat.get("query") or "").strip():
