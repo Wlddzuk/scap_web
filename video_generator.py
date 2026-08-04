@@ -2770,10 +2770,18 @@ def generate_referent_scene_images(
 
     images = []
     records = []
+    reuse_cursor = 0
     for index, scene in enumerate(scenes):
         asset = scene_assets[index]
+        reused = False
         if asset is None:
-            # Only reached if generation also failed for this slot.
+            # Only reached if generation also failed for this slot. A flat
+            # gradient used to be emitted here, which shipped a blank card in
+            # the middle of the edit -- at 2 seconds that reads as a broken
+            # video and costs the whole view. Any real image already earned by
+            # this story is better than a blank frame, so reuse before
+            # despairing: prefer one whose query overlaps this scene, else take
+            # the next pooled image in rotation so one photo is not repeated.
             relevant_pool = [
                 candidate for candidate in image_pool
                 if _expanded_reference_tokens(_scene_evidence_query(scene, article_title))
@@ -2782,24 +2790,21 @@ def generate_referent_scene_images(
                     str(candidate[1].get("evidence_query") or ""),
                 )))
             ]
-            asset = (
-                relevant_pool[0]
-                if relevant_pool
-                else (create_gradient_background(), {
-                    "lane": SCHEMATIC,
-                    "provider": "local",
-                    "source_url": "",
-                    "license": "Generated gradient",
-                    "author": "Clipper",
-                    "subject_verified": False,
-                    "verification_method": "scene generation unavailable",
-                    "evidence_query": _scene_evidence_query(scene, article_title),
-                    "visual_role": _scene_visual_role(scene),
-                })
-            )
+            fallback_pool = relevant_pool or image_pool
+            if not fallback_pool:
+                # Nothing was found or generated for the entire story. There is
+                # no video worth publishing here, so fail loudly and let the
+                # caller mark the article failed rather than emit blank frames.
+                raise RuntimeError(
+                    "No usable imagery for any scene; refusing to render "
+                    "placeholder frames"
+                )
+            asset = fallback_pool[reuse_cursor % len(fallback_pool)]
+            reuse_cursor += 1
+            reused = True
         image, base_record = asset
         record = dict(base_record)
-        if scene_assets[index] is None and relevant_pool:
+        if reused:
             record["editorial_reuse"] = True
             record["verification_method"] = (
                 str(record.get("verification_method") or "documentary image")

@@ -73,10 +73,34 @@ def test_summary_parser_forces_brand_style_and_keeps_teaching_metadata():
     assert parsed["suggested_style"] == "illustrated_science"
     assert parsed["scenes"][0]["focus_label"] == "OXYGEN RESERVE EXTRA WORDS"
     assert parsed["scenes"][0]["visual_action"] == "reveal"
-    assert parsed["scenes"][0]["referent_query"] == ""
+    # An unphotographable subject keeps its query: a whale's internal anatomy
+    # has real published figures, and clearing this left the sourcing path
+    # with no search term at all.
+    assert parsed["scenes"][0]["referent_query"] == "must be cleared"
     assert parsed["scenes"][0]["precise_claim"] is True
     assert parsed["scenes"][1]["graphic_payload"] == ""
     assert parsed["scenes"][1]["visual_action"] == "highlight"
+
+
+def test_only_an_abstract_referent_clears_its_search_query():
+    payload = _summary_payload()
+    payload["scenes"][0]["referent"] = "abstract"
+    payload["scenes"][0]["referent_query"] = "nothing to photograph"
+
+    parsed = summarizer.parse_response(json.dumps(payload))
+
+    assert parsed["scenes"][0]["referent_query"] == ""
+    assert parsed["scenes"][1]["referent_query"] == "diving whale underwater"
+
+
+def test_prompt_makes_abstract_a_last_resort():
+    prompt = summarizer.get_prompt("A physics result", "Body text")
+
+    assert '"abstract" is a last resort' in prompt
+    # The classifier used to label fabricated devices abstract, which meant no
+    # real image was ever searched for. The rule order must name that case.
+    assert "metagrating" in prompt
+    assert 'REQUIRED whenever referent is "object" or "unphotographable"' in prompt
 
 
 def test_scene_plan_numbers_progressive_teaching_steps():

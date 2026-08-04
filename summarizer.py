@@ -70,8 +70,9 @@ Break the script into 10-14 SCENES. For each scene provide:
 - emotion: one of [curious, shocking, urgent, triumphant, dark, funny]
 - focus_label: 1-4 factual concept words already spoken in this scene. Never use a person's name or an unanchored measurement. Never invent a new fact.
 - visual_action: one of [reveal, trace, compare, locate, sequence, highlight]
-- referent: classify the subject of THIS scene, not the story topic. Use "object" for a specific physical thing, place, person, instrument, specimen, or event that exists or existed and could plausibly have been photographed. Prefer object when a proper noun, named instrument, named place, or named person is available. Use "unphotographable" for a real microscopic, internal, extinct, subatomic, or pre-photography subject. Use "abstract" for a concept, feeling, statistic, comparison, rate, process, or mechanism with no physical form.
-- referent_query: when referent is "object", give a precise 2-6 word image-search query with proper nouns where available. Search for ONE main photographable subject only; never combine two animals, two artifacts, or an object plus a conceptual composition in one query. Otherwise return an empty string.
+- referent: classify the subject of THIS scene, not the story topic. Work this decision in order and STOP at the first rule that applies. Rule 1: if the scene names or implies any material, device, structure, instrument, chip, sample, organism, place, person, mission, telescope, or published figure that a camera or microscope has ever been pointed at, the answer is "object". A fabricated device such as a metagrating, an engineered material such as indium arsenide, a named satellite, a named specimen, and a laboratory rig are ALL objects, even when the sentence is describing how they work. Rule 2: if the real subject exists physically but is microscopic, internal, extinct, subatomic, or pre-photography, the answer is "unphotographable" - it almost always still has a real micrograph, scan, or published figure. Rule 3: only if the scene has NO physical subject at all - a pure rate, ratio, feeling, or comparison of numbers - the answer is "abstract".
+- "abstract" is a last resort and must be rare. Most scenes in a science story are object or unphotographable. If you are about to answer "abstract" because the sentence describes a process or mechanism, stop: a mechanism belongs to a physical thing, so classify that thing instead. Choosing "abstract" means no real photograph will ever be searched for this scene, so never choose it for convenience.
+- referent_query: REQUIRED whenever referent is "object" or "unphotographable" - give a precise 2-6 word image-search query with proper nouns where available. For "object" name the thing itself. For "unphotographable" name the real imagery that shows it, such as a micrograph, scan, or published figure. Search for ONE main photographable subject only; never combine two animals, two artifacts, or an object plus a conceptual composition in one query. Return an empty string only when referent is "abstract".
 - visual_role: classify what the picture contributes as exactly one of [discovery, evidence, mechanism, context]. Use discovery for the newly found object/result, evidence for the specimen/data/experiment that supports it, mechanism for how it works, and context only for a location, institution, researcher portrait, or atmosphere. Most scenes should be discovery, evidence, or mechanism. A location is context, never the visual substitute for a discovery.
 - evidence_query: give a precise 3-8 word search phrase for what THIS sentence is really revealing. Name the discovery, artifact, specimen, instrument, experiment, scientific figure, simulation, or mechanism. This is required for every scene, including abstract and unphotographable scenes, because it is also used to find truthful diagrams or guide a scene-specific illustration. Never return only a city, country, university, building, generic laboratory, or broad setting unless visual_role is context. Example: use "DNA double strand breaks super enhancers", not "Hebrew University Jerusalem"; use "pyramid hidden chamber muon scan", not "Egypt pyramid".
 - precise_claim: true whenever the narration states where something is located, how it works, how big it is, or asserts anatomy, internal layout, a mechanism, a measurement, or a labelled part. Default to true when uncertain.
@@ -158,7 +159,14 @@ def _normalize_referent(value) -> str:
 
 
 def _normalize_referent_query(value, referent: str) -> str:
-    if referent != "object":
+    """Keep the search query for anything with a real physical subject.
+
+    An unphotographable subject still has real imagery -- a micrograph, a scan,
+    a published figure -- so blanking its query here removed the only search
+    term the sourcing path had. Only a genuinely abstract scene has nothing to
+    look for.
+    """
+    if referent == "abstract":
         return ""
     return " ".join(_clean_inline_text(value).split()[:6])[:120].strip()
 

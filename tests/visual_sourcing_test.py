@@ -617,3 +617,98 @@ def test_openrouter_rate_limit_trips_process_circuit_breaker(monkeypatch):
     assert real_imagery._verify_subject_openrouter(image, "Mars") is None
     assert real_imagery._verify_subject_openrouter(image, "Mars") is None
     assert calls == [True]
+
+
+def test_a_failed_scene_reuses_story_imagery_instead_of_a_blank_gradient(monkeypatch):
+    """A dead scene must never ship as a flat gradient card.
+
+    Article 58 rendered a solid blue frame at 1.8s because both search and
+    generation failed for one scene and the fallback drew a gradient. At two
+    seconds that reads as a broken video, so any real image this story already
+    earned is the better substitute.
+    """
+    found = Image.new("RGB", (1080, 1920), "navy")
+    ImageDraw.Draw(found).ellipse((260, 400, 820, 960), fill="gold")
+
+    def only_the_telescope_scene_finds_an_image(query, **_kwargs):
+        if "telescope" not in str(query).lower():
+            return None
+        return SimpleNamespace(
+            image=found,
+            source_url="https://example.test/telescope.jpg",
+            audit_record=lambda lane: {
+                "lane": lane,
+                "provider": "Wikimedia",
+                "source_url": "https://example.test/telescope.jpg",
+                "search_query": query,
+            },
+            license="Public domain",
+            author="Archive",
+            source_name="Archive",
+        )
+
+    monkeypatch.setattr(
+        real_imagery, "fetch_referent_image", only_the_telescope_scene_finds_an_image
+    )
+    monkeypatch.setattr(video_generator, "search_pexels_images", lambda *_a, **_k: [])
+    monkeypatch.setattr(video_generator, "_credit_photo", lambda image, _source: image)
+    # Generation fails for every scene, which is what leaves a slot empty.
+    monkeypatch.setattr(
+        video_generator,
+        "_parallel_image_gen",
+        lambda prompts, **_kwargs: [None for _prompt in prompts],
+    )
+
+    records = []
+    images = video_generator.generate_referent_scene_images(
+        [
+            {
+                **_scene(
+                    referent="object",
+                    referent_query="telescope mirror",
+                    evidence_query="telescope mirror array",
+                    graphic_payload="",
+                ),
+                "_scene_index": 0,
+            },
+            {
+                **_scene(
+                    referent="object",
+                    referent_query="unfindable subject",
+                    evidence_query="unfindable subject entirely",
+                    graphic_payload="",
+                ),
+                "_scene_index": 1,
+            },
+        ],
+        article_title="A telescope story",
+        visual_sources_out=records,
+    )
+
+    assert len(images) == 2
+    gradient = video_generator.create_gradient_background()
+    for image in images:
+        assert ImageChops.difference(image.convert("RGB"), gradient).getbbox() is not None
+    assert records[1]["editorial_reuse"] is True
+    assert records[1]["provider"] == "Wikimedia"
+
+
+def test_a_story_with_no_usable_imagery_fails_instead_of_rendering_blanks(monkeypatch):
+    """Zero images for the whole story is a failed render, not a blank video."""
+    monkeypatch.setattr(real_imagery, "fetch_referent_image", lambda *_a, **_k: None)
+    monkeypatch.setattr(video_generator, "search_pexels_images", lambda *_a, **_k: [])
+    monkeypatch.setattr(
+        video_generator,
+        "_parallel_image_gen",
+        lambda prompts, **_kwargs: [None for _prompt in prompts],
+    )
+
+    try:
+        video_generator.generate_referent_scene_images(
+            [{**_scene(referent="object", referent_query="nothing"), "_scene_index": 0}],
+            article_title="A story with no imagery",
+        )
+    except RuntimeError as error:
+        assert "placeholder" in str(error)
+    else:
+        raise AssertionError("expected a RuntimeError instead of blank frames")
