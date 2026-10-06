@@ -1,8 +1,15 @@
 /**
- * Clipper Dashboard - Frontend JavaScript
+ * SCAP dashboard - frontend JavaScript (Night Shift)
  */
 
 const API_BASE = '';
+
+// Drawn icons from the inline SVG sprite in index.html; never unicode glyphs.
+function icon(name, extra = '') {
+    return `<svg class="icon ${extra}" aria-hidden="true"><use href="#i-${name}"></use></svg>`;
+}
+
+const PLATFORM_MONOGRAMS = { tiktok: 'TT', instagram: 'IG', youtube: 'YT', facebook: 'FB' };
 
 // ============================================
 // State
@@ -123,7 +130,7 @@ async function fetchArticles() {
         }
 
         updateStats();
-        updateProgressBanner();
+        renderMossRun();
         if (generationJustFinished) loadGenerationBudget(true);
     } catch (error) {
         console.error('Error fetching articles:', error);
@@ -488,7 +495,7 @@ function connectPlatform(platform) {
 
 async function disconnectPlatform(platform) {
     const name = platform[0].toUpperCase() + platform.slice(1);
-    if (!confirm(`Disconnect this ${name} account from Clipper?`)) return;
+    if (!confirm(`Disconnect this ${name} account from SCAP?`)) return;
     try {
         const connection = platformConnections[platform] || {};
         const response = await fetch(connection.disconnect_url || `/api/${platform}/disconnect`, { method: 'POST' });
@@ -591,13 +598,6 @@ async function runStoryDiscovery() {
     }
 }
 
-function focusStoryDiscovery() {
-    const button = document.getElementById('discovery-run-btn');
-    if (!button) return;
-    button.scrollIntoView({ behavior: 'smooth', block: 'center' });
-    window.setTimeout(() => button.focus({ preventScroll: true }), 450);
-}
-
 async function makeDiscoveryVideo(candidateId) {
     const candidate = (discoveryState.candidates || []).find(item => item.candidate_id === candidateId);
     const existing = candidate && articles.find(article => article.url === candidate.url);
@@ -674,14 +674,15 @@ function renderDiscovery() {
         candidate => ['queued', 'processing'].includes(candidate.pipeline_status)
     );
     button.disabled = Boolean(discoveryState.running) || hasPipelineWork;
-    setTextIfChanged(
-        button,
-        discoveryState.running
-            ? 'Finding stories…'
-            : hasPipelineWork
-                ? 'Video in progress…'
-                : 'Find today\'s stories'
-    );
+    const buttonHtml = discoveryState.running
+        ? 'Finding stories…'
+        : hasPipelineWork
+            ? 'Video in progress…'
+            : `${icon('search')}Find today’s stories`;
+    if (button.dataset.label !== buttonHtml) {
+        button.dataset.label = buttonHtml;
+        button.innerHTML = buttonHtml;
+    }
 
     let statusMessage;
     if (discoveryState.running) {
@@ -729,14 +730,12 @@ function renderDiscovery() {
         const buttonLabel = isProcessing
             ? 'Making video…'
             : isDone
-                ? '\u25B6 Watch'
+                ? `${icon('play', 'icon-sm icon-fill')}Watch`
                 : isSkipped
                     ? 'Already added'
-                    : isChoosingStyle
-                        ? 'Close'
-                        : pipelineStatus === 'failed'
-                            ? 'Retry video'
-                            : 'Make video';
+                    : pipelineStatus === 'failed'
+                        ? 'Retry video'
+                        : `${icon('spark', 'icon-sm')}Make video`;
 
         return `
             <article class="discovery-card" data-discovery-candidate="${candidate.candidate_id}">
@@ -990,7 +989,7 @@ async function previewVoiceTone(event, articleId) {
                 if (activeVoicePreviewSource === source) activeVoicePreviewSource = null;
                 if (button && button.isConnected) {
                     button.disabled = false;
-                    button.textContent = '▶ Preview';
+                    button.innerHTML = `${icon('volume', 'icon-sm')}Preview`;
                 }
             };
             source.start(0);
@@ -1007,7 +1006,7 @@ async function previewVoiceTone(event, articleId) {
                 }
                 if (button && button.isConnected) {
                     button.disabled = false;
-                    button.textContent = '▶ Preview';
+                    button.innerHTML = `${icon('volume', 'icon-sm')}Preview`;
                 }
             }, { once: true });
             await audio.play();
@@ -1023,7 +1022,7 @@ async function previewVoiceTone(event, articleId) {
         );
         if (button && button.isConnected) {
             button.disabled = false;
-            button.textContent = '▶ Preview';
+            button.innerHTML = `${icon('volume', 'icon-sm')}Preview`;
         }
     }
 }
@@ -1098,11 +1097,11 @@ function renderVideoActions(article) {
         <div class="video-transfer-row">
             <button class="btn btn-action btn-tiktok btn-post"
                     onclick="openShareEverywhereDialog(event, ${article.id})">
-                &#8599; Post
+                ${icon('send', 'icon-sm')}Post
             </button>
             <a href="/videos/${encodeURIComponent(article.video_path)}"
                class="btn btn-action btn-download" download>
-                Download
+                ${icon('download', 'icon-sm')}Download
             </a>
         </div>
         <p class="video-review-note">Before posting: does the first second show the real subject, and does the ending pay off the hook?</p>
@@ -1125,7 +1124,7 @@ function openVideoPlayer(articleId) {
     modal.onclick = (e) => { if (e.target === modal) closeVideoPlayer(); };
     modal.innerHTML = `
         <div class="video-player-content">
-            <button class="qr-modal-close" onclick="closeVideoPlayer()" aria-label="Close video">&times;</button>
+            <button class="qr-modal-close" onclick="closeVideoPlayer()" aria-label="Close video">${icon('close')}</button>
             <video class="video-player" controls autoplay playsinline
                    src="/videos/${encodeURIComponent(article.video_path)}"></video>
             <div class="video-player-side">
@@ -1286,7 +1285,6 @@ function renderShareEverywhereDialog(article, tiktokContext = null, retryPlatfor
         // destinations selected; only a single-platform retry is preselected.
         const selected = !reason && Boolean(retryPlatform && retryPlatform === platform);
         const lockedByRetry = Boolean(retryPlatform && retryPlatform !== platform);
-        const icon = { tiktok: '♪', instagram: '◎', youtube: '▶', facebook: 'f' }[platform];
         const helper = lockedByRetry
             ? `Retrying ${platformDisplayName(retryPlatform)} only`
             : reason || platformExpiryMessage(connection) || 'Ready to publish';
@@ -1296,12 +1294,12 @@ function renderShareEverywhereDialog(article, tiktokContext = null, retryPlatfor
             <div class="share-platform-card ${reason ? 'unavailable' : ''} ${lockedByRetry ? 'retry-locked' : ''}">
                 <label class="share-platform-toggle">
                     <input type="checkbox" name="share-platform" value="${platform}" ${selected ? 'checked' : ''} ${reason || lockedByRetry ? 'disabled' : ''}>
-                    <span class="share-platform-icon ${platform}">${icon}</span>
+                    <span class="share-platform-icon ${platform}" aria-hidden="true">${PLATFORM_MONOGRAMS[platform]}</span>
                     <span class="share-platform-copy">
                         <strong>${platformDisplayName(platform)}</strong>
                         <small>${escapeHtml(helper)}</small>
                     </span>
-                    <span class="share-platform-check" aria-hidden="true">✓</span>
+                    <span class="share-platform-check" aria-hidden="true">${icon('check', 'icon-sm')}</span>
                 </label>
                 ${canConnect ? `
                     <button type="button" class="share-platform-connect"
@@ -1316,9 +1314,9 @@ function renderShareEverywhereDialog(article, tiktokContext = null, retryPlatfor
 
     modal.innerHTML = `
         <div class="tiktok-modal-content share-modal-content">
-            <button class="qr-modal-close" onclick="closeShareModal()">&times;</button>
+            <button class="qr-modal-close" onclick="closeShareModal()" aria-label="Close">${icon('close')}</button>
             <div class="tiktok-modal-heading">
-                <div class="tiktok-mark share-mark">↗</div>
+                <div class="tiktok-mark share-mark">${icon('send')}</div>
                 <div>
                     <h3>${retryPlatform ? `Retry ${platformDisplayName(retryPlatform)}` : 'Post video'}</h3>
                     <p>Choose each destination yourself, then confirm once.</p>
@@ -1498,20 +1496,19 @@ function renderShareResults(articleId, results) {
     const container = document.getElementById('share-results');
     const form = document.getElementById('share-post-form');
     if (!container) return;
-    const iconByPlatform = { tiktok: '♪', instagram: '◎', youtube: '▶', facebook: 'f' };
     const rows = Object.entries(results || {}).map(([platform, result]) => {
         const status = result.status || (result.accepted ? 'ACCEPTED' : 'FAILED');
         const failed = !result.accepted || status === 'FAILED';
         const permalink = safePublishUrl(result.permalink);
         return `
             <div class="share-result-row ${failed ? 'failed' : 'accepted'}">
-                <span class="share-platform-icon ${platform}">${iconByPlatform[platform] || '↗'}</span>
+                <span class="share-platform-icon ${platform}" aria-hidden="true">${PLATFORM_MONOGRAMS[platform] || icon('send', 'icon-sm')}</span>
                 <span class="share-result-copy">
                     <strong>${platformDisplayName(platform)}</strong>
                     <small>${escapeHtml(formatPublishStatus(status))}${result.error ? ` · ${escapeHtml(result.error)}` : ''}</small>
                 </span>
                 ${permalink ? `<a href="${escapeHtml(permalink)}" target="_blank" rel="noopener noreferrer">View post</a>` : ''}
-                ${failed ? `<button type="button" onclick="openShareEverywhereDialog(event, ${articleId}, '${platform}')">Retry</button>` : '<span class="share-result-ok">✓</span>'}
+                ${failed ? `<button type="button" onclick="openShareEverywhereDialog(event, ${articleId}, '${platform}')">Retry</button>` : `<span class="share-result-ok">${icon('check', 'icon-sm')}</span>`}
             </div>
         `;
     }).join('');
@@ -1622,31 +1619,6 @@ function getFilteredArticles() {
 }
 
 // ============================================
-// Progress Banner
-// ============================================
-
-function updateProgressBanner() {
-    const bannerContainer = document.querySelector('.progress-banner-container');
-    const banner = document.getElementById('progress-banner');
-    const text = document.getElementById('progress-text');
-    const processing = articles.filter(a => ['summarizing', 'generating_video'].includes(a.status));
-
-    if (processing.length > 0) {
-        const names = processing.map(a => {
-            let label = 'Processing';
-            if (a.status === 'summarizing') label = 'Summarizing';
-            else if (a.status === 'generating_video') label = 'Generating video for';
-            const short = a.title.length > 40 ? a.title.slice(0, 40) + '...' : a.title;
-            return `${label}: ${short}`;
-        });
-        text.textContent = names.join(' | ');
-        banner.classList.remove('hidden');
-    } else {
-        banner.classList.add('hidden');
-    }
-}
-
-// ============================================
 // Render Functions
 // ============================================
 
@@ -1688,11 +1660,11 @@ function renderArticles() {
     // Update section header
     sectionHeader.classList.remove('hidden');
     if (searchQuery && filtered.length !== articles.length) {
-        sectionTitle.textContent = `${filtered.length} of ${articles.length} articles`;
+        sectionTitle.textContent = `${filtered.length} of ${articles.length} stories`;
     } else if (remaining > 0) {
-        sectionTitle.textContent = `${visible.length} of ${articles.length} articles`;
+        sectionTitle.textContent = `${visible.length} of ${articles.length} stories`;
     } else {
-        sectionTitle.textContent = `${articles.length} article${articles.length !== 1 ? 's' : ''}`;
+        sectionTitle.textContent = `${articles.length} stor${articles.length !== 1 ? 'ies' : 'y'}`;
     }
 
     const shouldAnimate = container.querySelectorAll('.article-card').length !== visible.length;
@@ -1729,9 +1701,9 @@ function renderArticles() {
             targets: '.article-card',
             // Cards are CSS-visible by default. Motion is an enhancement only,
             // so a suspended animation frame can never strand them at opacity 0.
-            translateY: [12, 0],
-            delay: anime.stagger(80),
-            duration: 360,
+            translateY: [6, 0],
+            delay: anime.stagger(30, { start: 0 }),
+            duration: 240,
             easing: 'easeOutCubic'
         });
     }
@@ -1739,7 +1711,6 @@ function renderArticles() {
 
 function renderArticleCard(article) {
     const isExpanded = expandedArticles.has(article.id);
-    const statusBadges = getStatusBadges(article);
     const formattedDate = new Date(article.scraped_at).toLocaleDateString('en-US', {
         month: 'short',
         day: 'numeric',
@@ -1755,13 +1726,14 @@ function renderArticleCard(article) {
                     <div class="article-meta">
                         <span>${formattedDate}</span>
                         ${article.site_name ? `<span>${escapeHtml(article.site_name)}</span>` : ''}
-                        <a href="${escapeHtml(article.url)}" target="_blank" rel="noopener">View Original</a>
+                        <a href="${escapeHtml(article.url)}" target="_blank" rel="noopener">Source</a>
                     </div>
                 </div>
+                ${renderStageStrip(article)}
                 <div class="article-status">
-                    ${statusBadges}
-                    ${article.video_path ? `<button type="button" class="btn-watch" onclick="openVideoPlayer(${article.id})" aria-label="Watch video: ${escapeAttribute(article.title)}">&#9654; Watch</button>` : ''}
-                    <button type="button" class="expand-chevron article-expand" aria-expanded="${isExpanded}" aria-controls="article-content-${article.id}" aria-label="${isExpanded ? 'Collapse' : 'Review'} article: ${escapeHtml(article.title)}" onclick="toggleExpand(${article.id})">${isExpanded ? '&#9650;' : '&#9660;'}</button>
+                    ${renderPlatformChips(article)}
+                    ${article.video_path ? `<button type="button" class="btn-watch" onclick="openVideoPlayer(${article.id})" aria-label="Watch video: ${escapeAttribute(article.title)}">${icon('play', 'icon-sm icon-fill')}Watch</button>` : ''}
+                    <button type="button" class="expand-chevron article-expand" aria-expanded="${isExpanded}" aria-controls="article-content-${article.id}" aria-label="${isExpanded ? 'Collapse' : 'Review'} story: ${escapeAttribute(article.title)}" onclick="toggleExpand(${article.id})">${icon('chevron')}</button>
                 </div>
             </div>
 
@@ -1870,45 +1842,137 @@ function renderPlatformPostStates(article) {
     return rows ? `<div class="platform-post-list">${rows}</div>` : '';
 }
 
-function getStatusBadges(article) {
-    const posts = normalizedPlatformPosts(article);
-    const supportedPlatforms = ['tiktok', 'instagram', 'youtube', 'facebook'];
-    const platformBadges = Object.values(posts).filter(
-        post => supportedPlatforms.includes(post.platform)
-    ).map(post => {
-        const name = platformDisplayName(post.platform);
-        if (platformPostIsPublished(post.status)) {
-            return `<span class="badge badge-platform badge-${post.platform}">${name} Posted</span>`;
-        }
-        if (platformPostIsPending(post.status)) {
-            return `<span class="badge badge-processing">${name} Processing</span>`;
-        }
-        if (post.status === 'FAILED') {
-            return `<span class="badge badge-failed">${name} Failed</span>`;
-        }
-        if (post.status === 'AWAITING_APPROVAL') {
-            return `<span class="badge badge-failed">${name} Needs cancel</span>`;
-        }
-        return '';
-    }).join('');
+function articleStages(article) {
+    const posts = Object.values(normalizedPlatformPosts(article));
+    const posted = posts.some(post => platformPostIsPublished(post.status));
+    const posting = posts.some(post => platformPostIsPending(post.status));
+    const failed = article.status === 'failed';
+    const hasScript = Boolean(article.video_script || article.tldr);
+    const hasVideo = Boolean(article.video_path);
 
-    // Single current-state pill. Priority: failed > processing > completed > scraped.
-    if (article.status === 'failed') {
-        return '<span class="badge badge-failed">Failed</span>' + platformBadges;
+    const script = article.status === 'summarizing'
+        ? 'working'
+        : hasScript ? 'done' : failed ? 'failed' : 'todo';
+    const video = article.status === 'generating_video'
+        ? 'working'
+        : hasVideo ? 'done' : failed && hasScript ? 'failed' : 'todo';
+    const review = hasVideo && !posted && !posting ? 'ready' : posted || posting ? 'done' : 'todo';
+    const post = posted ? 'posted' : posting ? 'working' : 'todo';
+    return [
+        ['Script', script],
+        ['Video', video],
+        ['Review', review],
+        ['Post', post],
+    ];
+}
+
+function renderStageStrip(article) {
+    const labels = { done: 'done', working: 'in progress', ready: 'ready', posted: 'posted', failed: 'failed', todo: 'not started' };
+    return `
+        <ol class="stage-strip" aria-label="Progress">
+            ${articleStages(article).map(([name, state]) => `
+                <li class="stage is-${state}" aria-label="${name}: ${labels[state]}">${name}</li>
+            `).join('')}
+        </ol>
+    `;
+}
+
+function renderPlatformChips(article) {
+    const supportedPlatforms = ['tiktok', 'instagram', 'youtube', 'facebook'];
+    return Object.values(normalizedPlatformPosts(article))
+        .filter(post => supportedPlatforms.includes(post.platform))
+        .map(post => {
+            const name = platformDisplayName(post.platform);
+            const monogram = PLATFORM_MONOGRAMS[post.platform];
+            if (platformPostIsPublished(post.status)) {
+                return `<span class="platform-chip" title="${name}: posted">${monogram}</span>`;
+            }
+            if (platformPostIsPending(post.status)) {
+                return `<span class="platform-chip is-pending" title="${name}: processing">${monogram}</span>`;
+            }
+            if (post.status === 'FAILED' || post.status === 'AWAITING_APPROVAL') {
+                return `<span class="platform-chip is-failed" title="${name}: ${post.status === 'FAILED' ? 'failed' : 'needs cancel'}">${monogram}</span>`;
+            }
+            return '';
+        }).join('');
+}
+
+// ============================================
+// Moss's run: today's video slots
+// ============================================
+
+const DAILY_GOAL = 3;
+let mossRunSignature = '';
+
+function isToday(value) {
+    if (!value) return false;
+    const date = new Date(value);
+    const now = new Date();
+    return date.getFullYear() === now.getFullYear()
+        && date.getMonth() === now.getMonth()
+        && date.getDate() === now.getDate();
+}
+
+function runSlotState(article) {
+    const stages = Object.fromEntries(articleStages(article));
+    if (article.status === 'failed') return ['failed', 'Failed'];
+    if (stages.Post === 'posted') return ['posted', 'Posted'];
+    if (article.status === 'summarizing') return ['working', 'Writing script'];
+    if (article.status === 'generating_video') return ['working', 'Making video'];
+    if (article.video_path) return ['ready', 'Ready to review'];
+    if (article.video_script) return ['scripted', 'Script ready'];
+    return ['scripted', 'Added'];
+}
+
+function renderMossRun() {
+    const track = document.getElementById('run-track');
+    const moss = document.getElementById('run-moss');
+    const summary = document.getElementById('run-summary');
+    if (!track || !moss || !summary) return;
+
+    const today = articles
+        .filter(article => isToday(article.scraped_at))
+        .sort((a, b) => new Date(a.scraped_at) - new Date(b.scraped_at));
+    // A busy day keeps the band readable: at most five slots, newest last.
+    const slots = today.slice(-5).map(article => ({ article, state: runSlotState(article) }));
+    while (slots.length < DAILY_GOAL) slots.push({ article: null, state: ['empty', 'Open slot'] });
+
+    const signature = slots.map(slot => `${slot.article?.id}:${slot.state[0]}`).join('|');
+    if (signature !== mossRunSignature) {
+        mossRunSignature = signature;
+        track.innerHTML = slots.map(({ article, state: [state, label] }, index) => `
+            <li class="run-slot is-${state}" data-run-state="${state}">
+                <strong>${label}</strong>
+                <span>${article ? escapeHtml(article.title) : `Video ${index + 1}`}</span>
+            </li>
+        `).join('');
     }
-    if (article.status === 'generating_video') {
-        return '<span class="badge badge-processing">Generating Video</span>' + platformBadges;
+
+    const done = slots.filter(slot => ['ready', 'posted'].includes(slot.state[0])).length;
+    const posted = slots.filter(slot => slot.state[0] === 'posted').length;
+    setTextIfChanged(
+        summary,
+        `${done} of ${DAILY_GOAL} ready${posted ? ` · ${posted} posted` : ''}`
+    );
+
+    // Moss stands on the slot that needs attention: something working, else
+    // the first open or unfinished slot, else the last one (the day is done).
+    let active = slots.findIndex(slot => slot.state[0] === 'working');
+    const allDone = done >= DAILY_GOAL;
+    if (active < 0) active = slots.findIndex(slot => ['empty', 'scripted', 'failed'].includes(slot.state[0]));
+    if (active < 0) active = slots.length - 1;
+    const working = slots[active].state[0] === 'working';
+    const failed = slots[active].state[0] === 'failed';
+
+    const slotEl = track.children[active];
+    if (slotEl) {
+        const x = slotEl.offsetLeft + 12;
+        moss.style.transform = `translateX(${Math.round(x / 4) * 4}px)`;
     }
-    if (article.status === 'summarizing') {
-        return '<span class="badge badge-processing">Summarizing</span>' + platformBadges;
-    }
-    if (article.video_path) {
-        return '<span class="badge badge-video">Video Ready</span>' + platformBadges;
-    }
-    if (article.tldr) {
-        return '<span class="badge badge-summarized">Summarized</span>' + platformBadges;
-    }
-    return '<span class="badge badge-scraped">Scraped</span>' + platformBadges;
+    moss.classList.toggle('is-walking', working);
+    moss.classList.toggle('is-delighted', allDone && !working);
+    moss.classList.toggle('is-thinking', failed && !working);
+    moss.classList.toggle('is-waving', !working && !allDone && !failed && slots[active].state[0] === 'empty');
 }
 
 function renderHookVariants(article) {
@@ -1977,8 +2041,8 @@ function renderSummary(article) {
     if (!article.tldr) {
         return `
             <div class="summary-section">
-                <p class="summary-text" style="color: var(--text-muted);">
-                    Click "Summarize" to generate an AI summary, key bullets, and a video script.
+                <p class="summary-text summary-empty">
+                    Summarize this story to get the script, scenes and opening hooks.
                 </p>
             </div>
         `;
@@ -2004,12 +2068,12 @@ function renderSummary(article) {
         ` : ''}
 
         <div class="summary-section">
-            <div class="summary-label">TL;DR</div>
+            <div class="summary-label">In short</div>
             <p class="summary-text">${escapeHtml(article.tldr)}</p>
         </div>
 
         <div class="summary-section">
-            <div class="summary-label">Key Points</div>
+            <div class="summary-label">Key points</div>
             <ul class="summary-bullets">
                 ${bullets.map(b => `<li>${escapeHtml(b)}</li>`).join('')}
             </ul>
@@ -2020,7 +2084,7 @@ function renderSummary(article) {
             ${renderHookVariants(article)}
             ${article.video_script ? `
                 <div class="summary-section">
-                    <div class="summary-label">Video Script</div>
+                    <div class="summary-label">Narration</div>
                     <div class="video-script">${escapeHtml(article.video_script)}</div>
                 </div>
             ` : ''}
@@ -2031,7 +2095,7 @@ function renderSummary(article) {
                 <div class="summary-label">
                     Hashtags
                     <button class="copy-hashtags-btn" onclick="copyHashtags(event, ${article.id})" title="Copy all hashtags">
-                        Copy All
+                        Copy all
                     </button>
                 </div>
                 <div class="hashtags-container" data-hashtags-id="${article.id}">
@@ -2057,7 +2121,7 @@ function renderActions(article) {
                 onclick="summarizeArticle(${article.id})"
                 ${!canSummarize || isProcessing ? 'disabled' : ''}
             >
-                ${article.tldr ? 'Re-Summarize' : 'Summarize'}
+                ${icon('refresh', 'icon-sm')}${article.tldr ? 'Summarize again' : 'Summarize'}
             </button>
 
             <div class="generate-group">
@@ -2082,7 +2146,7 @@ function renderActions(article) {
                             onclick="previewVoiceTone(event, ${article.id})"
                             ${!canGenerate || isProcessing ? 'disabled' : ''}
                         >
-                            ▶ Preview
+                            ${icon('volume', 'icon-sm')}Preview
                         </button>
                     </span>
                     <span
@@ -2095,7 +2159,7 @@ function renderActions(article) {
                     onclick="generateVideo(${article.id})"
                     ${!canGenerate || isProcessing ? 'disabled' : ''}
                 >
-                    Generate video
+                    ${icon('spark', 'icon-sm')}${article.video_path ? 'Make video again' : 'Make video'}
                 </button>
             </div>
 
@@ -2104,7 +2168,7 @@ function renderActions(article) {
                 onclick="deleteArticle(${article.id})"
                 ${isProcessing ? 'disabled' : ''}
             >
-                Delete
+                ${icon('trash', 'icon-sm')}Delete
             </button>
         </div>
     `;
@@ -2140,8 +2204,8 @@ function toggleExpand(articleId, cardElement) {
                 targets: newCard,
                 height: ['0px', newCard.scrollHeight + 'px'],
                 opacity: [0, 1],
-                duration: 600,
-                easing: 'easeOutElastic(1, .8)',
+                duration: 280,
+                easing: 'easeOutQuart',
                 complete: function () {
                     newCard.style.height = 'auto';
                 }
@@ -2154,34 +2218,14 @@ function updateStats() {
     const totalCountEl = document.getElementById('total-count');
     const videoCountEl = document.getElementById('video-count');
 
-    const prevTotal = totalCountEl.textContent;
-    const newTotal = `${articles.length} article${articles.length !== 1 ? 's' : ''}`;
+    const newTotal = `${articles.length} stor${articles.length !== 1 ? 'ies' : 'y'}`;
 
     const videoCount = articles.filter(a => a.video_path).length;
-    const prevVideo = videoCountEl.textContent;
     const newVideo = `${videoCount} video${videoCount !== 1 ? 's' : ''}`;
 
     totalCountEl.textContent = newTotal;
     videoCountEl.textContent = newVideo;
 
-    if (motionEnhancementsAllowed()) {
-        if (prevTotal !== newTotal) {
-            anime({
-                targets: totalCountEl,
-                scale: [1.2, 1],
-                duration: 800,
-                easing: 'spring(1, 80, 10, 0)'
-            });
-        }
-        if (prevVideo !== newVideo) {
-            anime({
-                targets: videoCountEl,
-                scale: [1.2, 1],
-                duration: 800,
-                easing: 'spring(1, 80, 10, 0)'
-            });
-        }
-    }
 }
 
 // ============================================
@@ -2191,23 +2235,19 @@ function updateStats() {
 function showToast(message, type = 'info') {
     const container = document.getElementById('toast-container');
 
-    const icons = {
-        success: '\u2705',
-        error: '\u274C',
-        info: '\u2139\uFE0F'
-    };
+    const icons = { success: 'check', error: 'alert', info: 'info' };
 
     const toast = document.createElement('div');
     toast.className = `toast ${type}`;
     toast.innerHTML = `
-        <span class="toast-icon">${icons[type]}</span>
+        <span class="toast-icon">${icon(icons[type] || 'info')}</span>
         <span class="toast-message">${escapeHtml(message)}</span>
     `;
 
     container.appendChild(toast);
 
     setTimeout(() => {
-        toast.style.animation = 'slideIn 0.3s ease reverse';
+        toast.style.animation = 'slideIn 0.2s ease reverse';
         setTimeout(() => toast.remove(), 300);
     }, 4000);
 }
@@ -2309,6 +2349,7 @@ document.addEventListener('DOMContentLoaded', () => {
 
     syncHeaderHeight();
     window.addEventListener('resize', syncHeaderHeight);
+    window.addEventListener('resize', renderMossRun);
 
     loadPublisherStatus();
     loadGenerationBudget();

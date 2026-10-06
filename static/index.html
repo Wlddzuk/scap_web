@@ -4,74 +4,85 @@
 <head>
     <meta charset="UTF-8">
     <meta name="viewport" content="width=device-width, initial-scale=1.0">
-    <title>Clipper | Article to Short Video</title>
-    <link rel="stylesheet" href="/static/styles.css?v=20261006-pixel-lab">
-    <link
-        href="https://fonts.googleapis.com/css2?family=Inter:wght@400;500;600&family=Space+Grotesk:wght@600;700&display=swap"
-        rel="stylesheet">
+    <meta name="color-scheme" content="dark">
+    <title>SCAP</title>
+    <link rel="icon" href="/static/img/moss/canonical.png">
+    <link rel="stylesheet" href="/static/styles.css?v=20261007-night-shift">
 </head>
 
 <body>
-    <div class="noise-bg"></div>
+    <svg class="icon-sprite" aria-hidden="true" focusable="false">
+        <symbol id="i-search" viewBox="0 0 24 24"><circle cx="11" cy="11" r="7"/><path d="m20 20-3.5-3.5"/></symbol>
+        <symbol id="i-play" viewBox="0 0 24 24"><path d="M7 4.5v15l12-7.5z"/></symbol>
+        <symbol id="i-chevron" viewBox="0 0 24 24"><path d="m6 9 6 6 6-6"/></symbol>
+        <symbol id="i-external" viewBox="0 0 24 24"><path d="M14 4h6v6"/><path d="M10 14 20 4"/><path d="M19 14v5a1 1 0 0 1-1 1H5a1 1 0 0 1-1-1V6a1 1 0 0 1 1-1h5"/></symbol>
+        <symbol id="i-send" viewBox="0 0 24 24"><path d="M21 3 10 14"/><path d="m21 3-7 18-4-7-7-4z"/></symbol>
+        <symbol id="i-trash" viewBox="0 0 24 24"><path d="M4 7h16"/><path d="M9 7V4h6v3"/><path d="m6 7 1 13h10l1-13"/></symbol>
+        <symbol id="i-refresh" viewBox="0 0 24 24"><path d="M20 12a8 8 0 1 1-2.34-5.66"/><path d="M20 4v5h-5"/></symbol>
+        <symbol id="i-plus" viewBox="0 0 24 24"><path d="M12 5v14M5 12h14"/></symbol>
+        <symbol id="i-check" viewBox="0 0 24 24"><path d="m5 12.5 4.5 4.5L19 7"/></symbol>
+        <symbol id="i-download" viewBox="0 0 24 24"><path d="M12 4v11"/><path d="m7 10 5 5 5-5"/><path d="M5 20h14"/></symbol>
+        <symbol id="i-close" viewBox="0 0 24 24"><path d="M6 6l12 12M18 6 6 18"/></symbol>
+        <symbol id="i-spark" viewBox="0 0 24 24"><path d="M12 3v4M12 17v4M3 12h4M17 12h4M6 6l2.5 2.5M15.5 15.5 18 18M18 6l-2.5 2.5M8.5 15.5 6 18"/></symbol>
+        <symbol id="i-volume" viewBox="0 0 24 24"><path d="M4 9v6h4l5 4V5L8 9z"/><path d="M16.5 8.5a5 5 0 0 1 0 7"/></symbol>
+        <symbol id="i-alert" viewBox="0 0 24 24"><path d="M12 4 2.5 20h19z"/><path d="M12 10v4M12 17.5v.5"/></symbol>
+        <symbol id="i-info" viewBox="0 0 24 24"><circle cx="12" cy="12" r="9"/><path d="M12 11v6M12 7.5v.5"/></symbol>
+        <symbol id="i-link" viewBox="0 0 24 24"><path d="M10 14a4 4 0 0 0 5.66 0l3-3a4 4 0 0 0-5.66-5.66l-1 1"/><path d="M14 10a4 4 0 0 0-5.66 0l-3 3a4 4 0 0 0 5.66 5.66l1-1"/></symbol>
+    </svg>
+
     <div class="app">
-        <!-- Header -->
-        <header class="header">
-            <div class="header-content">
-                <div class="header-primary-actions">
-                    <div class="logo">
-                        <span class="logo-icon">▲</span>
-                        <h1>Clipper</h1>
-                    </div>
-                    <button type="button" class="header-discovery-shortcut" onclick="focusStoryDiscovery()">
-                        <span aria-hidden="true">&#128269;</span>
-                        Find articles
-                    </button>
+        <header class="header topbar">
+            <a class="brand" href="/" aria-label="SCAP home">
+                <img class="brand-moss" src="/static/img/moss/canonical.png" alt="" width="24" height="32">
+                <svg class="wordmark" viewBox="0 0 69 21" width="69" height="21" role="img" aria-label="SCAP"><rect x="3" y="0" width="3" height="3"/><rect x="6" y="0" width="3" height="3"/><rect x="9" y="0" width="3" height="3"/><rect x="0" y="3" width="3" height="3"/><rect x="12" y="3" width="3" height="3"/><rect x="0" y="6" width="3" height="3"/><rect x="3" y="9" width="3" height="3"/><rect x="6" y="9" width="3" height="3"/><rect x="9" y="9" width="3" height="3"/><rect x="12" y="12" width="3" height="3"/><rect x="0" y="15" width="3" height="3"/><rect x="12" y="15" width="3" height="3"/><rect x="3" y="18" width="3" height="3"/><rect x="6" y="18" width="3" height="3"/><rect x="9" y="18" width="3" height="3"/><rect x="21" y="0" width="3" height="3"/><rect x="24" y="0" width="3" height="3"/><rect x="27" y="0" width="3" height="3"/><rect x="18" y="3" width="3" height="3"/><rect x="30" y="3" width="3" height="3"/><rect x="18" y="6" width="3" height="3"/><rect x="18" y="9" width="3" height="3"/><rect x="18" y="12" width="3" height="3"/><rect x="18" y="15" width="3" height="3"/><rect x="30" y="15" width="3" height="3"/><rect x="21" y="18" width="3" height="3"/><rect x="24" y="18" width="3" height="3"/><rect x="27" y="18" width="3" height="3"/><rect x="39" y="0" width="3" height="3"/><rect x="42" y="0" width="3" height="3"/><rect x="45" y="0" width="3" height="3"/><rect x="36" y="3" width="3" height="3"/><rect x="48" y="3" width="3" height="3"/><rect x="36" y="6" width="3" height="3"/><rect x="48" y="6" width="3" height="3"/><rect x="36" y="9" width="3" height="3"/><rect x="39" y="9" width="3" height="3"/><rect x="42" y="9" width="3" height="3"/><rect x="45" y="9" width="3" height="3"/><rect x="48" y="9" width="3" height="3"/><rect x="36" y="12" width="3" height="3"/><rect x="48" y="12" width="3" height="3"/><rect x="36" y="15" width="3" height="3"/><rect x="48" y="15" width="3" height="3"/><rect x="36" y="18" width="3" height="3"/><rect x="48" y="18" width="3" height="3"/><rect x="54" y="0" width="3" height="3"/><rect x="57" y="0" width="3" height="3"/><rect x="60" y="0" width="3" height="3"/><rect x="63" y="0" width="3" height="3"/><rect x="54" y="3" width="3" height="3"/><rect x="66" y="3" width="3" height="3"/><rect x="54" y="6" width="3" height="3"/><rect x="66" y="6" width="3" height="3"/><rect x="54" y="9" width="3" height="3"/><rect x="57" y="9" width="3" height="3"/><rect x="60" y="9" width="3" height="3"/><rect x="63" y="9" width="3" height="3"/><rect x="54" y="12" width="3" height="3"/><rect x="54" y="15" width="3" height="3"/><rect x="54" y="18" width="3" height="3"/></svg>
+            </a>
+            <div class="topbar-meta">
+                <div class="header-stats" aria-label="Library totals">
+                    <span class="stat" id="total-count">0 articles</span>
+                    <span class="stat" id="video-count">0 videos</span>
                 </div>
-                <div class="header-right">
-                    <div class="header-stats">
-                        <span class="stat" id="total-count">0 articles</span>
-                        <span class="stat" id="video-count">0 videos</span>
-                    </div>
-                    <div class="generation-budget" id="generation-budget">
-                        <button
-                            type="button"
-                            class="generation-budget-trigger"
-                            id="generation-budget-trigger"
-                            aria-expanded="false"
-                            aria-controls="generation-budget-panel"
-                            onclick="toggleGenerationBudget(event)"
-                        >
-                            <span class="generation-budget-dot" id="generation-budget-dot"></span>
-                            <span id="generation-budget-label">API budget</span>
-                            <span class="generation-budget-chevron" aria-hidden="true">&#9662;</span>
-                        </button>
-                        <div class="generation-budget-panel hidden" id="generation-budget-panel" role="dialog" aria-label="Generation budget">
-                            <div class="generation-budget-panel-head">
-                                <div>
-                                    <strong>Generation budget</strong>
-                                    <span id="generation-budget-updated">Checking providers&hellip;</span>
-                                </div>
-                                <button type="button" class="generation-budget-refresh" onclick="refreshGenerationBudget(event)" aria-label="Refresh API balances">&#8635;</button>
+                <div class="generation-budget" id="generation-budget">
+                    <button
+                        type="button"
+                        class="chip generation-budget-trigger"
+                        id="generation-budget-trigger"
+                        aria-expanded="false"
+                        aria-controls="generation-budget-panel"
+                        onclick="toggleGenerationBudget(event)"
+                    >
+                        <span class="generation-budget-dot" id="generation-budget-dot"></span>
+                        <span id="generation-budget-label">Balances</span>
+                        <svg class="icon icon-sm" aria-hidden="true"><use href="#i-chevron"></use></svg>
+                    </button>
+                    <div class="popover generation-budget-panel hidden" id="generation-budget-panel" role="dialog" aria-label="Provider balances">
+                        <div class="generation-budget-panel-head">
+                            <div>
+                                <strong>Balances</strong>
+                                <span id="generation-budget-updated">Checking providers&hellip;</span>
                             </div>
-                            <div id="generation-budget-summary" class="generation-budget-summary">Loading current balances&hellip;</div>
-                            <div id="generation-budget-providers" class="generation-budget-providers"></div>
-                            <div id="generation-budget-estimate" class="generation-budget-estimate"></div>
+                            <button type="button" class="icon-btn generation-budget-refresh" onclick="refreshGenerationBudget(event)" aria-label="Refresh balances">
+                                <svg class="icon" aria-hidden="true"><use href="#i-refresh"></use></svg>
+                            </button>
                         </div>
+                        <div id="generation-budget-summary" class="generation-budget-summary">Loading current balances&hellip;</div>
+                        <div id="generation-budget-providers" class="generation-budget-providers"></div>
+                        <div id="generation-budget-estimate" class="generation-budget-estimate"></div>
                     </div>
-                    <div class="accounts-menu" id="accounts-menu">
-                        <button
-                            type="button"
-                            class="accounts-trigger"
-                            id="accounts-trigger"
-                            aria-expanded="false"
-                            aria-controls="accounts-panel"
-                            onclick="toggleAccountsMenu(event)"
-                        >
-                            <span class="accounts-trigger-dot" aria-hidden="true"></span>
-                            <span id="accounts-trigger-label">Accounts</span>
-                            <span class="generation-budget-chevron" aria-hidden="true">&#9662;</span>
-                        </button>
-                        <div class="accounts-panel hidden" id="accounts-panel" role="dialog" aria-label="Publishing accounts">
+                </div>
+                <div class="accounts-menu" id="accounts-menu">
+                    <button
+                        type="button"
+                        class="chip accounts-trigger"
+                        id="accounts-trigger"
+                        aria-expanded="false"
+                        aria-controls="accounts-panel"
+                        onclick="toggleAccountsMenu(event)"
+                    >
+                        <span class="accounts-trigger-dot" aria-hidden="true"></span>
+                        <span id="accounts-trigger-label">Accounts</span>
+                        <svg class="icon icon-sm" aria-hidden="true"><use href="#i-chevron"></use></svg>
+                    </button>
+                    <div class="accounts-panel hidden" id="accounts-panel" role="dialog" aria-label="Publishing accounts">
                     <div class="platform-connections" aria-label="Publishing connections">
                         <div class="platform-connection tiktok" id="platform-connection-tiktok">
                             <span class="platform-connection-dot" aria-hidden="true"></span>
@@ -107,34 +118,25 @@
                         </div>
                     </div>
                         </div>
-                    </div>
                 </div>
             </div>
         </header>
 
-        <!-- Main Content -->
-        <main class="main">
-            <!-- URL Scraper Form -->
-            <div class="url-scraper-form">
-                <h3>Paste an article URL</h3>
-                <p>Turn any article into a short-form video with AI</p>
-                <form id="url-form" onsubmit="scrapeUrl(event)">
-                    <div class="url-input-group">
-                        <input type="url" id="url-input" aria-label="Article URL" placeholder="https://example.com/article..." required>
-                        <button type="submit" class="btn btn-primary" id="scrape-btn">
-                            Scrape
-                        </button>
-                    </div>
-                </form>
+        <section class="run" aria-labelledby="run-title">
+            <h2 class="run-title" id="run-title">Today</h2>
+            <div class="run-stage">
+                <ol class="run-track" id="run-track" aria-label="Today's videos"></ol>
+                <div class="run-moss" id="run-moss" aria-hidden="true"></div>
             </div>
+            <p class="run-summary" id="run-summary" role="status" aria-live="polite">Loading today&rsquo;s videos&hellip;</p>
+        </section>
 
-            <!-- Science Story Discovery -->
-            <section class="discovery-panel" aria-labelledby="discovery-title">
-                <div class="discovery-heading">
+        <main class="main workspace">
+            <section class="panel discovery-panel" aria-labelledby="discovery-title">
+                <div class="panel-head">
                     <div>
-                        <span class="discovery-eyebrow">Daily science radar</span>
-                        <h2 id="discovery-title">Find the next story</h2>
-                        <p>Scan trusted science feeds and rank the strongest ideas for a 60-second video.</p>
+                        <h2 id="discovery-title">Find stories</h2>
+                        <p class="panel-note">Ranked from trusted science feeds for a 60-second video.</p>
                     </div>
                     <button type="button" class="btn btn-primary discovery-run-btn" id="discovery-run-btn"
                         onclick="runStoryDiscovery()">
@@ -147,70 +149,51 @@
                 <div class="discovery-candidates hidden" id="discovery-candidates" aria-label="Ranked story shortlist">
                     <!-- Ranked candidates are rendered by static/app.js -->
                 </div>
+                <form class="url-scraper-form" id="url-form" onsubmit="scrapeUrl(event)">
+                    <label class="url-label" for="url-input">Or add an article by link</label>
+                    <div class="url-input-group">
+                        <svg class="icon field-icon" aria-hidden="true"><use href="#i-link"></use></svg>
+                        <input type="url" id="url-input" placeholder="https://www.sciencedaily.com/&hellip;" required>
+                        <button type="submit" class="btn btn-secondary" id="scrape-btn">Add</button>
+                    </div>
+                </form>
             </section>
 
-            <!-- Progress Banner (shows during processing) -->
-            <div class="progress-banner-container">
-                <div class="progress-banner hidden" id="progress-banner">
-                    <div class="progress-spinner"></div>
-                    <span class="progress-text" id="progress-text">Processing...</span>
-                </div>
-            </div>
-
-            <!-- Search Bar (hidden when no articles) -->
-            <div class="search-bar hidden" id="search-bar">
-                <span class="search-icon">&#x1F50D;</span>
-                <input type="text" id="search-input" aria-label="Search articles" placeholder="Search articles..." oninput="filterArticles()">
-            </div>
-
-            <!-- Section header -->
-            <div class="section-header hidden" id="section-header">
-                <span class="section-title" id="section-title">All articles</span>
-            </div>
-
-            <!-- Empty State -->
-            <div class="empty-state" id="empty-state">
-                <div class="empty-icon">&#x1F4F0;</div>
-                <h2>No articles yet</h2>
-                <p>Paste a URL above to scrape your first article</p>
-                <span class="empty-hint">Tip: You can also paste URLs via the Discord bot.</span>
-            </div>
-
-            <!-- Loading Skeleton -->
-            <div class="skeleton-container" id="loading-skeleton">
-                <div class="skeleton-card">
-                    <div class="skeleton-line title"></div>
-                    <div class="skeleton-line meta"></div>
-                    <div class="skeleton-badges">
-                        <div class="skeleton-badge"></div>
-                        <div class="skeleton-badge"></div>
+            <section class="panel stories-panel" aria-labelledby="stories-title">
+                <div class="panel-head">
+                    <div>
+                        <h2 id="stories-title">Stories</h2>
+                        <p class="panel-note section-header" id="section-header"><span class="section-title" id="section-title">All stories</span></p>
+                    </div>
+                    <div class="search-bar hidden" id="search-bar">
+                        <svg class="icon search-icon" aria-hidden="true"><use href="#i-search"></use></svg>
+                        <input type="search" id="search-input" aria-label="Search stories" placeholder="Search stories" oninput="filterArticles()">
                     </div>
                 </div>
-                <div class="skeleton-card">
-                    <div class="skeleton-line title"></div>
-                    <div class="skeleton-line meta"></div>
-                    <div class="skeleton-badges">
-                        <div class="skeleton-badge"></div>
-                    </div>
-                </div>
-            </div>
 
-            <!-- Articles List -->
-            <div class="articles-container hidden" id="articles-container">
-                <!-- Articles will be rendered here by JavaScript -->
-            </div>
+                <div class="empty-state" id="empty-state">
+                    <img class="empty-moss" src="/static/img/moss/thinking.png" alt="" width="48" height="64">
+                    <h3>No stories yet</h3>
+                    <p>Find today&rsquo;s stories on the left, or add an article by link. Moss will take it from there.</p>
+                </div>
+
+                <div class="skeleton-container" id="loading-skeleton" aria-hidden="true">
+                    <div class="skeleton-card"><div class="skeleton-line title"></div><div class="skeleton-line meta"></div></div>
+                    <div class="skeleton-card"><div class="skeleton-line title"></div><div class="skeleton-line meta"></div></div>
+                    <div class="skeleton-card"><div class="skeleton-line title"></div><div class="skeleton-line meta"></div></div>
+                </div>
+
+                <div class="articles-container hidden" id="articles-container">
+                    <!-- Stories are rendered here by static/app.js -->
+                </div>
+            </section>
         </main>
 
-        <!-- Toast Notifications -->
-        <div class="toast-container" id="toast-container"></div>
+        <div class="toast-container" id="toast-container" aria-live="polite"></div>
     </div>
 
-    <!-- Background Glows -->
-    <div class="glow-bg glow-1"></div>
-    <div class="glow-bg glow-2"></div>
-
     <script src="/static/anime.min.js"></script>
-    <script src="/static/app.js?v=20261006-pixel-lab"></script>
+    <script src="/static/app.js?v=20261007-night-shift"></script>
 </body>
 
 </html>

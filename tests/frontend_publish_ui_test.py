@@ -117,6 +117,6 @@ def test_assets_share_one_bumped_cache_version():
         INDEX_HTML,
     )
     assert versions == [
-        "20261006-pixel-lab",
-        "20261006-pixel-lab",
+        "20261007-night-shift",
+        "20261007-night-shift",
     ]
