@@ -171,7 +171,7 @@ async def process_article_url(
 
         # Step 2: Summarize
         with app.app_context():
-            from visual_styles import STYLES as VISUAL_STYLES
+            from visual_styles import DEFAULT_STYLE
 
             article = db.session.get(Article, article.id)
             result = summarize_article(article.title, article.content)
@@ -195,9 +195,7 @@ async def process_article_url(
             )
             article.hook_index_used = None
             article.dominant_emotion = result.get("dominant_emotion") or None
-            suggested = result.get("suggested_style")
-            if suggested and suggested in VISUAL_STYLES:
-                article.style = suggested
+            article.style = DEFAULT_STYLE
 
             article.status = "summarized"
             article.summarized_at = datetime.now(timezone.utc)
@@ -207,11 +205,8 @@ async def process_article_url(
             title = article.title
             article_id = article.id
             article_scenes = scenes or None
-            article_style = article.style
             article_emotion = article.dominant_emotion
             article_cover_line = article.cover_line
-            article_series_lane = article.series_lane
-            article_hero_image = article.hero_image
 
         await progress_msg.edit(
             content=(
@@ -226,13 +221,9 @@ async def process_article_url(
                 article_id=article_id,
                 title=title,
                 script=script,
-                image_source="ai",
                 scenes=article_scenes,
-                style_key=article_style,
                 emotion=article_emotion,
                 cover_line=article_cover_line,
-                series_lane=article_series_lane,
-                hero_image=article_hero_image,
             )
 
             article = db.session.get(Article, article_id)

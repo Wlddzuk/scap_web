@@ -103,11 +103,10 @@ class DiscoveryRouteTests(unittest.TestCase):
 
         self.assertEqual(response.status_code, 202)
         self.assertTrue(response.get_json()["started"])
-        start.assert_called_once_with(
-            self.app, "0123456789abcdef", "vivid", style=None
-        )
+        start.assert_called_once_with(self.app, "0123456789abcdef")
 
-    def test_make_video_forwards_selected_color_intensity(self):
+    def test_make_video_ignores_legacy_style_and_color_fields(self):
+        """Old clients may still send style/color; the locked look ignores them."""
         self._save_shortlist()
         candidate = {"candidate_id": "0123456789abcdef", "title": "Story"}
         with patch.object(
@@ -117,65 +116,13 @@ class DiscoveryRouteTests(unittest.TestCase):
         ) as start:
             response = self.client.post(
                 "/api/discovery/candidates/0123456789abcdef/make-video",
-                json={"color_intensity": " Electric "},
+                json={"style": "manga", "color_intensity": "electric"},
             )
 
         self.assertEqual(response.status_code, 202)
-        start.assert_called_once_with(
-            self.app,
-            "0123456789abcdef",
-            "electric",
-            style=None,
-        )
+        start.assert_called_once_with(self.app, "0123456789abcdef")
 
-    def test_make_video_forwards_selected_style(self):
-        self._save_shortlist()
-        candidate = {"candidate_id": "0123456789abcdef", "title": "Story"}
-        with patch.object(
-            discovery_web,
-            "start_candidate_pipeline",
-            return_value=("started", candidate),
-        ) as start:
-            response = self.client.post(
-                "/api/discovery/candidates/0123456789abcdef/make-video",
-                json={"style": "editorial_collage"},
-            )
-
-        self.assertEqual(response.status_code, 202)
-        start.assert_called_once_with(
-            self.app,
-            "0123456789abcdef",
-            "vivid",
-            style="editorial_collage",
-        )
-
-    def test_make_video_rejects_unknown_style(self):
-        self._save_shortlist()
-        with patch.object(discovery_web, "start_candidate_pipeline") as start:
-            response = self.client.post(
-                "/api/discovery/candidates/0123456789abcdef/make-video",
-                json={"style": "not_a_real_style"},
-            )
-
-        self.assertEqual(response.status_code, 400)
-        start.assert_not_called()
-
-    def test_make_video_rejects_unknown_color_intensity(self):
-        self._save_shortlist()
-        with patch.object(discovery_web, "start_candidate_pipeline") as start:
-            response = self.client.post(
-                "/api/discovery/candidates/0123456789abcdef/make-video",
-                json={"color_intensity": "radioactive"},
-            )
-
-        self.assertEqual(response.status_code, 400)
-        self.assertEqual(
-            response.get_json()["error"],
-            "Unknown color intensity",
-        )
-        start.assert_not_called()
-
-    def test_candidate_worker_threads_color_intensity_to_pipeline(self):
+    def test_candidate_worker_runs_the_pipeline_for_the_candidate(self):
         self._save_shortlist()
 
         class FakeCandidate:
@@ -200,14 +147,10 @@ class DiscoveryRouteTests(unittest.TestCase):
                 "0123456789abcdef",
                 discovery_web._read_state(self.app)["candidates"][0],
                 0,
-                "electric",
             )
 
         process.assert_called_once()
-        self.assertEqual(
-            process.call_args.kwargs["color_intensity"],
-            "electric",
-        )
+        self.assertEqual(process.call_args.kwargs, {})
 
     def test_make_video_rejects_unknown_or_malformed_candidate(self):
         malformed = self.client.post(

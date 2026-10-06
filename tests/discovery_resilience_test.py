@@ -385,7 +385,6 @@ class DiscoveryFailureStageTests(unittest.TestCase):
         *,
         summarize_side_effect=None,
         render_side_effect=None,
-        color_intensity="vivid",
     ):
         candidate = story_finder.StoryCandidate(
             title="Pipeline story",
@@ -400,7 +399,6 @@ class DiscoveryFailureStageTests(unittest.TestCase):
             style=None,
             dominant_emotion=None,
             status="scraped",
-            color_intensity="natural",
             viral_score=87.0,
         )
         article_type = MagicMock(return_value=article)
@@ -439,10 +437,7 @@ class DiscoveryFailureStageTests(unittest.TestCase):
             return_value="unused.mp4",
             side_effect=render_side_effect,
         ) as generate:
-            result = story_finder._process_candidate(
-                candidate,
-                color_intensity=color_intensity,
-            )
+            result = story_finder._process_candidate(candidate)
 
         self.last_article = article
         self.last_generate = generate
@@ -488,24 +483,13 @@ class DiscoveryFailureStageTests(unittest.TestCase):
         self.assertEqual(result["pipeline_error"], "Video render failed: the video could not be created.")
         self.assertNotIn("ffmpeg", result["pipeline_error"])
 
-    def test_successful_discovery_render_forwards_and_persists_color(self):
-        result = self._run_with_fake_article(color_intensity="electric")
+    def test_successful_discovery_render_uses_the_locked_style(self):
+        result = self._run_with_fake_article()
 
         self.assertEqual(result["status"], "video_done")
-        self.assertEqual(
-            self.last_generate.call_args.kwargs["color_intensity"],
-            "electric",
-        )
-        self.assertEqual(self.last_article.color_intensity, "electric")
-
-    def test_failed_discovery_render_does_not_persist_requested_color(self):
-        result = self._run_with_fake_article(
-            color_intensity="electric",
-            render_side_effect=RuntimeError("render failed"),
-        )
-
-        self.assertEqual(result["status"], "failed")
-        self.assertEqual(self.last_article.color_intensity, "natural")
+        self.assertEqual(self.last_article.style, "pixel_night_lab")
+        for removed in ("color_intensity", "style_key", "image_source"):
+            self.assertNotIn(removed, self.last_generate.call_args.kwargs)
 
     def test_discovery_payload_allow_lists_stage_message(self):
         payload = discovery_web._public_pipeline_failure(

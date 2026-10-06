@@ -6,7 +6,7 @@ from unittest.mock import patch
 import requests
 
 import generation_budget
-import video_generator
+import pixel_scenes
 
 
 class FakeResponse:
@@ -75,7 +75,6 @@ class GenerationBudgetTests(unittest.TestCase):
         self.assertEqual(openrouter["severity"], "low")
         self.assertEqual(payload["severity"], "low")
         self.assertTrue(payload["standard_video_affordable"])
-        self.assertTrue(payload["max_motion_video_affordable"])
 
         fal_call = next(
             call for call in get.call_args_list
@@ -210,26 +209,15 @@ class GenerationBudgetTests(unittest.TestCase):
             self.assertIsNone(provider["balance_usd"])
             self.assertEqual(provider["quota_status"], "check_provider_dashboard")
 
-    def test_estimates_come_from_video_generator_constants(self):
+    def test_estimate_is_a_typical_pixel_video(self):
         with patch.dict(os.environ, {}, clear=True):
             payload = generation_budget.get_generation_budget()
 
-        estimates = payload["estimates"]
-        expected_maximum = min(
-            video_generator.MAX_VIDEO_ESTIMATED_COST_USD,
-            video_generator.BASE_VIDEO_ESTIMATED_COST_USD
-            + video_generator.MAX_VIDEO_CLIPS_PER_VIDEO
-            * video_generator.VIDEO_CLIP_ESTIMATED_COST_USD,
-        )
         self.assertEqual(
-            estimates["standard_video_usd"],
-            video_generator.BASE_VIDEO_ESTIMATED_COST_USD,
+            payload["estimates"]["standard_video_usd"],
+            pixel_scenes.estimate_video_cost(generation_budget.TYPICAL_SCENES_PER_VIDEO),
         )
-        self.assertEqual(estimates["max_motion_video_usd"], expected_maximum)
-        self.assertEqual(
-            estimates["max_motion_clips"],
-            video_generator.MAX_VIDEO_CLIPS_PER_VIDEO,
-        )
+        self.assertNotIn("max_motion_video_usd", payload["estimates"])
 
     def test_smaller_readable_balance_controls_affordability(self):
         responses = {
@@ -254,10 +242,9 @@ class GenerationBudgetTests(unittest.TestCase):
             payload = generation_budget.get_generation_budget()
 
         self.assertAlmostEqual(payload["limiting_balance_usd"], 0.2)
-        # Illustrated Science reuses each scene image and needs one hook still,
+        # A pixel video is about fourteen $0.005 scene images,
         # so twenty cents safely covers a standard render.
         self.assertTrue(payload["standard_video_affordable"])
-        self.assertFalse(payload["max_motion_video_affordable"])
         self.assertEqual(payload["severity"], "critical")
 
     def test_custom_thresholds_control_provider_and_overall_severity(self):

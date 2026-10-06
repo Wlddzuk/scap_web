@@ -451,8 +451,6 @@ def _run_candidate_worker(
     candidate_id: str,
     candidate_payload: dict[str, Any],
     run_version: int,
-    color_intensity: str = "vivid",
-    style: str | None = None,
 ) -> None:
     try:
         def mark_processing(state):
@@ -477,11 +475,7 @@ def _run_candidate_worker(
             score_reason=str(candidate_payload.get("score_reason") or ""),
             use_rss_fallback=candidate_payload.get("use_rss_fallback") is True,
         )
-        result = _process_candidate(
-            candidate,
-            color_intensity=color_intensity,
-            style=style,
-        )
+        result = _process_candidate(candidate)
         final_status = str(result.get("status") or "failed")
         public_result = result
         if final_status == "failed":
@@ -534,8 +528,6 @@ def _run_candidate_worker(
 def start_candidate_pipeline(
     flask_app,
     candidate_id: str,
-    color_intensity: str = "vivid",
-    style: str | None = None,
 ) -> tuple[str, Optional[dict[str, Any]]]:
     """Queue one shortlist candidate and guard against duplicate video jobs."""
     state = _read_state(flask_app)
@@ -577,8 +569,6 @@ def start_candidate_pipeline(
                 candidate_id,
                 dict(candidate),
                 run_version,
-                color_intensity,
-                style,
             ),
             name=f"clipper-discovery-video-{candidate_id}",
             daemon=True,
@@ -711,45 +701,11 @@ def make_discovery_video_route(candidate_id: str):
     if len(candidate_id) != 16 or any(char not in "0123456789abcdef" for char in candidate_id):
         return jsonify({"error": "Story candidate not found"}), 404
 
-    payload = request.get_json(silent=True)
-    if payload is None:
-        payload = {}
-    elif not isinstance(payload, dict):
-        return jsonify({"error": "JSON body must be an object"}), 400
-
-    from video_generator import (
-        DEFAULT_COLOR_INTENSITY,
-        normalize_color_intensity,
-    )
-
-    raw_color_intensity = payload.get(
-        "color_intensity",
-        DEFAULT_COLOR_INTENSITY,
-    )
-    if (
-        not isinstance(raw_color_intensity, str)
-        or raw_color_intensity.strip().lower()
-        not in {"natural", "vivid", "electric"}
-    ):
-        return jsonify({"error": "Unknown color intensity"}), 400
-    color_intensity = normalize_color_intensity(raw_color_intensity)
-
-    from visual_styles import STYLES
-
-    raw_style = payload.get("style")
-    if raw_style is None or raw_style == "":
-        style = None  # let the summarizer's own choice stand
-    elif not isinstance(raw_style, str) or raw_style not in STYLES:
-        return jsonify({"error": "Unknown style"}), 400
-    else:
-        style = raw_style
-
+    # The look is the locked channel style; a request body is accepted but unused.
     try:
         outcome, candidate = start_candidate_pipeline(
             current_app._get_current_object(),
             candidate_id,
-            color_intensity,
-            style=style,
         )
     except Exception:
         return jsonify({"error": "Video creation could not be started"}), 500

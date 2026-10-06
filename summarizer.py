@@ -71,18 +71,8 @@ Shape that one fact as:
 === SCENE BEATS ===
 Break the script into 10-14 SCENES. For each scene provide:
 - speech: the exact narration for that beat (a slice of video_script, in order). Use complete sentences rather than disconnected fragments.
-- visual: a vivid concrete description of what is ON SCREEN - one clear subject, one clear action, one clear setting. Compose it as one illustration that can be progressively explained with a zoom, focus ring, arrow, and reveal. Keep the key detail near the center-right and leave clean space in the upper-left. Do NOT mention art style or medium here (style is applied separately). Do NOT include text/words/captions (platform adds captions). Describe only physical things built from the literal science objects of this scene (cells, molecules, organs, rocks, planets, stars, instruments). Never describe a chart, graph, timeline, bar, axis, icon, badge, label, checkmark, readout or screen, and never substitute a metaphor such as plants, trees or buildings. Show an amount as a count or size of the real objects and time as those objects changing. No human hands. Never describe the background colour, lighting, glow, art style or any mascot or recurring character; the renderer adds those. For the final follow or question beat, show the story's main science object again rather than a book, desk or other everyday object.
+- visual: a vivid concrete description of what is ON SCREEN - one clear subject, one clear action, one clear setting. Keep the main subject large and in the upper half of the frame. Do NOT mention art style or medium here (style is applied separately). Do NOT include text/words/captions (platform adds captions). Describe only physical things built from the literal science objects of this scene (cells, molecules, organs, rocks, planets, stars, instruments). Never describe a chart, graph, timeline, bar, axis, icon, badge, label, checkmark, readout or screen, and never substitute a metaphor such as plants, trees or buildings. Show an amount as a count or size of the real objects and time as those objects changing. No human hands. Never describe the background colour, lighting, glow, art style or any mascot or recurring character; the renderer adds those. For the final follow or question beat, show the story's main science object again rather than a book, desk or other everyday object.
 - emotion: one of [curious, shocking, urgent, triumphant, dark, funny]
-- focus_label: 1-4 factual concept words already spoken in this scene. Never use a person's name or an unanchored measurement. Never invent a new fact.
-- visual_action: one of [reveal, trace, compare, locate, sequence, highlight]
-- referent: classify the subject of THIS scene, not the story topic. Work this decision in order and STOP at the first rule that applies. Rule 1: if the scene names or implies any material, device, structure, instrument, chip, sample, organism, place, person, mission, telescope, or published figure that a camera or microscope has ever been pointed at, the answer is "object". A fabricated device such as a metagrating, an engineered material such as indium arsenide, a named satellite, a named specimen, and a laboratory rig are ALL objects, even when the sentence is describing how they work. Rule 2: if the real subject exists physically but is microscopic, internal, extinct, subatomic, or pre-photography, the answer is "unphotographable" - it almost always still has a real micrograph, scan, or published figure. Rule 3: only if the scene has NO physical subject at all - a pure rate, ratio, feeling, or comparison of numbers - the answer is "abstract".
-- "abstract" is a last resort and must be rare. Most scenes in a science story are object or unphotographable. If you are about to answer "abstract" because the sentence describes a process or mechanism, stop: a mechanism belongs to a physical thing, so classify that thing instead. Choosing "abstract" means no real photograph will ever be searched for this scene, so never choose it for convenience.
-- referent_query: REQUIRED whenever referent is "object" or "unphotographable" - give a precise 2-6 word image-search query with proper nouns where available. For "object" name the thing itself. For "unphotographable" name the real imagery that shows it, such as a micrograph, scan, or published figure. Search for ONE main photographable subject only; never combine two animals, two artifacts, or an object plus a conceptual composition in one query. Return an empty string only when referent is "abstract".
-- visual_role: classify what the picture contributes as exactly one of [discovery, evidence, mechanism, context]. Use discovery for the newly found object/result, evidence for the specimen/data/experiment that supports it, mechanism for how it works, and context only for a location, institution, researcher portrait, or atmosphere. Most scenes should be discovery, evidence, or mechanism. A location is context, never the visual substitute for a discovery.
-- evidence_query: give a precise 3-8 word search phrase for what THIS sentence is really revealing. Name the discovery, artifact, specimen, instrument, experiment, scientific figure, simulation, or mechanism. This is required for every scene, including abstract and unphotographable scenes, because it is also used to find truthful diagrams or guide a scene-specific illustration. Never return only a city, country, university, building, generic laboratory, or broad setting unless visual_role is context. Example: use "DNA double strand breaks super enhancers", not "Hebrew University Jerusalem"; use "pyramid hidden chamber muon scan", not "Egypt pyramid".
-- precise_claim: true whenever the narration states where something is located, how it works, how big it is, or asserts anatomy, internal layout, a mechanism, a measurement, or a labelled part. Default to true when uncertain.
-- graphic_payload: for an abstract referent, give the one number, short phrase, 2-4 step process, or two-item comparison the scene is really about. Otherwise return an empty string.
-
 When concatenated in order, all scene.speech values must equal video_script.
 
 === STYLE SUGGESTION ===
@@ -114,7 +104,7 @@ Write 3 consequence-first hook lines using different angles: what changes for th
   "search_caption": "What scientists found in the atmosphere of K2-18b.",
   "series_lane": "space|human_body|future_tech|other",
   "scenes": [
-    {{"speech": "...", "visual": "concrete description of what is on screen", "emotion": "...", "focus_label": "1-4 FACTUAL CONCEPT WORDS", "visual_action": "reveal|trace|compare|locate|sequence|highlight", "referent": "object|unphotographable|abstract", "referent_query": "2-6 photographable-subject words or empty", "visual_role": "discovery|evidence|mechanism|context", "evidence_query": "3-8 exact discovery/evidence words", "precise_claim": true, "graphic_payload": "short graphic content or empty"}},
+    {{"speech": "...", "visual": "concrete description of what is on screen", "emotion": "..."}},
     ...
   ],
   "video_script": "full narration, concatenation of all scene.speech in order",
@@ -129,9 +119,6 @@ ARTICLE CONTENT:
 
 
 SERIES_LANES = frozenset({"space", "human_body", "future_tech", "other"})
-VISUAL_ACTIONS = frozenset({"reveal", "trace", "compare", "locate", "sequence", "highlight"})
-REFERENT_TYPES = frozenset({"object", "unphotographable", "abstract"})
-VISUAL_ROLES = frozenset({"discovery", "evidence", "mechanism", "context"})
 HOOK_MAX_WORDS = 12
 SEARCH_CAPTION_MAX_CHARS = 220
 CTA_QUESTION_MAX_CHARS = 220
@@ -149,93 +136,6 @@ _LANE_HASHTAG_FALLBACKS = {
 def _clean_inline_text(value) -> str:
     """Collapse provider whitespace without inventing new copy."""
     return re.sub(r"\s+", " ", str(value or "")).strip()
-
-
-def _normalize_focus_label(value) -> str:
-    """Keep teaching labels brief enough for a vertical-video overlay."""
-    words = _clean_inline_text(value).split()[:4]
-    return " ".join(words)[:40].strip()
-
-
-def _normalize_referent(value) -> str:
-    """Unknown referents become abstract, the lane that cannot fabricate."""
-    normalized = _clean_inline_text(value).lower()
-    return normalized if normalized in REFERENT_TYPES else "abstract"
-
-
-def _normalize_referent_query(value, referent: str) -> str:
-    """Keep the search query for anything with a real physical subject.
-
-    An unphotographable subject still has real imagery -- a micrograph, a scan,
-    a published figure -- so blanking its query here removed the only search
-    term the sourcing path had. Only a genuinely abstract scene has nothing to
-    look for.
-    """
-    if referent == "abstract":
-        return ""
-    return " ".join(_clean_inline_text(value).split()[:6])[:120].strip()
-
-
-def _normalize_visual_role(value) -> str:
-    normalized = _clean_inline_text(value).lower()
-    return normalized if normalized in VISUAL_ROLES else "discovery"
-
-
-def _normalize_evidence_query(value, *fallbacks) -> str:
-    """Keep one compact subject-first query, including for non-photo scenes."""
-    for candidate in (value, *fallbacks):
-        query = " ".join(_clean_inline_text(candidate).split()[:8])[:160].strip()
-        if query:
-            return query
-    return ""
-
-
-def _normalize_precise_claim(value) -> bool:
-    """Ambiguous values default true so routing avoids generated structure."""
-    if type(value) is bool:
-        return value
-    if isinstance(value, str):
-        normalized = value.strip().lower()
-        if normalized in {"false", "no", "0"}:
-            return False
-        if normalized in {"true", "yes", "1"}:
-            return True
-    if isinstance(value, (int, float)) and not isinstance(value, bool):
-        if value == 0:
-            return False
-        if value == 1:
-            return True
-    return True
-
-
-def _normalize_graphic_payload(value, referent: str) -> str:
-    if referent != "abstract":
-        return ""
-    return _clean_inline_text(value)[:160].strip()
-
-
-def _safe_focus_label(value, speech: str, referent: str) -> str:
-    """Drop person-name and unanchored-measurement labels from visual output."""
-    label = _normalize_focus_label(value)
-    if not label:
-        return ""
-    if re.search(
-        r"\b(?:researcher|scientist|biologist|professor|doctor|dr\.?|university)\b",
-        speech,
-        re.I,
-    ):
-        label_words = {word.casefold() for word in label.split() if len(word) > 1}
-        speech_words = {word.casefold() for word in re.findall(r"[A-Za-z]+", speech)}
-        if label_words and label_words.issubset(speech_words):
-            return ""
-    if referent != "abstract" and re.fullmatch(
-        r"[\d.,]+\s*(?:%|percent|seconds?|minutes?|hours?|days?|years?|"
-        r"metres?|meters?|miles?|feet|inches?|kilograms?|grams?)?",
-        label,
-        re.I,
-    ):
-        return ""
-    return label
 
 
 def _normalize_cover_line(value) -> str:
@@ -380,40 +280,10 @@ def parse_response(text: str) -> dict:
         visual = (s.get('visual') or '').strip()
         if not (speech and visual):
             continue
-        visual_action = _clean_inline_text(s.get('visual_action')).lower()
-        if visual_action not in VISUAL_ACTIONS:
-            visual_action = 'highlight'
-        referent = _normalize_referent(s.get('referent'))
-        referent_query = _normalize_referent_query(
-            s.get('referent_query'),
-            referent,
-        )
-        focus_label = _safe_focus_label(
-            s.get('focus_label'),
-            speech,
-            referent,
-        )
-        graphic_payload = _normalize_graphic_payload(
-            s.get('graphic_payload'),
-            referent,
-        )
         normalized_scenes.append({
             'speech': speech,
             'visual': visual,
             'emotion': (s.get('emotion') or '').strip().lower() or None,
-            'focus_label': focus_label,
-            'visual_action': visual_action,
-            'referent': referent,
-            'referent_query': referent_query,
-            'visual_role': _normalize_visual_role(s.get('visual_role')),
-            'evidence_query': _normalize_evidence_query(
-                s.get('evidence_query'),
-                referent_query,
-                graphic_payload,
-                focus_label,
-            ),
-            'precise_claim': _normalize_precise_claim(s.get('precise_claim')),
-            'graphic_payload': graphic_payload,
         })
 
     # Recover a CTA already present in the narration when a provider omitted

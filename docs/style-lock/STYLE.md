@@ -147,6 +147,20 @@ cells. Remaining defect: Nano Banana places Moss in the caption band despite the
 rule, so captions overlap his body. Next step: draw Moss as a code-composited sprite
 (fixed position, perfect continuity, about $0.06 per video).
 
+## Moss becomes an animated sprite (2026-10-06)
+
+Moss is no longer painted into scenes. Painted Moss drifted, covered the
+captions, and needed the $0.039 edit model. He is now a sprite layer animated in
+code (`moss_sprite.py`), cut from approved poses in `assets/moss/sprites/`
+(canonical, front, side, thinking, amazed, point, wave, delighted, blink,
+walk_a, walk_b). He is about 12% of the frame height (half the first prototype),
+stands with his feet above the caption band, walks in and out, idles and
+blinks, and reacts to the narration's word timings. Every scene now uses
+Z-Image Turbo, so a video costs about **$0.06 in images**.
+
+Known pose gaps: `amazed` keeps the goggles up, and the walk frames differ only
+slightly. Horizontal movement and the bob carry the walk.
+
 ## Acceptance tests for pipeline output
 
 1. Extract a frame every 2s from a render; Moss appears in the hook and in at least a

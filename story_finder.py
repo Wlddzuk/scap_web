@@ -30,12 +30,7 @@ from models import (
     VideoMetrics,
 )
 from summarizer import summarize_article
-from video_generator import (
-    DEFAULT_COLOR_INTENSITY,
-    generate_video,
-    get_groq_client,
-    normalize_color_intensity,
-)
+from video_generator import generate_video, get_groq_client
 from llm_models import GROQ_EXTRA_BODY, GROQ_TEXT_MODEL
 
 logger = logging.getLogger(__name__)
@@ -863,13 +858,8 @@ def _pipeline_failure_result(
     }
 
 
-def _process_candidate(
-    candidate: StoryCandidate,
-    color_intensity: str = DEFAULT_COLOR_INTENSITY,
-    style: str | None = None,
-) -> dict:
+def _process_candidate(candidate: StoryCandidate) -> dict:
     """Run one selected story through the existing persisted video pipeline."""
-    color_intensity = normalize_color_intensity(color_intensity)
     article_id = None
     stage = "scrape"
     failure_reason = ""
@@ -924,7 +914,7 @@ def _process_candidate(
             article.series_lane = summary.get("series_lane") or None
 
             # Engagement metadata (scene-based generation)
-            from visual_styles import STYLES as VISUAL_STYLES
+            from visual_styles import DEFAULT_STYLE
             scenes = summary.get("scenes") or []
             article.scenes = json.dumps(scenes) if scenes else None
             article.visual_sources = None
@@ -936,14 +926,7 @@ def _process_candidate(
             )
             article.hook_index_used = None
             article.dominant_emotion = summary.get("dominant_emotion") or None
-            # An explicit pick from the discovery panel outranks the
-            # summarizer's suggestion — the user chose it for this story.
-            if style and style in VISUAL_STYLES:
-                article.style = style
-            else:
-                suggested = summary.get("suggested_style")
-                if suggested and suggested in VISUAL_STYLES:
-                    article.style = suggested
+            article.style = DEFAULT_STYLE
 
             article.status = "summarized"
             article.summarized_at = datetime.now(timezone.utc)
@@ -951,11 +934,8 @@ def _process_candidate(
             title = article.title
             script = article.video_script
             article_scenes = scenes or None
-            article_style = article.style
             article_emotion = article.dominant_emotion
             article_cover_line = getattr(article, "cover_line", None)
-            article_series_lane = getattr(article, "series_lane", None)
-            article_hero_image = getattr(article, "hero_image", None)
 
         stage = "render"
         visual_sources = []
@@ -963,21 +943,15 @@ def _process_candidate(
             article_id=article_id,
             title=title,
             script=script,
-            image_source="ai",
             scenes=article_scenes,
-            style_key=article_style,
             emotion=article_emotion,
             cover_line=article_cover_line,
-            series_lane=article_series_lane,
-            hero_image=article_hero_image,
-            color_intensity=color_intensity,
             visual_sources_out=visual_sources,
         )
 
         with app.app_context():
             article = db.session.get(Article, article_id)
             article.video_path = Path(video_path).name
-            article.color_intensity = color_intensity
             article.visual_sources = json.dumps(visual_sources)
             article.hook_index_used = find_matching_hook_index(
                 hook_variants,

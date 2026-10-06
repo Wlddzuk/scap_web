@@ -1292,35 +1292,6 @@ class TikTokRouteTests(unittest.TestCase):
             result = clipper_app.scrape_url_content('https://example.test/story')
         self.assertEqual(result['title'], 'NASA’s rover — found it')
 
-    def test_video_rejects_malformed_style_and_hook_without_starting_worker(self):
-        with clipper_app.app.app_context():
-            article = Article(
-                url='https://example.test/invalid-video-options',
-                title='Story', content='Body',
-                video_script='A complete narration.', status='summarized',
-            )
-            db.session.add(article)
-            db.session.commit()
-            article_id = article.id
-
-        invalid_payloads = [
-            {'style': ['illustrated_science']}, {'style': {'key': 'test'}},
-            {'use_video_hook': 'false'}, {'use_video_hook': 1},
-            {'use_video_hook': []},
-        ]
-        with patch.object(clipper_app, 'Thread') as thread_type:
-            for payload in invalid_payloads:
-                with self.subTest(payload=payload):
-                    response = self.client.post(
-                        f'/api/articles/{article_id}/video', json=payload,
-                    )
-                    self.assertEqual(response.status_code, 400)
-            thread_type.assert_not_called()
-        with clipper_app.app.app_context():
-            article = db.session.get(Article, article_id)
-            self.assertEqual(article.status, 'summarized')
-            self.assertIsNone(article.video_generation_token)
-
     def test_video_route_assigns_a_unique_worker_ownership_token(self):
         with clipper_app.app.app_context():
             article = Article(
@@ -1341,10 +1312,6 @@ class TikTokRouteTests(unittest.TestCase):
         worker_args = thread_type.call_args.kwargs['args']
         generation_token = worker_args[-1]
         self.assertEqual(worker_args[-2], 'controlled')
-        self.assertEqual(
-            thread_type.call_args.kwargs['kwargs']['color_intensity'],
-            'vivid',
-        )
         self.assertTrue(generation_token)
         with clipper_app.app.app_context():
             saved = db.session.get(Article, article_id)
@@ -1374,75 +1341,17 @@ class TikTokRouteTests(unittest.TestCase):
         worker_args = thread_type.call_args.kwargs['args']
         self.assertEqual(worker_args[-2], 'documentary')
 
-    def test_video_route_forwards_color_without_persisting_before_render(self):
-        with clipper_app.app.app_context():
-            article = Article(
-                url='https://example.test/video-color',
-                title='Color story',
-                content='Body',
-                video_script='A complete narration.',
-                status='summarized',
-            )
-            db.session.add(article)
-            db.session.commit()
-            article_id = article.id
-
-        with patch.object(clipper_app, 'Thread') as thread_type:
-            response = self.client.post(
-                f'/api/articles/{article_id}/video',
-                json={'color_intensity': ' Electric '},
-            )
-
-        self.assertEqual(response.status_code, 202)
-        self.assertEqual(
-            thread_type.call_args.kwargs['kwargs']['color_intensity'],
-            'electric',
-        )
-        with clipper_app.app.app_context():
-            saved = db.session.get(Article, article_id)
-            self.assertEqual(saved.status, 'generating_video')
-            self.assertIsNone(saved.color_intensity)
-
-    def test_video_route_rejects_unknown_color_before_claiming_article(self):
-        with clipper_app.app.app_context():
-            article = Article(
-                url='https://example.test/video-bad-color',
-                title='Bad color story',
-                content='Body',
-                video_script='A complete narration.',
-                status='summarized',
-            )
-            db.session.add(article)
-            db.session.commit()
-            article_id = article.id
-
-        with patch.object(clipper_app, 'Thread') as thread_type:
-            response = self.client.post(
-                f'/api/articles/{article_id}/video',
-                json={'color_intensity': 'radioactive'},
-            )
-
-        self.assertEqual(response.status_code, 400)
-        self.assertEqual(response.get_json()['error'], 'Unknown color intensity')
-        thread_type.assert_not_called()
-        with clipper_app.app.app_context():
-            saved = db.session.get(Article, article_id)
-            self.assertEqual(saved.status, 'summarized')
-            self.assertIsNone(saved.video_generation_token)
-            self.assertIsNone(saved.color_intensity)
-
-    def test_video_worker_persists_color_only_after_successful_render(self):
+    def test_video_worker_saves_the_render_with_the_locked_style(self):
         handle, output_path = tempfile.mkstemp(suffix='.mp4', dir=TEST_DIR)
         os.close(handle)
         with clipper_app.app.app_context():
             article = Article(
-                url='https://example.test/video-color-success',
-                title='Successful color story',
+                url='https://example.test/video-success',
+                title='Successful story',
                 content='Body',
                 video_script='A complete narration.',
                 status='generating_video',
-                video_generation_token='color-success-token',
-                color_intensity='natural',
+                video_generation_token='success-token',
             )
             db.session.add(article)
             db.session.commit()
@@ -1456,29 +1365,26 @@ class TikTokRouteTests(unittest.TestCase):
             clipper_app.run_video_in_background(
                 clipper_app.app.app_context(),
                 article_id,
-                generation_token='color-success-token',
-                color_intensity='electric',
+                generation_token='success-token',
             )
 
-        self.assertEqual(
-            generate.call_args.kwargs['color_intensity'],
-            'electric',
-        )
+        for removed in ('color_intensity', 'style_key', 'image_source', 'use_video_hook'):
+            self.assertNotIn(removed, generate.call_args.kwargs)
         with clipper_app.app.app_context():
             saved = db.session.get(Article, article_id)
             self.assertEqual(saved.status, 'video_done')
-            self.assertEqual(saved.color_intensity, 'electric')
+            self.assertEqual(saved.video_path, os.path.basename(output_path))
+            self.assertEqual(saved.style, 'pixel_night_lab')
 
-    def test_video_worker_does_not_persist_color_when_render_fails(self):
+    def test_video_worker_marks_failed_render(self):
         with clipper_app.app.app_context():
             article = Article(
-                url='https://example.test/video-color-failure',
-                title='Failed color story',
+                url='https://example.test/video-failure',
+                title='Failed story',
                 content='Body',
                 video_script='A complete narration.',
                 status='generating_video',
-                video_generation_token='color-failure-token',
-                color_intensity='natural',
+                video_generation_token='failure-token',
             )
             db.session.add(article)
             db.session.commit()
@@ -1492,14 +1398,13 @@ class TikTokRouteTests(unittest.TestCase):
             clipper_app.run_video_in_background(
                 clipper_app.app.app_context(),
                 article_id,
-                generation_token='color-failure-token',
-                color_intensity='electric',
+                generation_token='failure-token',
             )
 
         with clipper_app.app.app_context():
             saved = db.session.get(Article, article_id)
             self.assertEqual(saved.status, 'failed')
-            self.assertEqual(saved.color_intensity, 'natural')
+            self.assertIsNone(saved.video_path)
 
     def test_video_route_rejects_unknown_voice_tone_before_claiming_article(self):
         with clipper_app.app.app_context():

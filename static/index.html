@@ -5,7 +5,7 @@
     <meta charset="UTF-8">
     <meta name="viewport" content="width=device-width, initial-scale=1.0">
     <title>Clipper | Article to Short Video</title>
-    <link rel="stylesheet" href="/static/styles.css?v=20260926-watch-player">
+    <link rel="stylesheet" href="/static/styles.css?v=20261006-pixel-lab">
     <link
         href="https://fonts.googleapis.com/css2?family=Inter:wght@400;500;600&family=Space+Grotesk:wght@600;700&display=swap"
         rel="stylesheet">
@@ -31,7 +31,6 @@
                     <div class="header-stats">
                         <span class="stat" id="total-count">0 articles</span>
                         <span class="stat" id="video-count">0 videos</span>
-                        <span class="stat" id="carousel-count">0 carousels</span>
                     </div>
                     <div class="generation-budget" id="generation-budget">
                         <button
@@ -127,32 +126,6 @@
                         </button>
                     </div>
                 </form>
-                <div class="generation-preferences">
-                    <label class="hook-toggle" for="video-hook-toggle" title="When on, the 5-second opening uses a real AI video clip from FAL (slower, costs more, more cinematic). When off, it's 4 stills with a Ken Burns zoom.">
-                        <input type="checkbox" id="video-hook-toggle" onchange="onHookToggleChange()">
-                        <span class="hook-toggle-track"><span class="hook-toggle-thumb"></span></span>
-                        <span class="hook-toggle-label">
-                            <strong>AI video hook</strong>
-                            <span class="hook-toggle-hint">5s motion clip vs 4 stills · slower, costs more · matches image style</span>
-                        </span>
-                    </label>
-                    <label class="color-intensity-control" for="color-intensity-select">
-                        <span class="color-intensity-label">Color intensity</span>
-                        <select
-                            class="output-format-select color-intensity-select"
-                            id="color-intensity-select"
-                            aria-describedby="color-intensity-help"
-                            onchange="onColorIntensityChange()"
-                        >
-                            <option value="natural">Natural</option>
-                            <option value="vivid">Vivid (Recommended)</option>
-                            <option value="electric">Electric (maximum color)</option>
-                        </select>
-                        <span class="color-intensity-help" id="color-intensity-help">
-                            Vivid is punchy but balanced. Electric is the neon cyan, magenta, and red reference look.
-                        </span>
-                    </label>
-                </div>
             </div>
 
             <!-- Science Story Discovery -->
@@ -237,7 +210,7 @@
     <div class="glow-bg glow-2"></div>
 
     <script src="/static/anime.min.js"></script>
-    <script src="/static/app.js?v=20260926-watch-player"></script>
+    <script src="/static/app.js?v=20261006-pixel-lab"></script>
 </body>
 
 </html>

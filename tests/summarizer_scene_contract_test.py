@@ -23,50 +23,6 @@ def test_scene_speech_is_source_of_truth_when_script_drifts():
     assert result["video_script"] == scene_script == "First beat. Second beat."
 
 
-def test_scene_contract_keeps_discovery_query_separate_from_location_query():
-    result = parse_response(
-        json.dumps(
-            {
-                "video_script": "Researchers in Jerusalem found breaks in tumor DNA.",
-                "scenes": [{
-                    "speech": "Researchers in Jerusalem found breaks in tumor DNA.",
-                    "visual": "a tumor DNA strand breaking inside a super-enhancer",
-                    "referent": "object",
-                    "referent_query": "Hebrew University Jerusalem",
-                    "visual_role": "discovery",
-                    "evidence_query": "tumor DNA super-enhancer breaks",
-                }],
-            }
-        )
-    )
-
-    scene = result["scenes"][0]
-    assert scene["referent_query"] == "Hebrew University Jerusalem"
-    assert scene["visual_role"] == "discovery"
-    assert scene["evidence_query"] == "tumor DNA super-enhancer breaks"
-
-
-def test_old_scene_contract_derives_an_evidence_query():
-    result = parse_response(
-        json.dumps(
-            {
-                "video_script": "The DNA breaks clustered together.",
-                "scenes": [{
-                    "speech": "The DNA breaks clustered together.",
-                    "visual": "a DNA strand with clustered breaks",
-                    "referent": "abstract",
-                    "focus_label": "CLUSTERED DNA BREAKS",
-                    "graphic_payload": "Clustered DNA breaks",
-                }],
-            }
-        )
-    )
-
-    scene = result["scenes"][0]
-    assert scene["visual_role"] == "discovery"
-    assert scene["evidence_query"] == "Clustered DNA breaks"
-
-
 def test_hook_attribution_requires_an_exact_scene_one_match():
     variants = [
         "First exact hook.",

@@ -65,7 +65,7 @@ def test_voice_tone_picker_defaults_to_controlled_and_previews_all_presets():
     assert "data-voice-tone-select" in APP_JS
     assert "previewVoiceTone(event, ${article.id})" in APP_JS
     assert "/api/tts/preview" in APP_JS
-    assert "body.voice_tone = voiceTone;" in APP_JS
+    assert "body: JSON.stringify({ voice_tone: voiceTone })" in APP_JS
 
 
 def test_voice_preview_arms_audio_context_before_waiting_for_server():
@@ -99,39 +99,24 @@ def test_browser_caption_caps_every_user_visible_field():
     assert APP_JS.count(").trim().slice(0, 220).trim();") >= 2
 
 
-def test_color_intensity_is_a_persisted_vivid_default_for_discovery_videos():
-    assert 'id="color-intensity-select"' in INDEX_HTML
-    assert 'aria-describedby="color-intensity-help"' in INDEX_HTML
-    assert '<option value="natural">Natural</option>' in INDEX_HTML
-    assert '<option value="vivid">Vivid (Recommended)</option>' in INDEX_HTML
-    assert '<option value="electric">Electric (maximum color)</option>' in INDEX_HTML
-    assert "Vivid is punchy but balanced." in INDEX_HTML
-    assert "Electric is the neon cyan, magenta, and red reference look." in INDEX_HTML
-    assert "const DEFAULT_COLOR_INTENSITY = 'vivid';" in APP_JS
-    assert "const COLOR_INTENSITY_STORAGE_KEY = 'clipper_color_intensity';" in APP_JS
-    assert "localStorage.setItem(COLOR_INTENSITY_STORAGE_KEY, colorIntensity);" in APP_JS
-    assert "syncColorIntensityControl();" in APP_JS
-    assert "color_intensity: colorIntensity," in APP_JS
-    assert "style: discoveryStyleDraft[candidateId] || null" in APP_JS
+def test_the_locked_style_leaves_nothing_to_choose():
+    """Pixel Night Lab is the only look: no style, colour, hook or source pickers."""
+    for removed in (
+        "color-intensity", "colorIntensity", "video-hook-toggle", "data-source-select",
+        "data-format-select", "/api/styles", "carousel", "discoveryStyle",
+    ):
+        assert removed not in APP_JS, removed
+        assert removed not in INDEX_HTML, removed
+    assert "{ method: 'POST' }" in APP_JS            # discovery sends no style
+    assert 'onclick="generateVideo(${article.id})"' in APP_JS
 
 
-def test_article_generation_uses_article_or_global_color_intensity():
-    assert "selectedColorIntensityByArticle[article.id]" in APP_JS
-    assert "|| article.color_intensity" in APP_JS
-    assert "|| getColorIntensityPref()" in APP_JS
-    assert 'data-color-intensity-select="${article.id}"' in APP_JS
-    assert "onchange=\"selectColorIntensity(${article.id}, this.value)\"" in APP_JS
-    assert "body.color_intensity = colorIntensity;" in APP_JS
-    assert "generateVideo(articleId, imageSource, colorIntensity);" in APP_JS
-    assert ".article-color-intensity-control" in STYLES
-
-
-def test_color_intensity_assets_share_one_bumped_cache_version():
+def test_assets_share_one_bumped_cache_version():
     versions = re.findall(
         r"/static/(?:styles\.css|app\.js)\?v=([^\"']+)",
         INDEX_HTML,
     )
     assert versions == [
-        "20260926-watch-player",
-        "20260926-watch-player",
+        "20261006-pixel-lab",
+        "20261006-pixel-lab",
     ]

@@ -45,19 +45,9 @@ from summarizer import (
     CTA_QUESTION_MAX_CHARS,
     summarize_article,
 )
-from video_generator import (
-    DEFAULT_COLOR_INTENSITY,
-    generate_video,
-    normalize_color_intensity,
-)
+from video_generator import generate_video
 import tts_engine
-from carousel_generator import generate_carousel
-from visual_styles import (
-    DEFAULT_STYLE,
-    STYLES as VISUAL_STYLES,
-    get_style,
-    list_styles,
-)
+from visual_styles import DEFAULT_STYLE
 from tiktok_service import (
     AUTH_URL as TIKTOK_AUTH_URL,
     TikTokAPIError,
@@ -2046,9 +2036,7 @@ def run_summarize_in_background(app_context, article_id):
             # accurately. The next successful render restores attribution.
             article.hook_index_used = None
             article.dominant_emotion = result.get('dominant_emotion') or None
-            suggested = result.get('suggested_style')
-            if suggested and suggested in VISUAL_STYLES:
-                article.style = suggested
+            article.style = DEFAULT_STYLE
 
             article.status = 'summarized'
             article.summarized_at = datetime.now(timezone.utc)
@@ -2067,12 +2055,8 @@ def run_summarize_in_background(app_context, article_id):
 def run_video_in_background(
     app_context,
     article_id,
-    image_source="ai",
-    style_override=None,
-    use_video_hook=None,
     voice_tone="controlled",
     generation_token=None,
-    color_intensity=DEFAULT_COLOR_INTENSITY,
 ):
     """Run video generation in a background thread, with a watchdog timeout.
 
@@ -2083,7 +2067,6 @@ def run_video_in_background(
     watchdog already declared failure.
     """
     from threading import Timer
-    color_intensity = normalize_color_intensity(color_intensity)
 
     def _watchdog_fire():
         # Runs in a separate thread — needs its own app context.
@@ -2115,26 +2098,15 @@ def run_video_in_background(
 
             try:
                 scenes = json.loads(article.scenes) if article.scenes else None
-                # First renders use the channel's Illustrated Science identity.
-                # A style is changed only when the user explicitly chooses one
-                # in the existing manual picker.
-                style_key = style_override or DEFAULT_STYLE
-
                 visual_sources = []
                 video_path = generate_video(
                     article_id=article.id,
                     title=article.title,
                     script=article.video_script,
-                    image_source=image_source,
                     scenes=scenes,
-                    style_key=style_key,
                     emotion=article.dominant_emotion,
-                    use_video_hook=use_video_hook,
                     voice_tone=voice_tone,
                     cover_line=article.cover_line,
-                    series_lane=article.series_lane,
-                    hero_image=article.hero_image,
-                    color_intensity=color_intensity,
                     visual_sources_out=visual_sources,
                 )
 
@@ -2157,8 +2129,7 @@ def run_video_in_background(
                         pass
                     return
 
-                article.style = style_key
-                article.color_intensity = color_intensity
+                article.style = DEFAULT_STYLE
                 article.visual_sources = json.dumps(visual_sources)
 
                 relative_path = os.path.basename(video_path)
@@ -2188,34 +2159,6 @@ def run_video_in_background(
                     db.session.commit()
     finally:
         timer.cancel()
-
-
-def run_carousel_in_background(app_context, article_id, image_source="ai"):
-    """Run carousel generation in a background thread."""
-    with app_context:
-        article = db.session.get(Article, article_id)
-        if not article:
-            return
-
-        try:
-            result = generate_carousel(
-                article_id=article.id,
-                title=article.title,
-                script=article.video_script,
-                image_source=image_source
-            )
-
-            article.carousel_dir = result['carousel_dir']
-            article.carousel_audio = result['carousel_audio']
-            article.status = 'carousel_done'
-            article.carousel_generated_at = datetime.now(timezone.utc)
-            db.session.commit()
-            logger.info(f"Carousel generated for article {article_id}")
-
-        except Exception as e:
-            logger.error(f"Failed to generate carousel for article {article_id}: {e}", exc_info=True)
-            article.status = 'failed'
-            db.session.commit()
 
 
 # ============================================================
@@ -2275,79 +2218,6 @@ def serve_signed_public_video(filename):
     return response
 
 
-@app.route('/carousels/<int:article_id>/<path:filename>')
-def serve_carousel_file(article_id, filename):
-    """Serve carousel images and audio files."""
-    safe_filename = secure_filename(filename)
-    if not safe_filename or safe_filename != filename:
-        return jsonify({'error': 'Invalid filename'}), 400
-    carousel_dir = os.path.join('static', 'carousels', str(article_id))
-    if not os.path.isdir(carousel_dir):
-        return jsonify({'error': 'Carousel not found'}), 404
-    return send_from_directory(carousel_dir, safe_filename)
-
-
-@app.route('/api/articles/<int:article_id>/carousel/download')
-def download_carousel_zip(article_id):
-    """Download all carousel assets as a ZIP file."""
-    article = db.session.get(Article, article_id)
-    if not article or not article.carousel_dir:
-        return jsonify({'error': 'Carousel not found'}), 404
-
-    carousel_path = os.path.join('static', 'carousels', article.carousel_dir)
-    if not os.path.isdir(carousel_path):
-        return jsonify({'error': 'Carousel files not found'}), 404
-
-    # Create ZIP in memory
-    zip_buffer = BytesIO()
-    with zipfile.ZipFile(zip_buffer, 'w', zipfile.ZIP_DEFLATED) as zf:
-        for fname in sorted(os.listdir(carousel_path)):
-            fpath = os.path.join(carousel_path, fname)
-            if os.path.isfile(fpath):
-                zf.write(fpath, fname)
-
-    zip_buffer.seek(0)
-
-    # Clean title for filename
-    safe_title = re.sub(r'[^\w\s-]', '', article.title)[:40].strip().replace(' ', '_')
-    zip_name = f"carousel_{safe_title}_{article_id}.zip"
-
-    return send_file(
-        zip_buffer,
-        mimetype='application/zip',
-        as_attachment=True,
-        download_name=zip_name
-    )
-
-
-@app.route('/api/articles/<int:article_id>/carousel/qr')
-def carousel_qr_code(article_id):
-    """Generate a QR code pointing to the mobile download page."""
-    import qrcode
-
-    article = db.session.get(Article, article_id)
-    if not article or not article.carousel_dir:
-        return jsonify({'error': 'Carousel not found'}), 404
-
-    # Get the local network IP so the phone can access it
-    local_ip = _get_local_ip()
-    port = request.host.split(':')[-1] if ':' in request.host else '5050'
-    mobile_url = f"http://{local_ip}:{port}/carousels/{article_id}/mobile"
-
-    # Generate QR code
-    qr = qrcode.QRCode(version=1, box_size=10, border=2)
-    qr.add_data(mobile_url)
-    qr.make(fit=True)
-    img = qr.make_image(fill_color="black", back_color="white")
-
-    # Convert to PNG bytes
-    buf = BytesIO()
-    img.save(buf, format='PNG')
-    buf.seek(0)
-
-    return send_file(buf, mimetype='image/png')
-
-
 def _get_local_ip():
     """Get the local network IP address."""
     try:
@@ -2358,168 +2228,6 @@ def _get_local_ip():
         return ip
     except Exception:
         return '127.0.0.1'
-
-
-@app.route('/carousels/<int:article_id>/mobile')
-def carousel_mobile_page(article_id):
-    """Serve a mobile-friendly page to save carousel images to Camera Roll."""
-    article = db.session.get(Article, article_id)
-    if not article or not article.carousel_dir:
-        return "Carousel not found", 404
-
-    carousel_path = os.path.join('static', 'carousels', article.carousel_dir)
-    if not os.path.isdir(carousel_path):
-        return "Carousel files not found", 404
-
-    # Get list of slide files
-    slides = sorted([f for f in os.listdir(carousel_path) if f.startswith('slide_') and f.endswith('.png')])
-    audio_file = article.carousel_audio
-
-    # Build a self-contained mobile HTML page
-    slides_html = ""
-    for i, slide in enumerate(slides, 1):
-        slides_html += f'''
-        <div class="slide-card">
-            <div class="slide-number">Slide {i}</div>
-            <img src="/carousels/{article_id}/{slide}" alt="Slide {i}" class="slide-img">
-            <a href="/carousels/{article_id}/{slide}" download="{slide}" class="save-btn">
-                💾 Save Image {i}
-            </a>
-        </div>
-        '''
-
-    audio_html = ""
-    if audio_file:
-        audio_html = f'''
-        <div class="audio-card">
-            <div class="slide-number">🎙️ Voiceover</div>
-            <audio controls preload="metadata" class="audio-player">
-                <source src="/carousels/{article_id}/{audio_file}">
-            </audio>
-            <a href="/carousels/{article_id}/{audio_file}" download="{audio_file}" class="save-btn">
-                💾 Save Audio
-            </a>
-        </div>
-        '''
-
-    html = f'''<!DOCTYPE html>
-<html lang="en">
-<head>
-    <meta charset="UTF-8">
-    <meta name="viewport" content="width=device-width, initial-scale=1.0, user-scalable=no">
-    <title>Clipper — Save Carousel</title>
-    <link href="https://fonts.googleapis.com/css2?family=Inter:wght@400;600;700&display=swap" rel="stylesheet">
-    <style>
-        * {{ margin: 0; padding: 0; box-sizing: border-box; }}
-        body {{
-            font-family: 'Inter', -apple-system, sans-serif;
-            background: #0B0F14;
-            color: #F3F4F6;
-            min-height: 100vh;
-            padding: 20px;
-            padding-bottom: 40px;
-            -webkit-font-smoothing: antialiased;
-        }}
-        .header {{
-            text-align: center;
-            padding: 20px 0 24px;
-        }}
-        .logo {{ color: #5EEAD4; font-size: 0.9rem; }}
-        h1 {{
-            font-size: 1.5rem;
-            font-weight: 700;
-            margin: 8px 0 4px;
-            letter-spacing: -0.02em;
-        }}
-        .subtitle {{
-            color: #9CA3AF;
-            font-size: 0.85rem;
-            line-height: 1.4;
-        }}
-        .tip {{
-            background: rgba(94, 234, 212, 0.1);
-            border: 1px solid rgba(94, 234, 212, 0.2);
-            border-radius: 12px;
-            padding: 12px 16px;
-            margin: 16px 0 20px;
-            font-size: 0.8rem;
-            color: #5EEAD4;
-            text-align: center;
-        }}
-        .slide-card {{
-            background: #111827;
-            border: 1px solid rgba(255,255,255,0.08);
-            border-radius: 16px;
-            overflow: hidden;
-            margin-bottom: 16px;
-        }}
-        .slide-number {{
-            padding: 12px 16px;
-            font-size: 0.75rem;
-            font-weight: 600;
-            text-transform: uppercase;
-            letter-spacing: 0.05em;
-            color: #9CA3AF;
-        }}
-        .slide-img {{
-            width: 100%;
-            display: block;
-            border-top: 1px solid rgba(255,255,255,0.06);
-            border-bottom: 1px solid rgba(255,255,255,0.06);
-        }}
-        .save-btn {{
-            display: block;
-            text-align: center;
-            padding: 14px;
-            color: #0B0F14;
-            background: #5EEAD4;
-            font-weight: 600;
-            font-size: 0.9rem;
-            text-decoration: none;
-            transition: background 0.2s;
-        }}
-        .save-btn:active {{ background: #3dd1b9; }}
-        .audio-card {{
-            background: #111827;
-            border: 1px solid rgba(255,255,255,0.08);
-            border-radius: 16px;
-            overflow: hidden;
-            margin-bottom: 16px;
-        }}
-        .audio-player {{
-            width: calc(100% - 32px);
-            margin: 0 16px 12px;
-            height: 44px;
-        }}
-        .instructions {{
-            text-align: center;
-            padding: 20px 0;
-            color: #667085;
-            font-size: 0.75rem;
-            line-height: 1.6;
-        }}
-    </style>
-</head>
-<body>
-    <div class="header">
-        <div class="logo">▲ Clipper</div>
-        <h1>{article.title[:60]}</h1>
-        <p class="subtitle">Photo Carousel — {len(slides)} slides</p>
-    </div>
-    <div class="tip">
-        📱 <strong>Tip:</strong> Long-press each image → "Save to Photos"<br>
-        Or tap the save buttons below each slide
-    </div>
-    {slides_html}
-    {audio_html}
-    <div class="instructions">
-        After saving, open TikTok → Create → Photo Mode<br>
-        Select all images from Camera Roll → Add voiceover
-    </div>
-</body>
-</html>'''
-
-    return html
 
 
 @app.route('/api/articles/<int:article_id>/video/qr')
@@ -2981,7 +2689,8 @@ def preview_voice_tone():
 def generate_video_endpoint(article_id):
     """Trigger video generation for an article (runs in background).
 
-    Optional JSON body may override the visual style and voice tone.
+    Optional JSON body: {"voice_tone": ...}. The look is the locked Pixel
+    Night Lab style, so there is nothing else to choose.
     """
     article = db.session.get(Article, article_id)
     if not article:
@@ -2999,38 +2708,9 @@ def generate_video_endpoint(article_id):
     elif not isinstance(payload, dict):
         return jsonify({'error': 'JSON body must be an object'}), 400
 
-    image_source = payload.get('image_source', 'ai')
-    if image_source not in ('ai', 'stock', 'mixed'):
-        image_source = 'ai'
-
-    style_override = payload.get('style')
-    if style_override is not None and (
-        not isinstance(style_override, str) or style_override not in VISUAL_STYLES
-    ):
-        return jsonify({'error': 'Unknown style'}), 400
-
     voice_tone = payload.get('voice_tone', 'controlled')
     if not isinstance(voice_tone, str) or voice_tone not in VOICE_TONES:
         return jsonify({'error': 'Unknown voice tone'}), 400
-
-    raw_color_intensity = payload.get(
-        'color_intensity',
-        DEFAULT_COLOR_INTENSITY,
-    )
-    if (
-        not isinstance(raw_color_intensity, str)
-        or raw_color_intensity.strip().lower()
-        not in {'natural', 'vivid', 'electric'}
-    ):
-        return jsonify({'error': 'Unknown color intensity'}), 400
-    color_intensity = normalize_color_intensity(raw_color_intensity)
-
-    # `use_video_hook` is a tri-state: True/False/None.
-    #   True  -> AI video hook (FAL); False -> image hook; None -> env default.
-    raw_hook = payload.get('use_video_hook', None)
-    if raw_hook is not None and not isinstance(raw_hook, bool):
-        return jsonify({'error': 'Video hook must be true, false, or null'}), 400
-    use_video_hook = raw_hook
 
     generation_token = secrets.token_hex(24)
     current_status = article.status
@@ -3054,58 +2734,13 @@ def generate_video_endpoint(article_id):
 
     thread = Thread(
         target=run_video_in_background,
-        args=(
-            app.app_context(),
-            article.id,
-            image_source,
-            style_override,
-            use_video_hook,
-            voice_tone,
-            generation_token,
-        ),
-        kwargs={'color_intensity': color_intensity},
+        args=(app.app_context(), article.id, voice_tone, generation_token),
     )
     thread.daemon = True
     thread.start()
 
     return jsonify({
         'message': 'Video generation started',
-        'article': article.to_dict()
-    }), 202
-
-
-@app.route('/api/articles/<int:article_id>/carousel', methods=['POST'])
-def generate_carousel_endpoint(article_id):
-    """Trigger carousel generation for an article (runs in background)."""
-    article = db.session.get(Article, article_id)
-    if not article:
-        return jsonify({'error': 'Article not found'}), 404
-
-    if not article.video_script:
-        return jsonify({'error': 'Article must be summarized first'}), 400
-
-    if article.status in ('summarizing', 'generating_video', 'generating_carousel'):
-        return jsonify({'error': 'Article is already being processed'}), 409
-
-    # Get image source from request body
-    data = request.get_json(silent=True) or {}
-    image_source = data.get('image_source', 'ai')
-    if image_source not in ('ai', 'stock'):
-        image_source = 'ai'
-
-    article.status = 'generating_carousel'
-    db.session.commit()
-
-    # Run in background thread
-    thread = Thread(
-        target=run_carousel_in_background,
-        args=(app.app_context(), article.id, image_source)
-    )
-    thread.daemon = True
-    thread.start()
-
-    return jsonify({
-        'message': 'Carousel generation started',
         'article': article.to_dict()
     }), 202
 
@@ -3746,41 +3381,6 @@ def tiktok_article_publish_status(article_id):
         )
         db.session.commit()
         return _tiktok_error_response(error)
-
-
-@app.route('/api/styles', methods=['GET'])
-def list_styles_endpoint():
-    """Return available visual style presets for UI consumption."""
-    return jsonify({'styles': list_styles()})
-
-
-@app.route('/api/styles/suggest', methods=['POST'])
-def suggest_style_endpoint():
-    """Suggest one visual style for a story the user is about to render.
-
-    Called on demand when the discovery style picker opens — one story at a
-    time, never for the whole shortlist — so the Groq call only happens once the
-    user is actually choosing. Falls back to the default style whenever the
-    picker cannot decide, so the caller always gets a usable key.
-    """
-    payload = request.get_json(silent=True)
-    if not isinstance(payload, dict):
-        payload = {}
-
-    title = str(payload.get('title') or '').strip()[:300]
-    context = str(payload.get('summary') or '').strip()[:1500]
-    if not title and not context:
-        return jsonify({'error': 'A title or summary is required'}), 400
-
-    from visual_styles import DEFAULT_STYLE, _legacy_auto_pick_style
-
-    try:
-        suggested = _legacy_auto_pick_style(title, context)
-    except Exception:
-        logger.error('Style suggestion failed', exc_info=True)
-        suggested = DEFAULT_STYLE
-
-    return jsonify({'style': suggested or DEFAULT_STYLE})
 
 
 @app.route('/api/generation-budget', methods=['GET'])

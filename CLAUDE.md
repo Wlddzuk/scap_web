@@ -4,7 +4,7 @@ This file provides guidance to Claude Code (claude.ai/code) when working with co
 
 ## Commands
 
-**Environment:** Python 3.11. Requires `ffmpeg` on PATH (video encoding) and at least one LLM key in `.env` (see `.env.example`). `FAL_KEY` is optional — without it, videos use gradient backgrounds instead of AI images.
+**Environment:** Python 3.11. Requires `ffmpeg` on PATH (video encoding) and at least one LLM key in `.env` (see `.env.example`). `FAL_KEY` is required for videos: every scene image comes from FAL, and a render with no generated scene fails rather than shipping blank frames.
 
 ```bash
 # Install (dev deps include pytest, black, flake8, pylint, bandit, mypy)
@@ -26,8 +26,7 @@ pytest --cov=. --cov-report=term-missing                          # coverage
 
 # Smoke-test individual modules (each has a __main__ block)
 python summarizer.py        # Runs end-to-end against configured LLMs
-python video_generator.py   # Generates a test video (hits FAL + Kokoro)
-python visual_styles.py     # Prints style list + sample prompt
+python scripts/build_moss_sprites.py   # Re-cut Moss's sprites (add --generate for missing poses, FAL)
 ```
 
 **Port 5050 is hardcoded** in `app.py`, `gunicorn.conf.py`, `Dockerfile`, and `bookmarklet.js`. If you change it, grep for `5050` and update all of them.
@@ -49,24 +48,32 @@ URL ──scrape──▶ Article(status=scraped)
               ▼
           video_generator.py ──▶ Article(status=video_done, video_path=...)
                     │                 static/videos/article_{id}_{ts}.mp4
-                    └── uses visual_styles.apply_style() for image prompts
+                    ├── pixel_scenes.py   one pixel-art image per scene (FAL Z-Image Turbo)
+                    └── moss_sprite.py    Moss, the mascot, animated over the scenes in code
 ```
 
 ### The scene contract (summarizer ↔ video_generator)
 
 This is the most important cross-file invariant. `summarizer.py` emits a `scenes[]` array where each scene has `{speech, visual, emotion}`, and **concatenating all `scene.speech` in order must equal `video_script`**. `parse_response()` reconstructs `video_script` from scenes if the model omits it. Downstream:
 
-- `video_generator.generate_scene_images(scenes, style_key)` produces one image per scene via `visual_styles.apply_style(scene.visual, style_key)`.
+- `pixel_scenes.generate_scene_images(shots)` produces one image per scene from `scene.visual`.
 - `compute_scene_durations()` allocates time per scene proportional to `len(speech.split())` so visuals stay aligned with narration.
-- If `scenes` is missing, `generate_video()` falls back to the legacy path: `generate_themed_images()` + `chunk_text()`-based pacing.
+- If `scenes` is missing, `generate_video()` builds one scene per `chunk_text()` chunk.
 
-When changing the scene schema, update all three: the prompt in `summarizer.get_prompt()`, `parse_response()`'s normalization, and the scene-based branch of `generate_video()`. Also add a column to `models.Article` **and** to `_migrate_schema()` in `app.py` (see below).
+When changing the scene schema, update the prompt in `summarizer.get_prompt()`, `parse_response()`'s normalization, and `generate_video()`. Also add a column to `models.Article` **and** to `_migrate_schema()` in `app.py` (see below).
 
-### Visual-style separation (WHAT vs HOW)
+### One locked look: Pixel Night Lab
 
-`scene.visual` describes **what** is on screen (subject, action, setting). `visual_styles.STYLES[key]` provides **how** it looks (medium, lighting, aesthetic). `apply_style(visual, key, is_hook)` composes them. Scene `visual` strings must NOT mention art style or medium — doing so fights the style preset and produces inconsistent imagery. The prompt in `summarizer.py` enforces this ("Do NOT mention art style or medium here").
+There is exactly one visual style (`visual_styles.DEFAULT_STYLE = "pixel_night_lab"`); the direction packet, mascot bible and decision history are in `docs/style-lock/`. `scene.visual` describes **what** is on screen; `pixel_scenes.PIXEL_LOOK` is **how**. Two rules learned the hard way:
 
-`auto_pick_style()` calls Groq to choose a style key when the user hasn't overridden and the summarizer didn't set one. Default is `3d_pixar`.
+- **The scene model (Z-Image Turbo) has no negative prompt and draws every noun it reads.** "Never planets or rings" produced a ringed planet over a lab bench. Keep `build_scene_prompt()` positive-only; `generate_image_fal()` appends the no-text suffix.
+- **Never name the mascot in a scene prompt.** Mentioning Moss lettered "Moss" onto objects and produced look-alike mascots. Moss is not in the images at all.
+
+The summarizer is told to write physical, literal, wordless visuals (no charts, labels or metaphors). Older summaries that still describe charts and timelines are rewritten by `pixel_scenes.physicalize_visual()` (Groq) before generation.
+
+### Moss, the animated mascot
+
+`moss_sprite.create_moss_overlay()` composites Moss (an original tardigrade) as a sprite layer between the picture and the captions. Sprites live in `assets/moss/sprites/` (rebuild with `scripts/build_moss_sprites.py`). He hosts the hook, every other scene and the last scene; walks in and out; idles and blinks; and reacts to Whisper word timings (amazed on numbers and magnitude words, thinking on questions, waving on "follow"). Motion is stepped at 12 fps on a 4 px grid to read as a game sprite. His feet sit at `FEET_Y`, above the caption band, which `test_overlay_never_enters_the_caption_band` enforces.
 
 ### Multi-provider fallback chain (summarizer)
 
@@ -81,7 +88,7 @@ All four share the same `get_prompt()` and `parse_response()`, so adding a provi
 
 **Reasoning models need a bigger output budget.** Qwen3.7 Flash, DeepSeek V4 Flash, GLM 4.7 Flash and gpt-oss emit a hidden chain of thought before the first JSON character, and those tokens count against `max_tokens`. At the old 4500 default they truncate mid-string on every call (qwen3.7-flash measured 6,850 reasoning tokens before answering). `_is_reasoning_model()` in `summarizer.py` raises the cap to 16000 and the timeout to 240s. Add any new reasoning model to `_REASONING_MODELS` or it will fail 100% of the time. Such a model can also return a **null** `content` field rather than an error when it runs out of budget, so `_call_openrouter()` checks for empty content before parsing.
 
-A **separate** Groq client inside `video_generator.py` and `visual_styles.py` handles style selection, subject extraction, and image-prompt generation. That one falls silently back to hardcoded defaults if `GROQ_API_KEY` is missing.
+A **separate** Groq client (`video_generator.get_groq_client()`) is used by `pixel_scenes.physicalize_visual()` and story discovery. Without `GROQ_API_KEY` the scene rewrite is skipped and the original visual is used.
 
 ### Background execution + status polling
 
@@ -105,15 +112,15 @@ Any server-side URL fetch must go through `validate_url()` in `app.py`, which re
 
 ### Parallel image generation
 
-`_parallel_image_gen()` uses a `ThreadPoolExecutor(max_workers=MAX_IMAGE_WORKERS=6)` and preserves prompt-to-image ordering via an index map. FAL's FLUX-schnell runs at 4 inference steps for speed. Each failed image falls back to a gradient so one timeout doesn't kill the whole video. `create_hook_clips()` parallelizes its 4 hook angles the same way.
+`pixel_scenes.generate_scene_images()` generates one image per scene in a `ThreadPoolExecutor(max_workers=MAX_IMAGE_WORKERS=6)`, then expands it into per-shot framings. A failed scene reuses the nearest generated scene; if none succeeds the render fails instead of shipping blank frames. A video costs about $0.005 per scene (`pixel_scenes.estimate_video_cost`).
 
 ## Project-specific conventions
 
-- **Captions are burned in by the renderer, never by the image model.** `create_caption_clips()` draws word-synced (Whisper) captions plus the opening `cover_line` headline. All image prompts and style presets explicitly include "no text no words" directives so generated stills never carry their own lettering. `chunk_text()` exists only for visual pacing in the legacy path.
-- **Pacing:** shots are capped at `MAX_SHOT_DURATION` (2.5s), and consecutive shots of one image must use visibly different framings (`_documentary_photo_variant`) with a perceptible push (`BODY_SHOT_ZOOM`). A scene that looks like one frozen still is the main reason viewers swipe.
+- **Captions are burned in by the renderer, never by the image model.** `create_caption_clips()` draws word-synced (Whisper) captions plus the opening `cover_line` headline. Scene prompts never ask for text, and `generate_image_fal()` appends a no-text suffix. Captions take their spelling from the script (`align_words_to_script()`), not from Whisper's guesses.
+- **Pacing:** shots are capped at `MAX_SHOT_DURATION` (2.5s), and consecutive shots of one image must use visibly different framings (`shot_variant()` with `pixel_scenes.FRAMINGS`) with a perceptible push (`BODY_SHOT_ZOOM`). A scene that looks like one frozen still is the main reason viewers swipe.
 - **Restarting locally:** the app runs under the `com.scapweb.clipper` LaunchAgent with auto-reload off, so code edits need `launchctl kickstart -k gui/$(id -u)/com.scapweb.clipper`.
 - **User-facing errors are generic; full context goes to `logger.error(..., exc_info=True)`.** Don't leak provider error strings to the client.
-- **`print("[Tag] ...")` is the logging convention inside `video_generator.py`** (pipeline progress visible in gunicorn logs). `logger.info/error` is used in `app.py` and `summarizer.py`. Don't mix them within a module.
+- **Logging uses `logger.info/error` everywhere**, with `[Tag]` prefixes for pipeline stages (`[Pixel]`, `[Captions]`, `[Music]`).
 - **Frontend has no build step.** `static/app.js` is plain ES-modern JS served directly. Don't introduce bundlers without a reason.
-- **Tests use `tempfile` SQLite per-test via `conftest.py` fixtures** (`client`, `sample_article`, `summarized_article`, `mock_env_vars`). Tests marked `slow` or `integration` may hit real services if env keys are set — prefer `pytest-mock` for external calls.
+- **Tests never spend money:** `tests/conftest.py` blanks `FAL_KEY` (modules call `load_dotenv()`, which never overrides a set variable). Export `FAL_KEY` in the shell only for an intentional integration run. Route tests build their own temp SQLite database per module.
 - **OpenRouter calls send `HTTP-Referer: http://localhost:5050` and `X-Title: Clipper`.** If deploying publicly, update these in `summarizer._call_openrouter()`.

@@ -93,10 +93,6 @@ def candidate_articles(cutoff: datetime, article_ids: list[int] | None) -> list[
     return query.order_by(Article.id.asc()).all()
 
 
-def hook_setting(value: str) -> bool | None:
-    return {"env": None, "on": True, "off": False}[value]
-
-
 def safe_video_path(filename: str) -> Path:
     path = (VIDEOS_DIR / filename).resolve()
     if os.path.commonpath([str(VIDEOS_DIR), str(path)]) != str(VIDEOS_DIR):
@@ -155,12 +151,6 @@ def main() -> int:
     parser.add_argument("--article-id", type=int, action="append", dest="article_ids")
     parser.add_argument("--execute", action="store_true", help="perform renders; otherwise list only")
     parser.add_argument("--keep-old", action="store_true", help="keep superseded MP4 files")
-    parser.add_argument(
-        "--image-source",
-        choices=("ai", "stock", "mixed"),
-        default="ai",
-    )
-    parser.add_argument("--video-hook", choices=("env", "on", "off"), default="env")
     parser.add_argument("--max-size-mb", type=float, default=25.0)
     parser.add_argument("--ffmpeg-timeout", type=int, default=900)
     args = parser.parse_args()
@@ -199,14 +189,9 @@ def main() -> int:
                         article_id=article.id,
                         title=article.title,
                         script=article.video_script,
-                        image_source=args.image_source,
                         scenes=scenes,
-                        style_key=article.style or None,
                         emotion=article.dominant_emotion,
-                        use_video_hook=hook_setting(args.video_hook),
                         cover_line=getattr(article, "cover_line", None),
-                        series_lane=getattr(article, "series_lane", None),
-                        hero_image=getattr(article, "hero_image", None),
                     )
                 ).resolve()
                 if os.path.commonpath([str(VIDEOS_DIR), str(new_path)]) != str(VIDEOS_DIR):

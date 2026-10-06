@@ -16,11 +16,7 @@ let searchQuery = '';
 const ARTICLE_PAGE_SIZE = 15;
 let articleVisibleCount = ARTICLE_PAGE_SIZE;
 let initialLoadDone = false;
-let availableStyles = [];       // loaded from /api/styles
-let selectedStyleByArticle = {}; // { [articleId]: 'manga' } — user override
-const DEFAULT_VISUAL_STYLE = 'pixel_night_lab';
 let selectedVoiceToneByArticle = {}; // { [articleId]: 'controlled' | 'energetic' | 'documentary' }
-let selectedColorIntensityByArticle = {}; // { [articleId]: 'natural' | 'vivid' | 'electric' }
 let voicePreviewAudioContext = null;
 let activeVoicePreviewSource = null;
 let activeVoicePreviewAudio = null;
@@ -39,13 +35,6 @@ const VOICE_TONES = {
         description: 'Measured and authoritative for serious or complex stories.'
     }
 };
-const COLOR_INTENSITIES = {
-    natural: 'Natural',
-    vivid: 'Vivid (Recommended)',
-    electric: 'Electric (maximum color)'
-};
-const COLOR_INTENSITY_STORAGE_KEY = 'clipper_color_intensity';
-const DEFAULT_COLOR_INTENSITY = 'vivid';
 let platformConnections = {
     tiktok: { configured: false, connected: false },
     instagram: { configured: false, connected: false },
@@ -70,10 +59,6 @@ let discoveryShowAll = false;
 const DISCOVERY_PREVIEW_COUNT = 5;
 // Which candidate has its "choose a style" panel open, and what is picked in it.
 // Kept in module state so the 5s discovery poll can re-render without closing it.
-let discoveryStyleOpenFor = null;
-let discoveryStyleDraft = {};
-// candidate_id -> style key, or null while the server is still deciding.
-let discoverySuggestedStyle = {};
 let discoveryRequestInFlight = false;
 let discoveryPollTimer = null;
 let discoveryPollDelayMs = 5000;
@@ -121,9 +106,9 @@ async function fetchArticles() {
         }
         articles = data.articles;
         const generationJustFinished = prevArticles.some(previous => {
-            if (!['generating_video', 'generating_carousel'].includes(previous.status)) return false;
+            if (!['generating_video'].includes(previous.status)) return false;
             const current = articles.find(article => article.id === previous.id);
-            return current && !['generating_video', 'generating_carousel'].includes(current.status);
+            return current && !['generating_video'].includes(current.status);
         });
 
         // Hide loading skeleton after first load
@@ -268,14 +253,13 @@ function renderGenerationBudget() {
 
     const estimates = generationBudget.estimates || {};
     const standard = formatBudgetUsd(estimates.standard_video_usd);
-    const motion = formatBudgetUsd(estimates.max_motion_video_usd);
     let videosLeft = '';
     if (generationBudget.limiting_balance_usd !== null && generationBudget.limiting_balance_usd !== undefined && Number.isFinite(Number(generationBudget.limiting_balance_usd)) && Number(estimates.standard_video_usd) > 0) {
         const count = Math.floor(Number(generationBudget.limiting_balance_usd) / Number(estimates.standard_video_usd));
-        videosLeft = ` · roughly ${count} standard video${count === 1 ? '' : 's'} left`;
+        videosLeft = ` · roughly ${count} video${count === 1 ? '' : 's'} left`;
     }
-    estimate.textContent = standard && motion
-        ? `Estimated next video: ${standard} standard, up to ${motion} with motion${videosLeft}.`
+    estimate.textContent = standard
+        ? `Estimated next video: about ${standard}${videosLeft}.`
         : 'Generation cost estimates are temporarily unavailable.';
 
     const fetched = generationBudget.fetched_at ? new Date(generationBudget.fetched_at) : null;
@@ -338,7 +322,6 @@ function articlesChanged(prev, next) {
         if (prev[i].id !== next[i].id ||
             prev[i].status !== next[i].status ||
             prev[i].video_path !== next[i].video_path ||
-            prev[i].carousel_dir !== next[i].carousel_dir ||
             prev[i].tiktok_publish_status !== next[i].tiktok_publish_status ||
             prev[i].tiktok_publish_error !== next[i].tiktok_publish_error ||
             prev[i].hook_index_used !== next[i].hook_index_used ||
@@ -619,89 +602,6 @@ function focusStoryDiscovery() {
     window.setTimeout(() => button.focus({ preventScroll: true }), 450);
 }
 
-/** Suggest a visual style from the story's own words.
- *
- * Scored locally against each preset's `good_for` tags rather than with an LLM
- * call, because this runs for every card on every render and the user has not
- * committed to spending anything yet. It is a hint, not a decision — the panel
- * labels it "Suggested" and any chip can be picked instead.
- */
-function suggestStyleForStory(candidate) {
-    if (!availableStyles.length) return DEFAULT_VISUAL_STYLE;
-    const haystack = [
-        candidate.title,
-        candidate.score_reason,
-        candidate.summary
-    ].filter(Boolean).join(' ').toLowerCase();
-
-    let best = DEFAULT_VISUAL_STYLE;
-    let bestScore = 0;
-    availableStyles.forEach(style => {
-        const score = (style.good_for || [])
-            .reduce((total, tag) => total + (haystack.includes(String(tag).toLowerCase()) ? 1 : 0), 0);
-        if (score > bestScore) {
-            bestScore = score;
-            best = style.key;
-        }
-    });
-    return best;
-}
-
-function discoveryStyleFor(candidate) {
-    return discoveryStyleDraft[candidate.candidate_id]
-        || discoverySuggestedStyle[candidate.candidate_id]
-        || DEFAULT_VISUAL_STYLE;
-}
-
-/** Ask the server which style suits this story.
- *
- * Fired only when the picker opens, for the one story being opened, so the
- * shortlist never triggers a burst of provider calls. The local keyword guess
- * stays as the offline answer if this fails.
- */
-async function loadDiscoveryStyleSuggestion(candidate) {
-    const candidateId = candidate.candidate_id;
-    if (discoverySuggestedStyle[candidateId] !== undefined) return;
-    discoverySuggestedStyle[candidateId] = null; // pending — stops duplicate requests
-    try {
-        const response = await fetch(`${API_BASE}/api/styles/suggest`, {
-            method: 'POST',
-            headers: { 'Content-Type': 'application/json' },
-            body: JSON.stringify({
-                title: candidate.title || '',
-                summary: candidate.score_reason || candidate.summary || ''
-            })
-        });
-        if (!response.ok) throw new Error('suggestion unavailable');
-        const data = await response.json();
-        if (data.style) discoverySuggestedStyle[candidateId] = data.style;
-    } catch (error) {
-        console.error('Style suggestion failed:', error);
-        discoverySuggestedStyle[candidateId] = suggestStyleForStory(candidate);
-    }
-    if (discoveryStyleOpenFor === candidateId) renderDiscovery();
-}
-
-function openDiscoveryStylePanel(candidateId) {
-    discoveryStyleOpenFor = discoveryStyleOpenFor === candidateId ? null : candidateId;
-    if (discoveryStyleOpenFor) {
-        const candidate = (discoveryState.candidates || [])
-            .find(item => item.candidate_id === candidateId);
-        if (candidate) loadDiscoveryStyleSuggestion(candidate);
-    }
-    renderDiscovery();
-}
-
-function closeDiscoveryStylePanel() {
-    discoveryStyleOpenFor = null;
-    renderDiscovery();
-}
-
-function selectDiscoveryStyle(candidateId, styleKey) {
-    discoveryStyleDraft[candidateId] = styleKey;
-    renderDiscovery();
-}
-
 async function makeDiscoveryVideo(candidateId) {
     const candidate = (discoveryState.candidates || []).find(item => item.candidate_id === candidateId);
     const existing = candidate && articles.find(article => article.url === candidate.url);
@@ -710,7 +610,6 @@ async function makeDiscoveryVideo(candidateId) {
         document.getElementById('search-input').value = '';
         articleVisibleCount = Math.max(articleVisibleCount, articles.indexOf(existing) + 1);
         expandedArticles.add(existing.id);
-        discoveryStyleOpenFor = null;
         renderArticles();
         renderDiscovery();
         document.querySelector(`.article-card[data-article-id="${existing.id}"]`)?.scrollIntoView({ block: 'start' });
@@ -722,20 +621,11 @@ async function makeDiscoveryVideo(candidateId) {
         button.disabled = true;
         button.textContent = 'Starting…';
     }
-    discoveryStyleOpenFor = null;
 
     try {
-        const colorIntensity = getColorIntensityPref();
         const response = await fetch(
             `${API_BASE}/api/discovery/candidates/${candidateId}/make-video`,
-            {
-                method: 'POST',
-                headers: { 'Content-Type': 'application/json' },
-                body: JSON.stringify({
-                    color_intensity: colorIntensity,
-                    style: discoveryStyleDraft[candidateId] || null
-                })
-            }
+            { method: 'POST' }
         );
         const data = await response.json();
         if (!response.ok) throw new Error(data.error || 'Could not start video creation');
@@ -840,8 +730,6 @@ function renderDiscovery() {
         const isSkipped = pipelineStatus === 'skipped';
         const failedStage = candidate.failure_stage || (candidate.result && candidate.result.failure_stage);
         const pipelineError = candidate.pipeline_error || (candidate.result && candidate.result.pipeline_error);
-        const canChooseStyle = !discoveryState.running && !isProcessing && !isDone && !isSkipped;
-        const isChoosingStyle = canChooseStyle && discoveryStyleOpenFor === candidate.candidate_id;
         const buttonLabel = isProcessing
             ? 'Making video…'
             : isDone
@@ -879,16 +767,12 @@ function renderDiscovery() {
                 </div>
                 <button type="button" class="btn btn-secondary discovery-video-btn"
                     data-discovery-video="${candidate.candidate_id}"
-                    aria-expanded="${isChoosingStyle}"
                     onclick="${isDone && candidate.article_id
                         ? `openVideoPlayer(${Number(candidate.article_id)})`
-                        : canChooseStyle
-                            ? `openDiscoveryStylePanel('${candidate.candidate_id}')`
-                            : `makeDiscoveryVideo('${candidate.candidate_id}')`}"
+                        : `makeDiscoveryVideo('${candidate.candidate_id}')`}"
                     ${discoveryState.running || isProcessing || (isDone && !candidate.article_id) || isSkipped ? 'disabled' : ''}>
                     ${buttonLabel}
                 </button>
-                ${isChoosingStyle ? renderDiscoveryStylePanel(candidate) : ''}
             </article>
         `;
     }).join('');
@@ -903,50 +787,6 @@ function renderDiscovery() {
         `);
     }
     restoreDiscoveryFocus(container, focusDescriptor);
-}
-
-function renderDiscoveryStylePanel(candidate) {
-    const candidateId = candidate.candidate_id;
-    const suggested = discoverySuggestedStyle[candidateId] || null;
-    const suggestionPending = discoverySuggestedStyle[candidateId] === null;
-    const selected = discoveryStyleFor(candidate);
-    const chips = availableStyles.map(style => `
-        <button type="button"
-            class="discovery-style-chip ${style.key === selected ? 'selected' : ''}"
-            onclick="selectDiscoveryStyle('${candidateId}', '${style.key}')"
-            aria-pressed="${style.key === selected}"
-            title="${escapeAttribute(style.description || '')}">
-            <span class="discovery-style-emoji" aria-hidden="true">${style.emoji}</span>
-            <span class="discovery-style-name">${escapeHtml(style.name)}</span>
-            ${style.key === suggested
-                ? '<span class="discovery-style-suggested">Suggested</span>'
-                : ''}
-        </button>
-    `).join('');
-
-    return `
-        <div class="discovery-style-panel" role="group" aria-label="Visual style for this video">
-            <div class="discovery-style-head">
-                <strong>Visual style</strong>
-                <span>
-                    ${suggestionPending
-                        ? 'Picking a suggestion for this story…'
-                        : 'Applies to every scene in this video. Colour intensity uses your dashboard setting.'}
-                </span>
-            </div>
-            <div class="discovery-style-chips">${chips}</div>
-            <div class="discovery-style-actions">
-                <button type="button" class="btn btn-primary"
-                    onclick="makeDiscoveryVideo('${candidateId}')">
-                    Generate video
-                </button>
-                <button type="button" class="discovery-style-cancel"
-                    onclick="closeDiscoveryStylePanel()">
-                    Cancel
-                </button>
-            </div>
-        </div>
-    `;
 }
 
 function toggleDiscoveryShowAll() {
@@ -1034,27 +874,6 @@ async function summarizeArticle(articleId) {
             btn.disabled = false;
             btn.textContent = 'Summarize';
         }
-    }
-}
-
-async function loadStyles() {
-    try {
-        const res = await fetch(`${API_BASE}/api/styles`);
-        const data = await res.json();
-        availableStyles = data.styles || [];
-    } catch (err) {
-        console.warn('Failed to load styles', err);
-    }
-}
-
-function selectStyle(articleId, styleKey) {
-    selectedStyleByArticle[articleId] = styleKey;
-    // Update chip highlighting in place (no full re-render needed)
-    const container = document.querySelector(`.style-picker[data-article-id="${articleId}"]`);
-    if (container) {
-        container.querySelectorAll('.style-chip').forEach(chip => {
-            chip.classList.toggle('selected', chip.dataset.styleKey === styleKey);
-        });
     }
 }
 
@@ -1213,113 +1032,29 @@ async function previewVoiceTone(event, articleId) {
     }
 }
 
-function getVideoHookPref() {
-    // localStorage value is the source of truth; checkbox is its UI mirror.
-    return localStorage.getItem('clipper_video_hook') === '1';
-}
-
-function onHookToggleChange() {
-    const cb = document.getElementById('video-hook-toggle');
-    if (!cb) return;
-    localStorage.setItem('clipper_video_hook', cb.checked ? '1' : '0');
-}
-
-function syncHookToggle() {
-    const cb = document.getElementById('video-hook-toggle');
-    if (cb) cb.checked = getVideoHookPref();
-}
-
-function normalizeColorIntensity(value) {
-    return Object.hasOwn(COLOR_INTENSITIES, value)
-        ? value
-        : DEFAULT_COLOR_INTENSITY;
-}
-
-function getColorIntensityPref() {
-    return normalizeColorIntensity(localStorage.getItem(COLOR_INTENSITY_STORAGE_KEY));
-}
-
-function onColorIntensityChange() {
-    const select = document.getElementById('color-intensity-select');
-    if (!select) return;
-    const colorIntensity = normalizeColorIntensity(select.value);
-    select.value = colorIntensity;
-    localStorage.setItem(COLOR_INTENSITY_STORAGE_KEY, colorIntensity);
-}
-
-function syncColorIntensityControl() {
-    const select = document.getElementById('color-intensity-select');
-    if (select) select.value = getColorIntensityPref();
-}
-
-function articleColorIntensity(article) {
-    return normalizeColorIntensity(
-        selectedColorIntensityByArticle[article.id]
-        || article.color_intensity
-        || getColorIntensityPref()
-    );
-}
-
-function selectColorIntensity(articleId, value) {
-    const colorIntensity = normalizeColorIntensity(value);
-    selectedColorIntensityByArticle[articleId] = colorIntensity;
-    const select = document.querySelector(
-        `[data-color-intensity-select="${articleId}"]`
-    );
-    if (select) select.value = colorIntensity;
-}
-
-function renderColorIntensityOptions(selectedValue) {
-    const selected = normalizeColorIntensity(selectedValue);
-    return Object.entries(COLOR_INTENSITIES).map(([value, label]) => `
-        <option value="${value}" ${selected === value ? 'selected' : ''}>
-            ${escapeHtml(label)}
-        </option>
-    `).join('');
-}
-
-async function generateVideo(articleId, imageSource = 'ai', requestedColorIntensity = null) {
+async function generateVideo(articleId) {
     const btn = document.querySelector(`[data-video="${articleId}"]`);
     if (btn) {
         btn.disabled = true;
         btn.textContent = 'Generating...';
     }
 
-    const article = articles.find(a => a.id === articleId);
-    const chosenStyle = selectedStyleByArticle[articleId] || DEFAULT_VISUAL_STYLE;
     const voiceTone = selectedVoiceToneByArticle[articleId] || 'controlled';
-    const useVideoHook = getVideoHookPref();
-    const colorIntensity = normalizeColorIntensity(
-        requestedColorIntensity
-        || (article && articleColorIntensity(article))
-        || getColorIntensityPref()
-    );
-
-    const hookLabel = useVideoHook ? ' · AI video hook' : '';
-    const voiceLabel = VOICE_TONES[voiceTone].label;
     showToast(
-        `Generating video · ${voiceLabel} voice · ${COLOR_INTENSITIES[colorIntensity]} color${chosenStyle ? ' · ' + chosenStyle : ''}${hookLabel} — this may take a few minutes`,
+        `Generating video · ${VOICE_TONES[voiceTone].label} voice — this takes a few minutes`,
         'info'
     );
 
     try {
-        const body = {};
-        if (chosenStyle) body.style = chosenStyle;
-        body.use_video_hook = useVideoHook;
-        body.image_source = imageSource;
-        body.voice_tone = voiceTone;
-        body.color_intensity = colorIntensity;
-
         const response = await fetch(`${API_BASE}/api/articles/${articleId}/video`, {
             method: 'POST',
             headers: { 'Content-Type': 'application/json' },
-            body: JSON.stringify(body)
+            body: JSON.stringify({ voice_tone: voiceTone })
         });
-
         const data = await response.json();
 
         if (response.ok) {
-            showToast(response.status === 202 ? 'Video generation started' : 'Video generated!', 'success');
+            showToast('Video generation started', 'success');
             await fetchArticles();
             expandedArticles.add(articleId);
             renderArticles();
@@ -1327,7 +1062,7 @@ async function generateVideo(articleId, imageSource = 'ai', requestedColorIntens
             showToast(data.error || 'Failed to generate video', 'error');
             if (btn) {
                 btn.disabled = false;
-                btn.textContent = 'Generate Video';
+                btn.textContent = 'Generate video';
             }
         }
     } catch (error) {
@@ -1335,53 +1070,8 @@ async function generateVideo(articleId, imageSource = 'ai', requestedColorIntens
         showToast('Failed to generate video', 'error');
         if (btn) {
             btn.disabled = false;
-            btn.textContent = 'Generate Video';
+            btn.textContent = 'Generate video';
         }
-    }
-}
-
-async function generateCarousel(articleId, imageSource = 'ai') {
-    showToast('Generating photo carousel - this may take a few minutes', 'info');
-
-    try {
-        const response = await fetch(`${API_BASE}/api/articles/${articleId}/carousel`, {
-            method: 'POST',
-            headers: { 'Content-Type': 'application/json' },
-            body: JSON.stringify({ image_source: imageSource })
-        });
-
-        const data = await response.json();
-
-        if (response.ok) {
-            showToast('Photo carousel generated!', 'success');
-            await fetchArticles();
-            expandedArticles.add(articleId);
-            renderArticles();
-        } else {
-            showToast(data.error || 'Failed to generate carousel', 'error');
-        }
-    } catch (error) {
-        console.error('Error generating carousel:', error);
-        showToast('Failed to generate carousel', 'error');
-    }
-}
-
-function generateOutput(articleId) {
-    const formatSelect = document.querySelector(`[data-format-select="${articleId}"]`);
-    const sourceSelect = document.querySelector(`[data-source-select="${articleId}"]`);
-    const colorIntensitySelect = document.querySelector(
-        `[data-color-intensity-select="${articleId}"]`
-    );
-    const format = formatSelect ? formatSelect.value : 'video';
-    const imageSource = sourceSelect ? sourceSelect.value : 'ai';
-    const colorIntensity = normalizeColorIntensity(
-        colorIntensitySelect ? colorIntensitySelect.value : getColorIntensityPref()
-    );
-    selectedColorIntensityByArticle[articleId] = colorIntensity;
-    if (format === 'carousel') {
-        generateCarousel(articleId, imageSource);
-    } else {
-        generateVideo(articleId, imageSource, colorIntensity);
     }
 }
 
@@ -1410,7 +1100,7 @@ async function deleteArticle(articleId) {
 // QR Code Modal
 // ============================================
 
-function showQrModal(articleId, title, type = 'carousel') {
+function showQrModal(articleId, title) {
     // Remove existing modal
     closeQrModal();
 
@@ -1420,25 +1110,16 @@ function showQrModal(articleId, title, type = 'carousel') {
     modal.onclick = (e) => { if (e.target === modal) closeQrModal(); };
 
     const shortTitle = title.length > 50 ? title.slice(0, 50) + '...' : title;
-    const qrUrl = type === 'video'
-        ? `/api/articles/${articleId}/video/qr`
-        : `/api/articles/${articleId}/carousel/qr`;
-
-    const steps = type === 'video'
-        ? `<div class="qr-step">1️⃣ Scan QR → opens mobile page</div>
+    const qrUrl = `/api/articles/${articleId}/video/qr`;
+    const steps = `<div class="qr-step">1️⃣ Scan QR → opens mobile page</div>
            <div class="qr-step">2️⃣ Tap "Save Video" → saves to Camera Roll</div>
-           <div class="qr-step">3️⃣ Open TikTok → Create → Upload from Camera Roll</div>`
-        : `<div class="qr-step">1️⃣ Scan QR → opens mobile page</div>
-           <div class="qr-step">2️⃣ Long-press each image → "Save to Photos"</div>
-           <div class="qr-step">3️⃣ Open TikTok → Photo Mode → select from Camera Roll</div>`;
-
-    const typeLabel = type === 'video' ? 'Video' : 'Photo Carousel';
+           <div class="qr-step">3️⃣ Open TikTok → Create → Upload from Camera Roll</div>`;
 
     modal.innerHTML = `
         <div class="qr-modal-content">
             <button class="qr-modal-close" onclick="closeQrModal()">&times;</button>
             <div class="qr-modal-icon">📱</div>
-            <h3 class="qr-modal-title">Send ${typeLabel} to Phone</h3>
+            <h3 class="qr-modal-title">Send Video to Phone</h3>
             <p class="qr-modal-subtitle">${shortTitle}</p>
             <div class="qr-modal-code">
                 <img src="${qrUrl}" alt="QR Code" class="qr-img">
@@ -1465,7 +1146,7 @@ function renderVideoActions(article) {
                 &#8599; Post
             </button>
             <a href="/videos/${encodeURIComponent(article.video_path)}"
-               class="btn btn-action btn-carousel-dl" download>
+               class="btn btn-action btn-download" download>
                 Download
             </a>
             <button class="btn btn-action btn-video-qr"
@@ -1480,7 +1161,7 @@ function renderVideoActions(article) {
 function sendVideoToPhone(articleId) {
     const article = articles.find(a => a.id === articleId);
     closeVideoPlayer();
-    showQrModal(articleId, article ? article.title : '', 'video');
+    showQrModal(articleId, article ? article.title : '');
 }
 
 function openVideoPlayer(articleId) {
@@ -2011,14 +1692,13 @@ function updateProgressBanner() {
     const bannerContainer = document.querySelector('.progress-banner-container');
     const banner = document.getElementById('progress-banner');
     const text = document.getElementById('progress-text');
-    const processing = articles.filter(a => ['summarizing', 'generating_video', 'generating_carousel'].includes(a.status));
+    const processing = articles.filter(a => ['summarizing', 'generating_video'].includes(a.status));
 
     if (processing.length > 0) {
         const names = processing.map(a => {
             let label = 'Processing';
             if (a.status === 'summarizing') label = 'Summarizing';
             else if (a.status === 'generating_video') label = 'Generating video for';
-            else if (a.status === 'generating_carousel') label = 'Generating carousel for';
             const short = a.title.length > 40 ? a.title.slice(0, 40) + '...' : a.title;
             return `${label}: ${short}`;
         });
@@ -2282,55 +1962,16 @@ function getStatusBadges(article) {
     if (article.status === 'generating_video') {
         return '<span class="badge badge-processing">Generating Video</span>' + platformBadges;
     }
-    if (article.status === 'generating_carousel') {
-        return '<span class="badge badge-processing">Generating Carousel</span>' + platformBadges;
-    }
     if (article.status === 'summarizing') {
         return '<span class="badge badge-processing">Summarizing</span>' + platformBadges;
     }
     if (article.video_path) {
         return '<span class="badge badge-video">Video Ready</span>' + platformBadges;
     }
-    if (article.carousel_dir) {
-        return '<span class="badge badge-carousel">Carousel Ready</span>' + platformBadges;
-    }
     if (article.tldr) {
         return '<span class="badge badge-summarized">Summarized</span>' + platformBadges;
     }
     return '<span class="badge badge-scraped">Scraped</span>' + platformBadges;
-}
-
-function renderStylePicker(article) {
-    if (!availableStyles.length) return '';
-    const currentStyle = selectedStyleByArticle[article.id] || DEFAULT_VISUAL_STYLE;
-    const suggested = DEFAULT_VISUAL_STYLE;
-
-    return `
-        <div class="summary-section">
-            <div class="summary-label">
-                Visual Style
-                ${article.dominant_emotion ? `<span class="emotion-pill">${escapeHtml(article.dominant_emotion)}</span>` : ''}
-            </div>
-            <div class="style-picker" data-article-id="${article.id}">
-                ${availableStyles.map(s => `
-                    <button
-                        type="button"
-                        class="style-chip ${currentStyle === s.key ? 'selected' : ''}"
-                        data-style-key="${s.key}"
-                        onclick="event.stopPropagation(); selectStyle(${article.id}, '${s.key}')"
-                        title="${escapeHtml(s.description)}${suggested === s.key ? ' (AI suggested)' : ''}"
-                    >
-                        <span class="style-emoji">${s.emoji}</span>
-                        <span class="style-name">${escapeHtml(s.name)}</span>
-                        ${suggested === s.key ? '<span class="style-suggested-dot" title="AI suggested"></span>' : ''}
-                        <span class="style-palette">
-                            ${(s.palette || []).slice(0, 4).map(c => `<i style="background:${c}"></i>`).join('')}
-                        </span>
-                    </button>
-                `).join('')}
-            </div>
-        </div>
-    `;
 }
 
 function renderHookVariants(article) {
@@ -2352,7 +1993,7 @@ function renderHookVariants(article) {
     const bestIndex = Number.isInteger(article.best_hook_index)
         ? article.best_hook_index
         : null;
-    const isProcessing = ['summarizing', 'generating_video', 'generating_carousel']
+    const isProcessing = ['summarizing', 'generating_video']
         .includes(article.status);
     return `
         <div class="summary-section">
@@ -2438,9 +2079,8 @@ function renderSummary(article) {
         </div>
 
         <details class="script-details" ${article.video_path ? '' : 'open'}>
-            <summary>Script, opening hook &amp; visual style</summary>
+            <summary>Script &amp; opening hook</summary>
             ${renderHookVariants(article)}
-            ${renderStylePicker(article)}
             ${article.video_script ? `
                 <div class="summary-section">
                     <div class="summary-label">Video Script</div>
@@ -2448,38 +2088,6 @@ function renderSummary(article) {
                 </div>
             ` : ''}
         </details>
-
-        ${article.carousel_dir ? `
-            <div class="carousel-preview">
-                <div class="carousel-header-row">
-                    <div class="carousel-label">Photo Carousel (${6} slides)</div>
-                    <div class="carousel-actions-row">
-                        <a href="/api/articles/${article.id}/carousel/download" 
-                           class="btn btn-action btn-carousel-dl" download>
-                            📦 Download ZIP
-                        </a>
-                        <button class="btn btn-action btn-carousel-qr" 
-                                onclick="showQrModal(${article.id}, '${escapeHtml(article.title)}')">
-                            📱 Send to Phone
-                        </button>
-                    </div>
-                </div>
-                <div class="carousel-thumbnails">
-                    ${[1, 2, 3, 4, 5, 6].map(i => `
-                        <img src="/carousels/${article.id}/slide_${i}.png" 
-                             alt="Slide ${i}" 
-                             class="carousel-thumb"
-                             loading="lazy"
-                             onclick="window.open(this.src, '_blank')">
-                    `).join('')}
-                </div>
-                ${article.carousel_audio ? `
-                    <audio controls preload="metadata" class="carousel-audio">
-                        <source src="/carousels/${article.id}/${article.carousel_audio}">
-                    </audio>
-                ` : ''}
-            </div>
-        ` : ''}
 
         ${hashtags.length > 0 ? `
             <div class="summary-section hashtags-section">
@@ -2501,10 +2109,9 @@ function renderSummary(article) {
 
 function renderActions(article) {
     const canSummarize = article.status !== 'summarizing';
-    const canGenerate = article.video_script && !['generating_video', 'generating_carousel'].includes(article.status);
-    const isProcessing = ['summarizing', 'generating_video', 'generating_carousel'].includes(article.status);
+    const canGenerate = article.video_script && !['generating_video'].includes(article.status);
+    const isProcessing = ['summarizing', 'generating_video'].includes(article.status);
     const voiceTone = selectedVoiceToneByArticle[article.id] || 'controlled';
-    const colorIntensity = articleColorIntensity(article);
 
     return `
         <div class="article-actions">
@@ -2547,37 +2154,12 @@ function renderActions(article) {
                         data-voice-tone-description="${article.id}"
                     >${escapeHtml(VOICE_TONES[voiceTone].description)}</span>
                 </label>
-                <label class="color-intensity-control article-color-intensity-control">
-                    <span class="color-intensity-label">Color intensity</span>
-                    <select
-                        class="output-format-select color-intensity-select"
-                        data-color-intensity-select="${article.id}"
-                        aria-describedby="color-intensity-help-${article.id}"
-                        onchange="selectColorIntensity(${article.id}, this.value)"
-                        ${!canGenerate || isProcessing ? 'disabled' : ''}
-                    >
-                        ${renderColorIntensityOptions(colorIntensity)}
-                    </select>
-                    <span
-                        class="color-intensity-help"
-                        id="color-intensity-help-${article.id}"
-                    >Vivid is punchy but balanced. Electric is the neon cyan, magenta, and red reference look.</span>
-                </label>
-                <select class="output-format-select" data-format-select="${article.id}" ${!canGenerate || isProcessing ? 'disabled' : ''}>
-                    <option value="video">Classic Video</option>
-                    <option value="carousel">Photo Carousel</option>
-                </select>
-                <select class="output-format-select" data-source-select="${article.id}" ${!canGenerate || isProcessing ? 'disabled' : ''}>
-                    <option value="ai">🤖 AI Images</option>
-                    <option value="mixed">🛰️ Mixed Real + AI</option>
-                    <option value="stock">📷 Stock Photos</option>
-                </select>
                 <button
                     class="btn btn-action btn-success"
-                    onclick="generateOutput(${article.id})"
+                    onclick="generateVideo(${article.id})"
                     ${!canGenerate || isProcessing ? 'disabled' : ''}
                 >
-                    Generate
+                    Generate video
                 </button>
             </div>
 
@@ -2645,13 +2227,6 @@ function updateStats() {
 
     totalCountEl.textContent = newTotal;
     videoCountEl.textContent = newVideo;
-
-    // Update carousel count in header if element exists
-    const carouselCountEl = document.getElementById('carousel-count');
-    if (carouselCountEl) {
-        const carouselCount = articles.filter(a => a.carousel_dir).length;
-        carouselCountEl.textContent = `${carouselCount} carousel${carouselCount !== 1 ? 's' : ''}`;
-    }
 
     if (motionEnhancementsAllowed()) {
         if (prevTotal !== newTotal) {
@@ -2885,9 +2460,6 @@ document.addEventListener('DOMContentLoaded', () => {
     syncHeaderHeight();
     window.addEventListener('resize', syncHeaderHeight);
 
-    syncHookToggle();
-    syncColorIntensityControl();
-    loadStyles();
     loadPublisherStatus();
     loadGenerationBudget();
     fetchDiscoveryCandidates(true).finally(() => scheduleDiscoveryPoll({ reset: true }));
@@ -2926,7 +2498,7 @@ document.addEventListener('DOMContentLoaded', () => {
         if (document.hidden) return;
 
         const hasProcessing = articles.some(a =>
-            ['summarizing', 'generating_video', 'generating_carousel'].includes(a.status)
+            ['summarizing', 'generating_video'].includes(a.status)
         );
         const remotePublishingBusy = articles.some(article =>
             Object.values(normalizedPlatformPosts(article)).some(post => platformPostIsPending(post.status))

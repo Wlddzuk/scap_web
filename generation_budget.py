@@ -17,12 +17,11 @@ import time
 
 import requests
 
-from video_generator import (
-    BASE_VIDEO_ESTIMATED_COST_USD,
-    MAX_VIDEO_CLIPS_PER_VIDEO,
-    MAX_VIDEO_ESTIMATED_COST_USD,
-    VIDEO_CLIP_ESTIMATED_COST_USD,
-)
+from pixel_scenes import estimate_video_cost
+
+# A Pixel Night Lab video is one cheap scene image per scene (10-14 scenes);
+# Moss is animated in code and costs nothing per video.
+TYPICAL_SCENES_PER_VIDEO = 14
 
 
 logger = logging.getLogger(__name__)
@@ -314,19 +313,9 @@ def _console_only_provider(key_name: str, dashboard_url: str) -> dict:
 
 
 def _estimate_payload() -> dict:
-    standard = float(BASE_VIDEO_ESTIMATED_COST_USD)
-    maximum = min(
-        float(MAX_VIDEO_ESTIMATED_COST_USD),
-        standard
-        + float(MAX_VIDEO_CLIPS_PER_VIDEO) * float(VIDEO_CLIP_ESTIMATED_COST_USD),
-    )
     return {
         "currency": "USD",
-        "standard_video_usd": standard,
-        "max_motion_video_usd": maximum,
-        "motion_clip_usd": float(VIDEO_CLIP_ESTIMATED_COST_USD),
-        "max_motion_clips": int(MAX_VIDEO_CLIPS_PER_VIDEO),
-        "hard_cap_usd": float(MAX_VIDEO_ESTIMATED_COST_USD),
+        "standard_video_usd": float(estimate_video_cost(TYPICAL_SCENES_PER_VIDEO)),
         "kind": "estimate",
     }
 
@@ -398,11 +387,6 @@ def _build_payload() -> dict:
         "limiting_balance_usd": limiting_balance,
         "standard_video_affordable": (
             limiting_balance >= estimates["standard_video_usd"]
-            if limiting_balance is not None
-            else None
-        ),
-        "max_motion_video_affordable": (
-            limiting_balance >= estimates["max_motion_video_usd"]
             if limiting_balance is not None
             else None
         ),
