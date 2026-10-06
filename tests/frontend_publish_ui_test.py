@@ -111,7 +111,8 @@ def test_color_intensity_is_a_persisted_vivid_default_for_discovery_videos():
     assert "const COLOR_INTENSITY_STORAGE_KEY = 'clipper_color_intensity';" in APP_JS
     assert "localStorage.setItem(COLOR_INTENSITY_STORAGE_KEY, colorIntensity);" in APP_JS
     assert "syncColorIntensityControl();" in APP_JS
-    assert "body: JSON.stringify({ color_intensity: colorIntensity })" in APP_JS
+    assert "color_intensity: colorIntensity," in APP_JS
+    assert "style: discoveryStyleDraft[candidateId] || null" in APP_JS
 
 
 def test_article_generation_uses_article_or_global_color_intensity():
@@ -131,6 +132,6 @@ def test_color_intensity_assets_share_one_bumped_cache_version():
         INDEX_HTML,
     )
     assert versions == [
-        "20260801-find-articles",
-        "20260801-find-articles",
+        "20260926-watch-player",
+        "20260926-watch-player",
     ]

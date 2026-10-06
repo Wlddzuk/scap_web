@@ -15,7 +15,7 @@ from summarizer import (
 )
 
 
-def _summary(hook, target_words=125):
+def _summary(hook, target_words=115):
     cta_question = "What should researchers test next?"
     filler_source = (
         "Researchers documented the behavior across repeated field observations "
@@ -83,7 +83,7 @@ def test_prompt_uses_curious_energy_without_old_hype_instructions():
     assert "Do not recap the script" in prompt
     assert "SINGLE-FACT MANDATE" in prompt
     assert "CONSEQUENCE-FIRST HOOK" in prompt
-    assert "120-150 words" in prompt
+    assert "100-130 words" in prompt
     assert "12 words or fewer" in prompt
     assert "Curiosity gaps and genuine questions are allowed" in prompt
     assert '"cover_line"' in prompt
@@ -100,6 +100,27 @@ def test_gemini_summarizer_uses_a_non_versioned_model_alias_by_default(monkeypat
 
     monkeypatch.setenv("GEMINI_SUMMARIZER_MODEL", "gemini-3.6-flash")
     assert summarizer._gemini_summarizer_model_name() == "gemini-3.6-flash"
+
+
+def test_follow_invitation_preserves_final_question_and_scene_contract():
+    result = _summary("Orcas coordinate their hunts.")
+    invitation = "Follow for the evidence behind animal behavior."
+    question = result["cta_question"]
+    final_speech = result["scenes"][-1]["speech"]
+    result["scenes"][-1]["speech"] = final_speech.removesuffix(question) + (
+        f"{invitation} {question}"
+    )
+    result["video_script"] = " ".join(
+        scene["speech"] for scene in result["scenes"]
+    )
+
+    parsed = summarizer.parse_response(json.dumps(result))
+
+    assert invitation in parsed["video_script"]
+    assert parsed["video_script"].endswith(question)
+    assert parsed["scenes"][-1]["speech"].endswith(question)
+    assert find_summary_contract_issues(parsed) == []
+    assert find_script_quality_issues(parsed["video_script"]) == []
 
 
 @pytest.mark.parametrize(
@@ -226,12 +247,12 @@ def test_quality_gate_tries_next_provider_after_sloppy_result(monkeypatch):
         calls.append("kimi")
         return sloppy
 
-    def claude(_title, _content):
-        calls.append("claude")
+    def qwen(_title, _content):
+        calls.append("qwen")
         return clean
 
     monkeypatch.setattr(summarizer, "summarize_with_kimi", kimi)
-    monkeypatch.setattr(summarizer, "summarize_with_claude", claude)
+    monkeypatch.setattr(summarizer, "summarize_with_qwen", qwen)
     monkeypatch.setattr(
         summarizer,
         "summarize_with_groq",
@@ -245,11 +266,11 @@ def test_quality_gate_tries_next_provider_after_sloppy_result(monkeypatch):
 
     result = summarizer.summarize_article("Orca research", "Source facts")
 
-    assert calls == ["kimi", "claude"]
+    assert calls == ["kimi", "qwen"]
     assert result is clean
 
 
-@pytest.mark.parametrize("word_count", [119, 151])
+@pytest.mark.parametrize("word_count", [99, 131])
 def test_summary_contract_rejects_scripts_outside_target_duration(word_count):
     result = _summary(
         "This behavior changes how researchers interpret the hunt.",
@@ -259,7 +280,7 @@ def test_summary_contract_rejects_scripts_outside_target_duration(word_count):
     issues = find_summary_contract_issues(result)
 
     assert any(
-        issue.startswith("video_script must contain 120-150 words")
+        issue.startswith("video_script must contain 100-130 words")
         for issue in issues
     )
 
@@ -271,7 +292,7 @@ def test_contract_gate_tries_next_provider_after_short_script(monkeypatch):
     )
     complete = _summary(
         "This behavior changes how researchers interpret the hunt.",
-        target_words=125,
+        target_words=115,
     )
     calls = []
 
@@ -279,12 +300,12 @@ def test_contract_gate_tries_next_provider_after_short_script(monkeypatch):
         calls.append("kimi")
         return short
 
-    def claude(_title, _content):
-        calls.append("claude")
+    def qwen(_title, _content):
+        calls.append("qwen")
         return complete
 
     monkeypatch.setattr(summarizer, "summarize_with_kimi", kimi)
-    monkeypatch.setattr(summarizer, "summarize_with_claude", claude)
+    monkeypatch.setattr(summarizer, "summarize_with_qwen", qwen)
     monkeypatch.setattr(
         summarizer,
         "summarize_with_groq",
@@ -298,14 +319,15 @@ def test_contract_gate_tries_next_provider_after_short_script(monkeypatch):
 
     result = summarizer.summarize_article("Orca research", "Source facts")
 
-    assert calls == ["kimi", "claude"]
+    assert calls == ["kimi", "qwen"]
     assert result is complete
 
 
 @pytest.mark.parametrize(
     "hook_variants",
     [
-        ["Only one hook."],
+        [],
+        ["One.", "Two.", "Three.", "Four."],
         ["First hook.", "   ", "Third hook."],
         ["First hook.", 42, "Third hook."],
         "First hook.",
@@ -317,7 +339,7 @@ def test_summary_contract_requires_three_nonempty_hook_strings(hook_variants):
 
     issues = find_summary_contract_issues(result)
 
-    assert "hook_variants must contain exactly 3 nonempty strings" in issues
+    assert "hook_variants must contain 1-3 nonempty strings" in issues
 
 
 def test_summary_contract_caps_every_hook_for_the_first_three_seconds():
@@ -340,7 +362,7 @@ def test_summary_contract_caps_every_hook_for_the_first_three_seconds():
 def test_every_hook_variant_keeps_the_complete_script_in_target_range():
     result = _summary(
         "This behavior changes how researchers read the hunt.",
-        target_words=120,
+        target_words=104,
     )
     result["hook_variants"] = [
         result["hook_variants"][0],
@@ -351,7 +373,7 @@ def test_every_hook_variant_keeps_the_complete_script_in_target_range():
     issues = find_summary_contract_issues(result)
 
     assert (
-        "every hook variant must keep video_script within 120-150 words"
+        "every hook variant must keep video_script within 100-130 words"
         in issues
     )
 
@@ -434,7 +456,7 @@ def test_quality_gate_blocks_rendering_if_no_provider_clears(monkeypatch):
     )
 
     monkeypatch.setattr(summarizer, "summarize_with_kimi", lambda *_args: noisy)
-    monkeypatch.setattr(summarizer, "summarize_with_claude", lambda *_args: closest)
+    monkeypatch.setattr(summarizer, "summarize_with_qwen", lambda *_args: closest)
     monkeypatch.setattr(
         summarizer,
         "summarize_with_groq",
@@ -588,3 +610,20 @@ def test_substack_quality_gate_tries_the_next_provider(monkeypatch):
     assert len(calls) == 2
     assert "A 2025 Oxford study tracked 74 samples" in result
     assert "Experts agree" not in result
+
+
+def test_parse_drops_unusable_alternate_hooks_but_keeps_the_chosen_one():
+    result = _summary("Orcas coordinate their hunts.")
+    chosen = result["hook_variants"][result["best_hook_index"]]
+    too_long = (
+        "Scientists watching orcas for many years finally noticed something "
+        "very strange about how they hunt"
+    )
+    result["hook_variants"] = [too_long, chosen, "Orcas plan their hunts together."]
+    result["best_hook_index"] = 1
+
+    parsed = summarizer.parse_response(json.dumps(result))
+
+    assert parsed["hook_variants"] == [chosen, "Orcas plan their hunts together."]
+    assert parsed["best_hook_index"] == 0
+    assert find_summary_contract_issues(parsed) == []

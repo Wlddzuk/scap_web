@@ -103,7 +103,9 @@ class DiscoveryRouteTests(unittest.TestCase):
 
         self.assertEqual(response.status_code, 202)
         self.assertTrue(response.get_json()["started"])
-        start.assert_called_once_with(self.app, "0123456789abcdef", "vivid")
+        start.assert_called_once_with(
+            self.app, "0123456789abcdef", "vivid", style=None
+        )
 
     def test_make_video_forwards_selected_color_intensity(self):
         self._save_shortlist()
@@ -123,7 +125,40 @@ class DiscoveryRouteTests(unittest.TestCase):
             self.app,
             "0123456789abcdef",
             "electric",
+            style=None,
         )
+
+    def test_make_video_forwards_selected_style(self):
+        self._save_shortlist()
+        candidate = {"candidate_id": "0123456789abcdef", "title": "Story"}
+        with patch.object(
+            discovery_web,
+            "start_candidate_pipeline",
+            return_value=("started", candidate),
+        ) as start:
+            response = self.client.post(
+                "/api/discovery/candidates/0123456789abcdef/make-video",
+                json={"style": "editorial_collage"},
+            )
+
+        self.assertEqual(response.status_code, 202)
+        start.assert_called_once_with(
+            self.app,
+            "0123456789abcdef",
+            "vivid",
+            style="editorial_collage",
+        )
+
+    def test_make_video_rejects_unknown_style(self):
+        self._save_shortlist()
+        with patch.object(discovery_web, "start_candidate_pipeline") as start:
+            response = self.client.post(
+                "/api/discovery/candidates/0123456789abcdef/make-video",
+                json={"style": "not_a_real_style"},
+            )
+
+        self.assertEqual(response.status_code, 400)
+        start.assert_not_called()
 
     def test_make_video_rejects_unknown_color_intensity(self):
         self._save_shortlist()
@@ -220,12 +255,24 @@ class DiscoveryRouteTests(unittest.TestCase):
 
         discovery_web._update_state(self.app, mark_processing)
 
-        with patch.object(discovery_web, "Thread") as thread_type:
-            self.assertFalse(discovery_web.start_discovery(self.app, trigger="manual"))
+        owner = discovery_web._try_file_lock(self.app, "candidate-0123456789abcdef")
+        try:
+            with patch.object(discovery_web, "Thread") as thread_type:
+                self.assertFalse(discovery_web.start_discovery(self.app, trigger="manual"))
+            self.assertFalse(thread_type.called)
+            state = discovery_web._read_state(self.app)
+            self.assertEqual(state["candidates"][0]["pipeline_status"], "processing")
+        finally:
+            discovery_web._release_file_lock(owner)
 
+    def test_abandoned_candidate_becomes_retryable_without_starting_worker(self):
+        self._save_shortlist()
+        discovery_web._update_state(self.app, lambda state: state["candidates"][0].update(pipeline_status="processing"))
+        with patch.object(discovery_web, "Thread") as thread_type:
+            payload = self.client.get("/api/discovery/candidates").get_json()
+        self.assertEqual(payload["candidates"][0]["pipeline_status"], "failed")
+        self.assertIn("interrupted", payload["candidates"][0]["pipeline_error"])
         self.assertFalse(thread_type.called)
-        state = discovery_web._read_state(self.app)
-        self.assertEqual(state["candidates"][0]["pipeline_status"], "processing")
 
     def test_candidate_queue_rejects_a_stale_shortlist_version(self):
         self._save_shortlist()

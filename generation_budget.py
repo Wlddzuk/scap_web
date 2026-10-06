@@ -278,7 +278,7 @@ def _openrouter_budget() -> dict:
         "key_limit_reset": None,
         "currency": "USD",
         "severity": "unavailable",
-        "dashboard_url": "https://openrouter.ai/activity",
+        "dashboard_url": "https://openrouter.ai/settings/credits",
     }
     _openrouter_credits(result)
     _openrouter_key_usage(result)

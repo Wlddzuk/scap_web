@@ -182,3 +182,29 @@ def test_scene_render_budget_prices_one_premium_fallback_per_unique_scene():
     assert estimated == pytest.approx(
         video_generator.estimate_ai_still_cost(3, 0)
     )
+
+
+def test_image_prompts_drop_requests_for_lettering():
+    concept = (
+        "Lab vials labeled H5N1 being analyzed, grids labeled 'BigGAN 2018', "
+        "a sign reading \"DANGER\", Earth's warning labels on packaging"
+    )
+
+    prompt = visual_styles.apply_style(concept, "illustrated_science")
+
+    for lettering in ("H5N1", "BigGAN", "DANGER", "labeled"):
+        assert lettering not in prompt
+    assert "Lab vials being analyzed" in prompt
+    assert "Earth's warning labels on packaging" in prompt
+
+
+def test_generated_frames_forbid_lettering_for_every_style():
+    scene = {
+        "visual": "a gas giant with an arrow labeled 64 light years",
+        "speech": "It sits 64 light years away.",
+        "evidence_query": "Beta Pictoris b",
+    }
+    for build in (video_generator._schematic_prompt, video_generator._symbolic_prompt):
+        prompt = build(scene, "vivid", "Radio signals from an exoplanet", None)
+        assert "No text, letters, numbers, labels, or captions" in prompt
+        assert "labeled 64" not in prompt

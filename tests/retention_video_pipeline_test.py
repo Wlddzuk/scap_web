@@ -834,7 +834,8 @@ def test_motion_hook_is_split_into_capped_edit_shots():
 
 def test_still_cost_is_floorless_count_math():
     assert video_generator.estimate_ai_still_cost(8, 16) == pytest.approx(
-        (8 * 0.025) + (16 * 0.003)
+        (8 * video_generator.FAL_HOOK_IMAGE_COST_USD)
+        + (16 * video_generator.FAL_IMAGE_COST_USD)
     )
     assert math.isclose(
         video_generator.estimate_ai_still_cost(-2, -3),

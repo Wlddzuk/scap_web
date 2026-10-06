@@ -14,6 +14,7 @@ Usage:
 
 import os
 import re
+from llm_models import GROQ_EXTRA_BODY, GROQ_TEXT_MODEL
 
 
 STYLES = {
@@ -38,6 +39,36 @@ STYLES = {
             "strong silhouette, immediate visual question, clean open annotation space"
         ),
         "good_for": ["science", "education", "discovery", "nature", "space", "health"],
+    },
+    "editorial_collage": {
+        "name": "Editorial Collage",
+        "emoji": "📎",
+        "description": "Layered paper-and-interface cut-outs for credible explainer beats",
+        "palette": ["#f2ede3", "#4f8cff", "#a855f7", "#5eead4"],
+        "base": (
+            "editorial mixed-media paper collage, torn and cut paper layers on warm "
+            "off-white stock, visible newsprint grain and soft drop shadows between "
+            "layers, halftone cut-out photography, simplified arrow and bracket "
+            "shapes, plain bar and line chart forms, folder tabs, ruled and grid "
+            "paper fragments, ink-stamp marks, near-black ink linework, electric "
+            "blue and violet accents with one cyan highlight, one clear central "
+            "subject, layered foreground and background separation, generous "
+            "negative space, measured modern editorial art direction, credible and "
+            "intelligent rather than futuristic, flat 2D artwork, vertical 9:16, "
+            "no glowing holograms, no neon HUD, no sci-fi interface glow, "
+            "no photorealism, no 3D render, no faces, no crowds, no logos, "
+            "no signatures, no watermarks, no legible text, no readable words, "
+            "no lettering, no numbers, no labels"
+        ),
+        "hook_modifier": (
+            "single oversized cut-out subject, torn-paper reveal edge, bold arrow "
+            "driving into frame, exaggerated scale contrast, immediate visual "
+            "question, wide open negative space"
+        ),
+        "good_for": [
+            "technology", "media", "process", "explainer",
+            "business", "science", "productivity",
+        ],
     },
     "manga": {
         "name": "Manga / Anime Panel",
@@ -189,6 +220,9 @@ def list_styles() -> list:
             "emoji": v["emoji"],
             "description": v["description"],
             "palette": v["palette"],
+            # Surfaced so the dashboard can suggest a style for a story without
+            # spending an LLM call before the user has committed to a render.
+            "good_for": v["good_for"],
         }
         for k, v in STYLES.items()
     ]
@@ -199,6 +233,32 @@ def get_style(key: str) -> dict:
     return STYLES.get(key) or STYLES[DEFAULT_STYLE]
 
 
+# Scene descriptions often ask for lettering ("vials labeled H5N1", "grids
+# labeled 'BigGAN 2018'"). Image models then paint misspelled words under the
+# burned-in captions, so the request is removed before any prompt is built.
+_LETTERING_REQUESTS = (
+    re.compile(
+        r"\s*\b(?:labell?ed|captioned|annotated)\b(?:\s+(?:with|as))?"
+        r"(?:\s+(?!(?:being|showing|while|and|in|on|at|next|beside|against|"
+        r"that|which|from|under|over|near|glowing|floating)\b)[^\s,.;]+){1,5}",
+        re.I,
+    ),
+    re.compile(r"\s*\b(?:reading|that says|saying)\s+['\"][^'\"]*['\"]", re.I),
+    re.compile(r"\s*\"[^\"]{1,80}\""),
+    re.compile(r"\s*(?<![A-Za-z])'[^']{1,80}'(?![A-Za-z])"),
+)
+
+
+def strip_lettering_requests(text: str) -> str:
+    """Drop requests for words, labels, or quoted strings from an image idea."""
+    cleaned = str(text or "")
+    for pattern in _LETTERING_REQUESTS:
+        cleaned = pattern.sub("", cleaned)
+    cleaned = re.sub(r"\s+([,.;])", r"\1", cleaned)
+    cleaned = re.sub(r"([,;])(?:\s*[,;])+", r"\1", cleaned)
+    return re.sub(r"\s{2,}", " ", cleaned).strip(" ,;")
+
+
 def apply_style(visual_concept: str, style_key: str, is_hook: bool = False) -> str:
     """Compose a full image prompt from a scene's visual concept + style.
 
@@ -206,7 +266,7 @@ def apply_style(visual_concept: str, style_key: str, is_hook: bool = False) -> s
     The style provides HOW it looks (medium, lighting, aesthetic).
     """
     style = get_style(style_key)
-    concept = (visual_concept or "").strip().rstrip(",.")
+    concept = strip_lettering_requests(visual_concept).rstrip(",.")
     parts = [concept] if concept else []
     if is_hook:
         parts.append(style["hook_modifier"])
@@ -239,7 +299,8 @@ def _legacy_auto_pick_style(title: str, script: str) -> str:
         )
 
         response = client.chat.completions.create(
-            model="llama-3.3-70b-versatile",
+            model=GROQ_TEXT_MODEL,
+            extra_body=GROQ_EXTRA_BODY,
             messages=[
                 {"role": "system", "content": "You pick a visual style for short-form videos. Respond with ONLY one style key from the list. No explanation, no punctuation."},
                 {"role": "user", "content": (

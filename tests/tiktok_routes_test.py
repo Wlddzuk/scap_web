@@ -176,6 +176,26 @@ class TikTokRouteTests(unittest.TestCase):
         self.assertNotIn('youtube-refresh-secret', body)
         self.assertTrue(response.get_json()['platforms']['youtube']['connected'])
 
+    def test_tiktok_expiry_warning_ignores_auto_refreshed_access_token(self):
+        from datetime import datetime, timedelta, timezone
+        now = datetime.now(timezone.utc)
+        with clipper_app.app.app_context():
+            cipher = clipper_app._tiktok_cipher()
+            db.session.add(TikTokAccount(
+                open_id='open-1',
+                access_token_encrypted=cipher.encrypt('access'),
+                refresh_token_encrypted=cipher.encrypt('refresh'),
+                scope='user.info.basic,video.publish',
+                access_token_expires_at=now + timedelta(hours=2),
+                refresh_token_expires_at=now + timedelta(days=300),
+            ))
+            db.session.commit()
+
+        tiktok = self.client.get('/api/publishers/status').get_json()['platforms']['tiktok']
+
+        self.assertFalse(tiktok['expiry_warning'])
+        self.assertEqual(tiktok['days_until_expiry'], 299)
+
     def test_facebook_oauth_stores_encrypted_page_token(self):
         env = {
             'FACEBOOK_APP_ID': 'facebook-app-id',
@@ -1213,6 +1233,93 @@ class TikTokRouteTests(unittest.TestCase):
             True,
         ):
             self.assertFalse(discord_bot._discord_discovery_scheduler_enabled())
+
+    def test_scraper_rejects_private_redirect_before_fetching_it(self):
+        redirect_response = Mock(
+            status_code=302, headers={'Location': 'http://127.0.0.1/private'}
+        )
+        with patch.object(
+            clipper_app.socket, 'getaddrinfo',
+            side_effect=[
+                [(2, 1, 6, '', ('93.184.216.34', 0))],
+                [(2, 1, 6, '', ('127.0.0.1', 0))],
+            ],
+        ), patch.object(
+            clipper_app.requests, 'get', return_value=redirect_response
+        ) as fetch:
+            with self.assertRaisesRegex(ValueError, 'internal networks'):
+                clipper_app.scrape_url_content('https://example.test/article')
+
+        self.assertEqual(fetch.call_count, 1)
+        self.assertFalse(fetch.call_args.kwargs['allow_redirects'])
+        redirect_response.close.assert_called_once()
+
+    def test_scraper_resolves_relative_redirect_and_limits_loops(self):
+        redirect_response = Mock(status_code=302, headers={'Location': '/new'})
+        final_response = Mock(
+            status_code=200,
+            text='<article><h1>Story</h1><p>A science story with enough content.</p></article>',
+        )
+        with patch.object(clipper_app, 'validate_url', side_effect=lambda url: url), patch.object(
+            clipper_app.requests, 'get', side_effect=[redirect_response, final_response]
+        ) as fetch:
+            result = clipper_app.scrape_url_content('https://example.test/old')
+        self.assertEqual(result['title'], 'Story')
+        self.assertEqual(fetch.call_args.args[0], 'https://example.test/new')
+
+        with patch.object(clipper_app, 'validate_url', side_effect=lambda url: url), patch.object(
+            clipper_app.requests, 'get', return_value=redirect_response
+        ) as fetch:
+            with self.assertRaisesRegex(ValueError, 'too many times'):
+                clipper_app.scrape_url_content('https://example.test/old')
+        self.assertEqual(fetch.call_count, 6)
+
+    def test_scraper_decodes_utf8_page_without_header_charset(self):
+        html = (
+            '<html><head><meta charset="utf-8"></head><body><article>'
+            '<h1>NASA’s rover — found it</h1>'
+            '<p>A science story with enough content.</p></article></body></html>'
+        ).encode('utf-8')
+        response = Mock(
+            status_code=200,
+            content=html,
+            headers={'Content-Type': 'text/html'},
+            text=html.decode('latin-1'),
+        )
+        with patch.object(clipper_app, 'validate_url', side_effect=lambda url: url), patch.object(
+            clipper_app.requests, 'get', return_value=response
+        ):
+            result = clipper_app.scrape_url_content('https://example.test/story')
+        self.assertEqual(result['title'], 'NASA’s rover — found it')
+
+    def test_video_rejects_malformed_style_and_hook_without_starting_worker(self):
+        with clipper_app.app.app_context():
+            article = Article(
+                url='https://example.test/invalid-video-options',
+                title='Story', content='Body',
+                video_script='A complete narration.', status='summarized',
+            )
+            db.session.add(article)
+            db.session.commit()
+            article_id = article.id
+
+        invalid_payloads = [
+            {'style': ['illustrated_science']}, {'style': {'key': 'test'}},
+            {'use_video_hook': 'false'}, {'use_video_hook': 1},
+            {'use_video_hook': []},
+        ]
+        with patch.object(clipper_app, 'Thread') as thread_type:
+            for payload in invalid_payloads:
+                with self.subTest(payload=payload):
+                    response = self.client.post(
+                        f'/api/articles/{article_id}/video', json=payload,
+                    )
+                    self.assertEqual(response.status_code, 400)
+            thread_type.assert_not_called()
+        with clipper_app.app.app_context():
+            article = db.session.get(Article, article_id)
+            self.assertEqual(article.status, 'summarized')
+            self.assertIsNone(article.video_generation_token)
 
     def test_video_route_assigns_a_unique_worker_ownership_token(self):
         with clipper_app.app.app_context():

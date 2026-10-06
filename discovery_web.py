@@ -203,7 +203,34 @@ def _read_state_unlocked(flask_app) -> dict[str, Any]:
 
 def _read_state(flask_app) -> dict[str, Any]:
     with _state_file_guard(flask_app):
-        return _read_state_unlocked(flask_app)
+        state = _read_state_unlocked(flask_app)
+        changed = False
+        # A persisted busy flag is not proof that a worker survived a restart.
+        # Live workers hold this lock from queueing through final-state commit.
+        if fcntl is not None:
+            for candidate in state.get("candidates", []):
+                if candidate.get("pipeline_status") not in {"queued", "processing"}:
+                    continue
+                candidate_id = str(candidate.get("candidate_id") or "")
+                if len(candidate_id) != 16 or any(c not in "0123456789abcdef" for c in candidate_id):
+                    continue
+                owner = _try_file_lock(flask_app, f"candidate-{candidate_id}")
+                if owner is None:
+                    continue
+                try:
+                    candidate["pipeline_status"] = "failed"
+                    candidate["failure_stage"] = "pipeline"
+                    candidate["pipeline_error"] = (
+                        "Video job was interrupted. Review the article and retry when ready."
+                    )
+                    candidate["result"] = {"status": "failed", "failure_stage": "pipeline",
+                                           "pipeline_error": candidate["pipeline_error"]}
+                    changed = True
+                finally:
+                    _release_file_lock(owner)
+        if changed:
+            _write_state_unlocked(flask_app, state)
+        return state
 
 
 def _write_state_unlocked(flask_app, state: dict[str, Any]) -> None:
@@ -425,6 +452,7 @@ def _run_candidate_worker(
     candidate_payload: dict[str, Any],
     run_version: int,
     color_intensity: str = "vivid",
+    style: str | None = None,
 ) -> None:
     try:
         def mark_processing(state):
@@ -452,6 +480,7 @@ def _run_candidate_worker(
         result = _process_candidate(
             candidate,
             color_intensity=color_intensity,
+            style=style,
         )
         final_status = str(result.get("status") or "failed")
         public_result = result
@@ -506,6 +535,7 @@ def start_candidate_pipeline(
     flask_app,
     candidate_id: str,
     color_intensity: str = "vivid",
+    style: str | None = None,
 ) -> tuple[str, Optional[dict[str, Any]]]:
     """Queue one shortlist candidate and guard against duplicate video jobs."""
     state = _read_state(flask_app)
@@ -548,6 +578,7 @@ def start_candidate_pipeline(
                 dict(candidate),
                 run_version,
                 color_intensity,
+                style,
             ),
             name=f"clipper-discovery-video-{candidate_id}",
             daemon=True,
@@ -703,11 +734,22 @@ def make_discovery_video_route(candidate_id: str):
         return jsonify({"error": "Unknown color intensity"}), 400
     color_intensity = normalize_color_intensity(raw_color_intensity)
 
+    from visual_styles import STYLES
+
+    raw_style = payload.get("style")
+    if raw_style is None or raw_style == "":
+        style = None  # let the summarizer's own choice stand
+    elif not isinstance(raw_style, str) or raw_style not in STYLES:
+        return jsonify({"error": "Unknown style"}), 400
+    else:
+        style = raw_style
+
     try:
         outcome, candidate = start_candidate_pipeline(
             current_app._get_current_object(),
             candidate_id,
             color_intensity,
+            style=style,
         )
     except Exception:
         return jsonify({"error": "Video creation could not be started"}), 500

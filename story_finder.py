@@ -36,6 +36,7 @@ from video_generator import (
     get_groq_client,
     normalize_color_intensity,
 )
+from llm_models import GROQ_EXTRA_BODY, GROQ_TEXT_MODEL
 
 logger = logging.getLogger(__name__)
 
@@ -577,14 +578,26 @@ def _scoring_prompts(candidates: list[StoryCandidate]) -> tuple[str, str]:
     ]
     performance_feedback = _performance_examples()
     system_prompt = (
-        "You are the story editor for @60s.science2, a Gen-Z science TikTok "
-        "channel. Score every supplied candidate from 0 to 100 using wow-factor, "
-        "visual-ness, broad appeal, curiosity gap, and fit for a compelling "
-        "60-second video. Return strict JSON only with exactly this schema: "
+        "You are the story editor for @60s.science2, a science TikTok channel "
+        "for curious adults. Score every supplied candidate from 0 to 100 for "
+        "a clear, source-backed 60-second explanation: a concrete surprising "
+        "fact, visual evidence or an explainable mechanism, an understandable "
+        "payoff, and fit with recurring space, human-body, or future-tech stories. "
+        "Other topics can score highly when the evidence and explanation are strong. "
+        "Prefer a story that rewards curiosity and gives viewers a reason to "
+        "return for related explanations over a sensational headline. Penalize "
+        "unsupported certainty, speculative applications presented as available, "
+        "and stories whose hook cannot be paid off by the supplied facts. "
+        "Judge only the supplied title and summary; flag missing evidence in "
+        "the reason instead of inventing details. The score is editorial "
+        "priority, not a probability of going viral. "
+        "Return strict JSON only with exactly this schema: "
         '{"scores":[{"id":0,"score":87,"reason":"brief reason"}]}. '
         "The supplied historical examples include only mature posts and are "
         "ranked by age-normalized views per day. Use them as a weak signal, not "
         "a rule; topic novelty and current story quality still matter most. "
+        "Views, engagement, and Reddit votes do not measure follower conversion. "
+        "Do not claim a topic gains followers from these metrics. "
         "Return every id exactly once. Do not add keys or markdown."
     )
     user_prompt = "Score this complete candidate batch:\n" + json.dumps(
@@ -609,7 +622,8 @@ def _groq_scoring_content(system_prompt: str, user_prompt: str) -> str:
         else client
     )
     response = scoring_client.chat.completions.create(
-        model="llama-3.3-70b-versatile",
+        model=GROQ_TEXT_MODEL,
+        extra_body=GROQ_EXTRA_BODY,
         messages=[
             {"role": "system", "content": system_prompt},
             {"role": "user", "content": user_prompt},
@@ -852,6 +866,7 @@ def _pipeline_failure_result(
 def _process_candidate(
     candidate: StoryCandidate,
     color_intensity: str = DEFAULT_COLOR_INTENSITY,
+    style: str | None = None,
 ) -> dict:
     """Run one selected story through the existing persisted video pipeline."""
     color_intensity = normalize_color_intensity(color_intensity)
@@ -921,9 +936,14 @@ def _process_candidate(
             )
             article.hook_index_used = None
             article.dominant_emotion = summary.get("dominant_emotion") or None
-            suggested = summary.get("suggested_style")
-            if suggested and suggested in VISUAL_STYLES:
-                article.style = suggested
+            # An explicit pick from the discovery panel outranks the
+            # summarizer's suggestion — the user chose it for this story.
+            if style and style in VISUAL_STYLES:
+                article.style = style
+            else:
+                suggested = summary.get("suggested_style")
+                if suggested and suggested in VISUAL_STYLES:
+                    article.style = suggested
 
             article.status = "summarized"
             article.summarized_at = datetime.now(timezone.utc)

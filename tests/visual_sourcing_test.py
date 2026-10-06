@@ -439,9 +439,21 @@ def test_documentary_frame_keeps_an_off_centre_archive_subject_visible():
     framed = video_generator._documentary_frame_image(source, 1080, 1920)
 
     assert framed.size == (1080, 1920)
-    # The full source is fitted over the background, so the edge-positioned
-    # evidence survives instead of being removed by a centred 9:16 crop.
+    # The square window follows the detail, so the edge-positioned evidence
+    # survives instead of being removed by a centred crop.
     assert sum(1 for pixel in framed.getdata() if max(pixel) < 40) > 15_000
+
+
+def test_documentary_frame_fills_over_half_the_screen_for_wide_photos():
+    source = Image.new("RGB", (1920, 1080), (40, 90, 160))
+    ImageDraw.Draw(source).ellipse((800, 300, 1120, 780), fill=(250, 200, 60))
+
+    framed = video_generator._documentary_frame_image(source, 1080, 1920)
+
+    # The sharp photo band (the untouched blue) must span > half the height.
+    column = [framed.getpixel((40, y)) for y in range(1920)]
+    photo_rows = sum(1 for pixel in column if pixel == (40, 90, 160))
+    assert photo_rows > 1920 * 0.5
 
 
 def test_documentary_quality_gate_rejects_empty_frames_and_scanned_diagrams():
@@ -531,7 +543,7 @@ def test_provider_metadata_can_verify_subject_when_vision_is_unavailable():
     ) is False
 
 
-def test_authoritative_catalogue_can_override_bad_vision_but_not_pdf():
+def test_pdf_catalogue_entries_are_not_still_visuals():
     museum = real_imagery.ImageCandidate(
         "https://upload.wikimedia.org/thoth.jpg",
         "Wikimedia Commons",
@@ -548,16 +560,40 @@ def test_authoritative_catalogue_can_override_bad_vision_but_not_pdf():
         "Archive",
         "Ancient Egyptian papyrus moon catalogue.pdf",
     )
-    assert real_imagery.authoritative_metadata_can_override_vision(
-        museum,
-        "Thoth ibis",
-    ) is True
-    assert real_imagery.authoritative_metadata_can_override_vision(
-        pdf,
-        "Egyptian papyrus",
-    ) is False
     assert real_imagery.candidate_is_still_visual(museum) is True
     assert real_imagery.candidate_is_still_visual(pdf) is False
+
+
+def test_vision_rejection_is_final_even_for_strong_catalogue_match(monkeypatch):
+    """A NASA typhoon captioned with "Celsius" and "spin" once shipped as a time crystal."""
+    typhoon = real_imagery.ImageCandidate(
+        "https://upload.wikimedia.org/haishen.jpg",
+        "Wikimedia Commons",
+        "https://commons.wikimedia.org/wiki/File:Haishen_2020-09-04_1320Z.jpg",
+        "Public domain",
+        "NASA Earth Observatory",
+        "Typhoon Haishen spin, sea surface 30 degrees Celsius, same time",
+    )
+    monkeypatch.setattr(real_imagery, "_wikimedia_candidates", lambda *_a, **_k: [typhoon])
+    monkeypatch.setattr(real_imagery, "_smithsonian_candidates", lambda *_a, **_k: [])
+    monkeypatch.setattr(real_imagery, "_openverse_candidates", lambda *_a, **_k: [])
+    monkeypatch.setattr(real_imagery, "_request_with_retry", lambda *_a, **_k: object())
+    monkeypatch.setattr(
+        real_imagery,
+        "_image_from_response",
+        lambda *_a, **_k: Image.new("RGB", (64, 64), "white"),
+    )
+
+    result = real_imagery.fetch_referent_image(
+        "Celsius spin",
+        resize_fn=lambda image, *_a: image,
+        target_width=64,
+        target_height=64,
+        verify_fn=lambda *_a: False,
+        subject="Distant time crystals can somehow fall into the same rhythm",
+    )
+
+    assert result is None
 
 
 def test_subject_verification_falls_back_to_openrouter(monkeypatch):

@@ -25,6 +25,7 @@ from urllib.parse import urljoin, urlparse
 
 from PIL import Image
 import requests
+from llm_models import OPENROUTER_PROVIDER_PREFS
 
 
 logger = logging.getLogger(__name__)
@@ -803,22 +804,6 @@ def metadata_subject_matches(candidate: ImageCandidate, referent_query: str) -> 
     return len(overlap) >= required
 
 
-def authoritative_metadata_can_override_vision(
-    candidate: ImageCandidate,
-    referent_query: str,
-) -> bool:
-    """Trust a strong museum/agency catalogue match over a weak vision model."""
-    if candidate.source_name not in {"Wikimedia Commons", "Smithsonian", "NASA"}:
-        return False
-    source_key = candidate.source_url.casefold()
-    subject_key = candidate.subject_text[:240].casefold()
-    if ".pdf" in source_key or ".pdf" in subject_key:
-        return False
-    query_tokens = _subject_tokens(referent_query)
-    overlap = query_tokens & _subject_tokens(candidate.subject_text)
-    return len(query_tokens) >= 2 and len(overlap) >= 2
-
-
 def _subject_verification_prompt(referent_query: str, subject: str = "") -> str:
     """Build the vision check, anchored on the story subject when one is known.
 
@@ -890,7 +875,7 @@ def _verify_subject_gemini(image: Image.Image, referent_query: str, subject: str
 def _openrouter_vision_models() -> list[str]:
     configured = os.getenv(
         "OPENROUTER_VISION_MODELS",
-        "openai/gpt-4o-mini,openrouter/free",
+        "google/gemini-2.5-flash-lite,openrouter/free",
     )
     return [model.strip() for model in configured.split(",") if model.strip()]
 
@@ -931,6 +916,7 @@ def _verify_subject_openrouter(image: Image.Image, referent_query: str, subject:
                 }],
                 "temperature": 0,
                 "max_tokens": 5,
+                "provider": OPENROUTER_PROVIDER_PREFS,
             },
             timeout=20,
         )
@@ -1066,19 +1052,12 @@ def fetch_referent_image(
                 if image is None:
                     continue
                 vision_result = _call_verifier(verify, image, query, subject)
-                # A catalogue match may only rescue a vision rejection when the
-                # story subject itself is in the metadata. Without that clause a
-                # strong NASA match on "fertilizing sperm" overrode vision and
-                # put a Gemini spacecraft schematic into a biology video.
-                metadata_override = (
-                    vision_result is False
-                    and authoritative_metadata_can_override_vision(candidate, query)
-                    and (
-                        not subject
-                        or metadata_subject_matches(candidate, subject)
-                    )
-                )
-                if vision_result is False and not metadata_override:
+                # A vision rejection is final. Catalogue text used to be allowed
+                # to overrule it, and a NASA typhoon photo whose caption shared
+                # the words "Celsius" and "spin" was shipped as a verified image
+                # of a time crystal. Metadata only decides when vision is
+                # unavailable (None); a generated fallback beats a wrong photo.
+                if vision_result is False:
                     logger.info(
                         "[RealImage] Vision rejected %s candidate for %r: %s",
                         candidate.source_name,
@@ -1086,17 +1065,7 @@ def fetch_referent_image(
                         candidate.source_url,
                     )
                     continue
-                if vision_result is True:
-                    method = "vision+metadata"
-                elif metadata_override:
-                    method = "authoritative provider metadata"
-                    logger.info(
-                        "[RealImage] Trusted authoritative catalogue match for %r: %s",
-                        query,
-                        candidate.source_url,
-                    )
-                else:
-                    method = "provider metadata"
+                method = "vision+metadata" if vision_result is True else "provider metadata"
                 return ReferentImage(
                     image=image,
                     source_name=candidate.source_name,

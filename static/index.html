@@ -5,7 +5,7 @@
     <meta charset="UTF-8">
     <meta name="viewport" content="width=device-width, initial-scale=1.0">
     <title>Clipper | Article to Short Video</title>
-    <link rel="stylesheet" href="/static/styles.css?v=20260801-find-articles">
+    <link rel="stylesheet" href="/static/styles.css?v=20260926-watch-player">
     <link
         href="https://fonts.googleapis.com/css2?family=Inter:wght@400;500;600&family=Space+Grotesk:wght@600;700&display=swap"
         rel="stylesheet">
@@ -59,6 +59,20 @@
                             <div id="generation-budget-estimate" class="generation-budget-estimate"></div>
                         </div>
                     </div>
+                    <div class="accounts-menu" id="accounts-menu">
+                        <button
+                            type="button"
+                            class="accounts-trigger"
+                            id="accounts-trigger"
+                            aria-expanded="false"
+                            aria-controls="accounts-panel"
+                            onclick="toggleAccountsMenu(event)"
+                        >
+                            <span class="accounts-trigger-dot" aria-hidden="true"></span>
+                            <span id="accounts-trigger-label">Accounts</span>
+                            <span class="generation-budget-chevron" aria-hidden="true">&#9662;</span>
+                        </button>
+                        <div class="accounts-panel hidden" id="accounts-panel" role="dialog" aria-label="Publishing accounts">
                     <div class="platform-connections" aria-label="Publishing connections">
                         <div class="platform-connection tiktok" id="platform-connection-tiktok">
                             <span class="platform-connection-dot" aria-hidden="true"></span>
@@ -93,6 +107,8 @@
                             <button class="platform-connect-btn" id="platform-connection-facebook-btn" onclick="connectPlatform('facebook')">Connect</button>
                         </div>
                     </div>
+                        </div>
+                    </div>
                 </div>
             </div>
         </header>
@@ -105,7 +121,7 @@
                 <p>Turn any article into a short-form video with AI</p>
                 <form id="url-form" onsubmit="scrapeUrl(event)">
                     <div class="url-input-group">
-                        <input type="url" id="url-input" placeholder="https://example.com/article..." required>
+                        <input type="url" id="url-input" aria-label="Article URL" placeholder="https://example.com/article..." required>
                         <button type="submit" class="btn btn-primary" id="scrape-btn">
                             Scrape
                         </button>
@@ -171,7 +187,7 @@
             <!-- Search Bar (hidden when no articles) -->
             <div class="search-bar hidden" id="search-bar">
                 <span class="search-icon">&#x1F50D;</span>
-                <input type="text" id="search-input" placeholder="Search articles..." oninput="filterArticles()">
+                <input type="text" id="search-input" aria-label="Search articles" placeholder="Search articles..." oninput="filterArticles()">
             </div>
 
             <!-- Section header -->
@@ -221,7 +237,7 @@
     <div class="glow-bg glow-2"></div>
 
     <script src="/static/anime.min.js"></script>
-    <script src="/static/app.js?v=20260801-find-articles"></script>
+    <script src="/static/app.js?v=20260926-watch-player"></script>
 </body>
 
 </html>

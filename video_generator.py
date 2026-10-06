@@ -35,6 +35,8 @@ from PIL import Image, ImageDraw, ImageEnhance, ImageFilter, ImageFont, ImageSta
 import requests
 from dotenv import load_dotenv
 import tts_engine
+from llm_models import GROQ_EXTRA_BODY, GROQ_TEXT_MODEL
+from visual_styles import strip_lettering_requests
 
 load_dotenv()
 
@@ -103,23 +105,35 @@ FAL_VIDEO_TIMEOUT_SECONDS = _bounded_int_env(
 FAL_IMAGE_TIMEOUT_SECONDS = _bounded_int_env(
     "FAL_IMAGE_TIMEOUT_SECONDS", 120, 30, 900
 )
+# Z-Image turbo ($0.005/MP vs schnell's $0.003) won a side-by-side on real
+# scene prompts: clearer subjects than schnell, and unlike FLUX.2 flash (same
+# price) it does not print proper names from the prompt ("Beta Pictoris b",
+# researcher names) as lettering under the burned-in captions.
 FAL_IMAGE_MODEL = (
-    os.getenv("FAL_IMAGE_MODEL", "fal-ai/flux/schnell").strip()
-    or "fal-ai/flux/schnell"
+    os.getenv("FAL_IMAGE_MODEL", "fal-ai/z-image/turbo").strip()
+    or "fal-ai/z-image/turbo"
 )
-FAL_IMAGE_STEPS = _bounded_int_env("FAL_IMAGE_STEPS", 4, 1, 100)
+# The step override only suits FLUX.1 schnell; newer models use their own tuned
+# defaults and may reject or degrade under a forced 4-step run.
+FAL_IMAGE_STEPS = (
+    _bounded_int_env("FAL_IMAGE_STEPS", 4, 1, 100)
+    if "flux/schnell" in FAL_IMAGE_MODEL
+    else None
+)
+# Premium (opening) scenes use the same validated model. fal-ai/flux-2 was
+# tried here and both calls in a live render died waiting for a cold runner.
 FAL_HOOK_IMAGE_MODEL = (
-    os.getenv("FAL_HOOK_IMAGE_MODEL", "fal-ai/flux/dev").strip()
-    or "fal-ai/flux/dev"
+    os.getenv("FAL_HOOK_IMAGE_MODEL", "fal-ai/z-image/turbo").strip()
+    or "fal-ai/z-image/turbo"
 )
-# Official default-model prices checked at implementation time. portrait_16_9
-# is 576x1024 and therefore rounds up to one billed megapixel. Operators using
-# a different model can override each price without falsifying the budget UI.
+# Live FAL prices (2026-09-26) for the default models. portrait_16_9 is
+# 576x1024 and therefore rounds up to one billed megapixel. Operators using a
+# different model can override each price without falsifying the budget UI.
 FAL_IMAGE_COST_USD = _bounded_float_env(
-    "FAL_IMAGE_COST_PER_MP_USD", 0.003, 0.0, 100.0
+    "FAL_IMAGE_COST_PER_MP_USD", 0.005, 0.0, 100.0
 )
 FAL_HOOK_IMAGE_COST_USD = _bounded_float_env(
-    "FAL_HOOK_IMAGE_COST_PER_MP_USD", 0.025, 0.0, 100.0
+    "FAL_HOOK_IMAGE_COST_PER_MP_USD", 0.005, 0.0, 100.0
 )
 try:
     VIDEO_CLIP_ESTIMATED_COST_USD = max(
@@ -196,6 +210,8 @@ SHOT_TYPES = (
     "detail with scale contrast",
 )
 SHOT_MOTIONS = ("push", "pan-left", "pan-right", "pull")
+# A 4.5% move over 2.5s is below what a phone viewer perceives as motion.
+BODY_SHOT_ZOOM = 0.10
 
 # Color is graded once per still before MoviePy starts animating it. This keeps
 # the look deterministic across AI, stock, hero, and NASA imagery without
@@ -414,7 +430,7 @@ def generate_image_fal(
     enhanced_prompt = (
         f"{prompt}, clear high-contrast focal hierarchy, faithful to the requested "
         f"medium and palette, clean composition, vertical 9:16, professional quality, "
-        f"no text no words"
+        f"no text, no letters, no numbers, no labels, no captions"
     )
 
     selected_model = model or FAL_IMAGE_MODEL
@@ -687,7 +703,8 @@ def _extract_search_keywords(title: str, script: str) -> list:
 
     try:
         response = client.chat.completions.create(
-            model="llama-3.3-70b-versatile",
+            model=GROQ_TEXT_MODEL,
+            extra_body=GROQ_EXTRA_BODY,
             messages=[
                 {
                     "role": "system",
@@ -1561,13 +1578,14 @@ def select_style_with_groq(title: str, script: str) -> str:
     try:
         logger.info("[Style] Selecting style...")
         response = client.chat.completions.create(
-            model="llama-3.3-70b-versatile",
+            model=GROQ_TEXT_MODEL,
+            extra_body=GROQ_EXTRA_BODY,
             messages=[
                 {"role": "system", "content": "Select BRIGHT, VIBRANT styles. Respond with only keywords."},
                 {"role": "user", "content": f"Pick style for:\nTITLE: {title}\nCONTENT: {script[:2000]}\n\n{TIKTOK_STYLES}\n\nRespond with ONLY the style keywords."}
             ],
             temperature=0.5,
-            max_tokens=100
+            max_tokens=600
         )
         style = response.choices[0].message.content.strip().strip('"\'')
         if "bright" not in style.lower() and "vibrant" not in style.lower():
@@ -1590,7 +1608,8 @@ def extract_story_subjects(title: str, script: str) -> dict:
     try:
         logger.info("[Subjects] Extracting subjects...")
         response = client.chat.completions.create(
-            model="llama-3.3-70b-versatile",
+            model=GROQ_TEXT_MODEL,
+            extra_body=GROQ_EXTRA_BODY,
             messages=[
                 {"role": "system", "content": "Extract visual subjects. Respond only with valid JSON."},
                 {"role": "user", "content": f'Analyze:\nTITLE: {title}\nCONTENT: {script[:3000]}\n\nRespond with JSON: {{"main_subject": "3-5 words", "visual_keywords": ["5 items"], "setting": "location"}}'}
@@ -1624,7 +1643,8 @@ def generate_image_prompts(title: str, script: str, num_prompts: int, style: str
     try:
         logger.info("[Prompts] Generating prompts...")
         response = client.chat.completions.create(
-            model="llama-3.3-70b-versatile",
+            model=GROQ_TEXT_MODEL,
+            extra_body=GROQ_EXTRA_BODY,
             messages=[
                 {"role": "system", "content": f"Generate prompts for '{main_subject}'. Include keywords: {keywords_str}. JSON array only."},
                 {"role": "user", "content": f"Generate {num_prompts} image prompts.\nTITLE: {title}\nSETTING: {setting}\nSTYLE: {style}\nSCRIPT: {script[:4000]}\n\nRules: 15-30 words each, vertical 9:16, NO text in images.\nRespond with JSON array: [\"prompt1\", \"prompt2\", ...]"}
@@ -1767,6 +1787,7 @@ def generate_scene_images(
             color_intensity=color_intensity,
             visual_sources_out=visual_sources_out,
             hero_image=hero_image,
+            style_key=style_key,
         )
 
     if image_source == "stock":
@@ -1969,33 +1990,96 @@ def _credit_photo(image: Image.Image, source) -> Image.Image:
     return result
 
 
+def _style_look(style_key: str | None, fallback: str) -> str:
+    """Return the LOOK half of a generated-frame prompt.
+
+    The referent lane owns WHAT is on screen — that stays fact-driven. Only the
+    medium/palette half is negotiable, so a visual-style preset can replace it.
+    Without an explicit non-default style the original illustrated-science
+    wording is reused verbatim; the surrounding prompt reorders its sentences
+    (subject guard now precedes the look) but adds and drops nothing.
+    """
+    if not style_key:
+        return fallback
+    try:
+        from visual_styles import DEFAULT_STYLE, STYLES, apply_style
+    except Exception:  # visual_styles is optional at import time
+        return fallback
+    if style_key == DEFAULT_STYLE or style_key not in STYLES:
+        return fallback
+    return apply_style("", style_key)
+
+
+def _style_opener(style_key: str | None, fallback: str, article_title: str) -> str:
+    """Opening clause of a generated-frame prompt.
+
+    The default wording names a medium ("editorial science illustration"), which
+    would argue with any other preset, so a non-default style gets a
+    medium-neutral opener and states its own medium in the look half.
+    """
+    # The title is deliberately absent: models with strong typography (FLUX.2)
+    # printed it as a magazine headline across the frame.
+    if _style_look(style_key, "") == "":
+        return fallback
+    return "Wordless premium image with no lettering of any kind."
+
+
+# Kept out of _style_look: these are factual-accuracy guards, not aesthetics, so
+# they survive every style preset.
+_GENERATED_SUBJECT_GUARD = (
+    "Show a recognizable focal subject, not an empty composition or a lone "
+    "abstract shape. No unrelated animals, gods, or objects. No text, letters, "
+    "numbers, labels, or captions anywhere in the image."
+)
+
+_SCHEMATIC_DEFAULT_LOOK = (
+    "Warm off-white field, cobalt blue shapes, restrained yellow highlight and "
+    "red only for emphasis, simple geometric silhouettes, intentionally "
+    "illustrated, vertical 9:16. No photorealism, no human hands, no faces, no "
+    "crowds, no signatures, no watermarks, no words, no letters, no labels, no "
+    "cutaway, no cross-section, no microscopy, no measurement scale."
+)
+
+
 def _schematic_prompt(
     scene: dict,
     color_intensity: str,
     article_title: str = "",
+    style_key: str | None = None,
 ) -> str:
-    visual = str(scene.get("visual") or scene.get("speech") or "science concept")
+    visual = strip_lettering_requests(
+        str(scene.get("visual") or scene.get("speech") or "science concept")
+    )
     evidence_query = str(scene.get("evidence_query") or "").strip()
+    opener = _style_opener(
+        style_key,
+        "Wordless premium flat science illustration with no lettering of any kind.",
+        article_title,
+    )
     return (
-        f"Premium flat editorial science illustration for the story '{article_title}'. "
-        f"The exact discovery or evidence to keep central is '{evidence_query}'. "
+        f"{opener} "
+        f"The exact discovery or evidence to keep central is {evidence_query}. "
         f"Clearly communicate {visual}. Show the discovered thing or measured effect, "
         "not merely the city, institution, building, or broad setting where it happened. "
-        "Warm off-white field, cobalt blue "
-        "shapes, restrained yellow highlight and red only for emphasis, simple geometric "
-        "silhouettes, intentionally illustrated, vertical 9:16. Show a recognizable focal "
-        "subject, not an empty composition or a lone abstract shape. No unrelated animals, "
-        "gods, or objects. No photorealism, no human "
-        "hands, no faces, no crowds, no signatures, no watermarks, no words, no letters, "
-        "no labels, no cutaway, no cross-section, no microscopy, no measurement scale. "
+        f"{_GENERATED_SUBJECT_GUARD} "
+        f"{_style_look(style_key, _SCHEMATIC_DEFAULT_LOOK)} "
         f"{color_intensity_prompt_guidance(color_intensity)}"
     )
+
+
+_SYMBOLIC_DEFAULT_LOOK = (
+    "Warm off-white field, cobalt blue and restrained yellow, clean editorial "
+    "collage, intentionally illustrated, vertical 9:16. No photorealism, no "
+    "human hands, no human faces, no crowds, no signatures, no watermarks, no "
+    "words, no letters, no labels."
+)
 
 
 def _symbolic_prompt(
     scene: dict,
     color_intensity: str,
     article_title: str = "",
+    style_key: str | None = None,
 ) -> str:
     """Prompt for scenes that must not depict structure.
 
@@ -2006,24 +2090,31 @@ def _symbolic_prompt(
     instead, so the frame carries the narration without asserting a fact.
     """
     narration = str(scene.get("speech") or "discovery")
-    visual_reference = str(scene.get("visual") or narration)
+    visual_reference = strip_lettering_requests(str(scene.get("visual") or narration))
     evidence_query = str(scene.get("evidence_query") or "").strip()
+    opener = _style_opener(
+        style_key,
+        "Wordless premium science illustration with no lettering of any kind.",
+        article_title,
+    )
     return (
-        f"Premium editorial science illustration for the story '{article_title}'. "
-        f"The narration is: {narration}. Use this only as safe visual inspiration: "
+        f"{opener} "
+        # Narration leans on pronouns ("Both animals glow..."); the title is
+        # what tells the model which subject they mean.
+        f"Story subject: {article_title}. "
+        f"The idea being narrated: {narration} Use this only as safe visual inspiration: "
         f"{visual_reference}. The exact discovery or evidence to keep central is "
-        f"'{evidence_query}'. Show that finding, result, specimen, or mechanism rather "
+        f"{evidence_query}. Show that finding, result, specimen, or mechanism rather "
         "than merely the city, institution, building, or broad setting. Show a clear, "
         "recognizable focal subject explicitly named "
         "in the story or scene, using lighting, pose, scale, or environment to communicate "
         "the idea. Never substitute an unrelated animal, deity, organ, machine, or object. "
         "Do not output an empty composition, decorative-only geometry, or one lone abstract "
-        "shape. Warm off-white field, cobalt blue and restrained yellow, clean editorial "
-        "collage, intentionally illustrated, vertical 9:16. Symbolic and atmospheric only; "
-        "do not assert hidden structure. No technical diagram, no anatomy, no cutaway, no "
-        "cross-section, no microscopy, no measurement scale, no photorealism, no human "
-        "hands, no human faces, no crowds, no signatures, no watermarks, no words, no "
-        "letters, no labels. "
+        "shape. Symbolic and atmospheric only; do not assert hidden structure. No technical "
+        "diagram, no anatomy, no cutaway, no cross-section, no microscopy, no measurement "
+        "scale. "
+        f"{_GENERATED_SUBJECT_GUARD} "
+        f"{_style_look(style_key, _SYMBOLIC_DEFAULT_LOOK)} "
         f"{color_intensity_prompt_guidance(color_intensity)}"
     )
 
@@ -2035,29 +2126,24 @@ def _documentary_photo_variant(
 ) -> Image.Image:
     """Create a distinct editorial crop without inventing visual evidence."""
     source = resize_and_crop_image(image.convert("RGB"), VIDEO_WIDTH, VIDEO_HEIGHT)
-    shot_type = str((shot or {}).get("_shot_type") or "").casefold()
-    if "macro" in shot_type:
-        scale = 1.18
-    elif "close" in shot_type:
-        scale = 1.12
-    elif "wide" in shot_type:
-        scale = 1.035
-    else:
-        scale = 1.075 + (0.015 * (variant_index % 3))
+    # Consecutive shots of one image must read as different shots. The old
+    # 3.5-18% crops were invisible, so a 10s scene looked like one frozen still
+    # and viewers swiped. Alternate full frame, tight detail, and medium. The
+    # detail stays at 1.3x because FLUX stills are already upscaled ~1.9x.
+    framings = (
+        (1.0, (0.50, 0.50)),
+        (1.3, (0.62, 0.40)),
+        (1.15, (0.30, 0.62)),
+        (1.3, (0.38, 0.30)),
+        (1.15, (0.70, 0.66)),
+    )
+    scale, (anchor_x, anchor_y) = framings[variant_index % len(framings)]
 
     width = max(VIDEO_WIDTH, int(round(VIDEO_WIDTH * scale)))
     height = max(VIDEO_HEIGHT, int(round(VIDEO_HEIGHT * scale)))
     enlarged = source.resize((width, height), Image.Resampling.LANCZOS)
     max_x = max(0, width - VIDEO_WIDTH)
     max_y = max(0, height - VIDEO_HEIGHT)
-    anchors = (
-        (0.50, 0.42),
-        (0.18, 0.30),
-        (0.82, 0.34),
-        (0.30, 0.72),
-        (0.70, 0.68),
-    )
-    anchor_x, anchor_y = anchors[variant_index % len(anchors)]
     left = int(round(max_x * anchor_x))
     top = int(round(max_y * anchor_y))
     edited = enlarged.crop((left, top, left + VIDEO_WIDTH, top + VIDEO_HEIGHT))
@@ -2074,6 +2160,38 @@ def _documentary_photo_variant(
     return Image.alpha_composite(rgba, overlay).convert("RGB")
 
 
+def _salient_square_crop(source: Image.Image) -> Image.Image:
+    """Crop a wide photo to the square window holding the most detail.
+
+    A 16:9 photo fitted to a 9:16 frame fills only a third of the screen and
+    reads as letterboxing. A square keeps over half the photo and fills over
+    half the screen; choosing it by edge density rather than the centre keeps
+    an off-centre subject in frame.
+    """
+    width, height = source.size
+    side = min(width, height)
+    if width <= side:
+        return source
+    scale = 8
+    small = source.convert("L").resize(
+        (max(1, width // scale), max(1, height // scale)),
+        Image.Resampling.BILINEAR,
+    )
+    columns = np.asarray(
+        small.filter(ImageFilter.FIND_EDGES), dtype=np.float32
+    ).sum(axis=0)
+    columns[[0, -1]] = 0.0  # filter artefacts at the image border
+    window = max(1, side // scale)
+    if window >= len(columns):
+        return source
+    sums = np.convolve(columns, np.ones(window, dtype=np.float32), mode="valid")
+    # Prefer the centre when detail is evenly spread.
+    offsets = np.abs(np.arange(len(sums)) - (len(sums) - 1) / 2.0)
+    sums = sums * (1.0 - 0.15 * offsets / max(1.0, offsets.max()))
+    left = min(max(0, int(np.argmax(sums)) * scale), width - side)
+    return source.crop((left, 0, left + side, height))
+
+
 def _documentary_frame_image(
     image: Image.Image,
     target_width: int,
@@ -2084,8 +2202,8 @@ def _documentary_frame_image(
     Archive and museum photographs are commonly landscape, square, or place
     the subject away from the centre. A destructive 9:16 crop can therefore
     turn a valid source into an apparently empty frame. Close-to-vertical
-    sources remain full bleed; other aspect ratios are shown intact over a
-    restrained, blurred extension of the same photograph.
+    sources remain full bleed; wide sources are cut to their most detailed
+    square and shown over a restrained, blurred extension of the photograph.
     """
     source = image.convert("RGB")
     source_ratio = source.width / max(1, source.height)
@@ -2106,9 +2224,18 @@ def _documentary_frame_image(
     background = ImageEnhance.Brightness(background).enhance(0.66)
     background = ImageEnhance.Color(background).enhance(0.82)
 
-    foreground = source.copy()
-    foreground.thumbnail(
-        (target_width, int(round(target_height * 0.9))),
+    foreground = _salient_square_crop(source)
+    # thumbnail() never enlarges, which left small archive photos as a strip
+    # in the middle of the frame. Fit to the frame in both directions.
+    fit = min(
+        target_width / max(1, foreground.width),
+        (target_height * 0.9) / max(1, foreground.height),
+    )
+    foreground = foreground.resize(
+        (
+            max(1, int(round(foreground.width * fit))),
+            max(1, int(round(foreground.height * fit))),
+        ),
         Image.Resampling.LANCZOS,
     )
     x = (target_width - foreground.width) // 2
@@ -2174,6 +2301,13 @@ _DOCUMENTARY_QUERY_STOPWORDS = frozenset({
     "ancient", "artwork", "close", "diagram", "egyptian", "for", "full", "image",
     "launch", "manuscript", "moon", "night", "photo", "photograph", "relief",
     "scene", "sky", "space", "temple", "the", "this", "view", "which", "wide",
+})
+
+# Capitalised units are not subjects. "minus 270 degrees Celsius" made
+# "Celsius" the search anchor, and "Celsius spin" found a typhoon.
+_UNIT_PROPER_NOUNS = frozenset({
+    "celsius", "fahrenheit", "kelvin", "newton", "newtons", "joule", "joules",
+    "watt", "watts", "volt", "volts", "hertz", "pascal", "tesla", "gauss",
 })
 
 _WEAK_EVIDENCE_TERMS = frozenset({
@@ -2272,7 +2406,11 @@ def _documentary_proper_terms(*parts: str) -> list[str]:
             tokens = re.findall(r"[A-Za-z][A-Za-z0-9-]+", sentence)
             for position, token in enumerate(tokens):
                 clean = token.strip("-")
-                if len(clean) < 3 or clean.casefold() in _DOCUMENTARY_QUERY_STOPWORDS:
+                if (
+                    len(clean) < 3
+                    or clean.casefold() in _DOCUMENTARY_QUERY_STOPWORDS
+                    or clean.casefold() in _UNIT_PROPER_NOUNS
+                ):
                     continue
                 if not (clean.isupper() or clean[:1].isupper()):
                     continue
@@ -2481,6 +2619,7 @@ def generate_referent_scene_images(
     visual_sources_out: list | None = None,
     article_title: str = "",
     hero_image: str | None = None,
+    style_key: str | None = None,
 ) -> list:
     """Build a documentary edit from relevant real images, never placeholders."""
     from real_imagery import fetch_hero_image, fetch_referent_image, _verify_subject
@@ -2747,9 +2886,9 @@ def generate_referent_scene_images(
 
     if generated_indexes:
         generated = _parallel_image_gen([
-            _schematic_prompt(scenes[index], color_intensity, article_title)
+            _schematic_prompt(scenes[index], color_intensity, article_title, style_key)
             if route_scene(scenes[index]) == SCHEMATIC
-            else _symbolic_prompt(scenes[index], color_intensity, article_title)
+            else _symbolic_prompt(scenes[index], color_intensity, article_title, style_key)
             for index in generated_indexes
         ], premium_flags=[True] * len(generated_indexes))
         for index, image in zip(generated_indexes, generated):
@@ -3245,6 +3384,35 @@ def build_scene_shot_plan(scenes: list, total_time: float) -> list:
     return plan
 
 
+def split_plan_at_hook(plan: list, hook_len: float) -> list:
+    """Return the part of a shot plan that plays after the hook, with its slots.
+
+    The picture track is planned across the FULL narration so every shot lines
+    up with the words that sized it. The hook then covers ``[0, hook_len)``, so
+    the body must resume with whichever shot is on screen at ``hook_len``,
+    trimmed to the time it has left. Planning the body across
+    ``audio_duration - hook_len`` instead is what made every image start
+    ``hook_len * (1 - f)`` seconds after its own narration.
+
+    Returns ``(slot, shot)`` pairs. ``slot`` is the index into the full plan, so
+    callers can still look the shot's image up in a list built from that plan.
+    """
+    remaining = []
+    elapsed = 0.0
+    for slot, shot in enumerate(plan):
+        duration = float(shot["_duration"])
+        end = elapsed + duration
+        if end > hook_len + 1e-9:
+            trimmed = dict(shot)
+            trimmed["_duration"] = min(duration, end - hook_len)
+            remaining.append((slot, trimmed))
+        elapsed = end
+    if not remaining and plan:
+        # A hook longer than the whole plan should still leave one shot to hold.
+        remaining = [(len(plan) - 1, dict(plan[-1]))]
+    return remaining
+
+
 def build_legacy_shot_plan(chunks: list, total_time: float) -> list:
     """Apply the same shot cap to pre-scene legacy scripts."""
     plan = []
@@ -3375,13 +3543,16 @@ def generate_video(
             logger.info("[Captions] Created %d caption groups", len(caption_groups))
 
         hook_len = min(HOOK_DURATION, max(2.0, audio_duration * 0.25))
-        remaining = max(0.1, audio_duration - hook_len)
+        # Plan the picture track across the whole narration so shot N lines up
+        # with the words that sized it, then hand the hook window back.
         chunks = []
         if use_scenes:
-            body_shots = build_scene_shot_plan(scenes, remaining)
+            full_shots = build_scene_shot_plan(scenes, audio_duration)
         else:
             chunks = chunk_text(script)
-            body_shots = build_legacy_shot_plan(chunks, remaining)
+            full_shots = build_legacy_shot_plan(chunks, audio_duration)
+        body_slots = split_plan_at_hook(full_shots, hook_len)
+        body_shots = [shot for _, shot in body_slots]
         longest_body_shot = max(
             (float(shot["_duration"]) for shot in body_shots),
             default=0.0,
@@ -3392,7 +3563,9 @@ def generate_video(
             longest_body_shot,
         )
         planned_still_cost = estimate_planned_still_cost(
-            body_shots,
+            # Images are generated from the full plan, including the shots the
+            # hook covers, so the estimate has to be based on the same list.
+            full_shots,
             use_scenes=use_scenes,
             image_source=image_source,
             style_key=style_key,
@@ -3439,16 +3612,17 @@ def generate_video(
         if use_scenes:
             logger.info("Step 4: Building documentary image edit...")
             themed_images = generate_referent_scene_images(
-                body_shots,
+                full_shots,
                 color_intensity=color_intensity,
                 visual_sources_out=visual_sources_out,
                 article_title=title,
                 hero_image=hero_image,
+                style_key=style_key,
             )
         elif image_source == "mixed":
             logger.info("Step 4: Generating legacy mixed-source shot images...")
             themed_images = generate_scene_images(
-                body_shots,
+                full_shots,
                 style_key,
                 image_source=image_source,
                 series_lane=series_lane,
@@ -3464,11 +3638,6 @@ def generate_video(
                 image_source=image_source,
                 color_intensity=color_intensity,
             )
-        themed_images = apply_color_intensity_to_images(
-            themed_images,
-            color_intensity,
-        )
-
         # Step 5: Hook clips (AI video hook or rapid-fire image sequence)
         logger.info("Step 5: Creating hook sequence...")
         opening_visual = scenes[0].get("visual") if use_scenes else None
@@ -3477,7 +3646,7 @@ def generate_video(
         if use_scenes and themed_images:
             seen_scenes = set()
             seen_sources = set()
-            for slot, shot in enumerate(body_shots):
+            for slot, shot in enumerate(full_shots):
                 if slot >= len(themed_images):
                     break
                 scene_index = int(shot.get("_scene_index", slot))
@@ -3523,6 +3692,12 @@ def generate_video(
 
         # Step 6: Body clips
         logger.info("Step 6: Creating body clips...")
+        # The hook grades its own inputs. Keep those inputs ungraded so its
+        # palette matches the body instead of doubling saturation/contrast.
+        themed_images = apply_color_intensity_to_images(
+            themed_images,
+            color_intensity,
+        )
 
         if use_scenes:
             durations = [float(shot["_duration"]) for shot in body_shots]
@@ -3542,28 +3717,30 @@ def generate_video(
                     remaining_motion_slots,
                     color_intensity=color_intensity,
                 )
-            for i, shot in enumerate(body_shots):
-                img = themed_images[i] if i < len(themed_images) else themed_images[-1]
+            for i, (slot, shot) in enumerate(body_slots):
+                # `slot` indexes the full plan that themed_images was built from;
+                # `i` is this clip's position in the body.
+                img = themed_images[slot] if slot < len(themed_images) else themed_images[-1]
                 dur = durations[i] if i < len(durations) else DEFAULT_CHUNK_DURATION
                 clips.append(
                     body_motion_clips.get(i)
                     or create_clip(
                         img,
                         dur,
-                        zoom_factor=0.045,
-                        motion=SHOT_MOTIONS[i % len(SHOT_MOTIONS)],
+                        zoom_factor=BODY_SHOT_ZOOM,
+                        motion=SHOT_MOTIONS[slot % len(SHOT_MOTIONS)],
                     )
                 )
         else:
-            for i, shot in enumerate(body_shots):
-                img = themed_images[i % len(themed_images)]
+            for slot, shot in body_slots:
+                img = themed_images[slot % len(themed_images)]
                 dur = float(shot["_duration"])
                 clips.append(
                     create_clip(
                         img,
                         dur,
-                        zoom_factor=0.045,
-                        motion=SHOT_MOTIONS[i % len(SHOT_MOTIONS)],
+                        zoom_factor=BODY_SHOT_ZOOM,
+                        motion=SHOT_MOTIONS[slot % len(SHOT_MOTIONS)],
                     )
                 )
 
@@ -3645,7 +3822,10 @@ def generate_video(
             audio_bitrate="128k",
             threads=4,
             preset="veryfast",
-            ffmpeg_params=["-crf", str(crf), "-pix_fmt", "yuv420p"],
+            ffmpeg_params=[
+                "-crf", str(crf), "-pix_fmt", "yuv420p",
+                "-movflags", "+faststart",
+            ],
             verbose=False,
             logger=None
         )

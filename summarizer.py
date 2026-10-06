@@ -1,6 +1,6 @@
-"""AI Summarization: Kimi K2 → Claude Sonnet 5 → Groq Llama 3.3 → Gemini Flash.
+"""AI Summarization: Kimi K2 → Qwen Flash → Groq Llama 3.3 → Gemini Flash.
 
-Kimi and Claude both route through OpenRouter (one API key covers both). Groq uses
+Kimi and Qwen both route through OpenRouter (one API key covers both). Groq uses
 its own API for sub-second first-token latency. Gemini is the budget floor.
 
 Produces a STORY-shaped short-form video script with:
@@ -18,6 +18,7 @@ import re
 import requests
 from dotenv import load_dotenv
 from visual_styles import DEFAULT_STYLE
+from llm_models import GROQ_EXTRA_BODY, GROQ_TEXT_MODEL, OPENROUTER_PROVIDER_PREFS
 
 load_dotenv()
 
@@ -34,20 +35,24 @@ everything worth knowing. Supporting details may appear only when they clarify,
 escalate, or pay off the central fact. If a detail starts a second story, cut it.
 
 Shape that one fact as:
-1. CONSEQUENCE-FIRST HOOK (1 complete sentence, under 3 seconds) - Lead with what the fact means, changes, threatens, or makes possible, not merely what happened. "This planet just changed the search for life" is stronger than "Astronomers detected an atmosphere on K2-18b." The hook must make sense immediately and remain scene 1.
+1. CONSEQUENCE-FIRST HOOK (1 short complete sentence) - Lead with a concrete, source-backed consequence or surprising observation. Name the subject and what it does: "This moon sprays its ocean into space" is clearer than "This changes the search for life." Use that example only when the source supports it. Avoid vague "this discovery changes everything" promises. The hook must make sense immediately and remain scene 1.
 2. SETUP - Give only the context needed to picture and understand the central fact.
 3. ESCALATION - Add the strongest source-backed evidence that raises the stakes or sharpens the picture.
 4. TURN - Reveal the mechanism, contradiction, or detail that changes how the viewer understands the fact.
 5. PAYOFF - Deliver the concrete consequence promised by the hook. Any curiosity gap must be fully paid off before the CTA.
-6. CTA QUESTION - End with one specific, answerable question tied to this story. This exact question is the final spoken line.
+6. FOLLOW REASON - After delivering the payoff, include one brief invitation of at most 10 words to follow for a specific kind of explanation in this story's series lane. For example, "Follow for the evidence behind space discoveries." Adapt the topic to the story. Offer a repeatable editorial benefit, never an invented sequel, posting schedule, or withheld answer.
+7. CTA QUESTION - End with one specific, answerable question tied to this story. This exact question is the final spoken line. Keep both closing lines brief so they do not crowd out the explanation.
 
 === WRITING RULES ===
-- TARGET: video_script must be 120-150 words, including the final CTA question. Keep the finished video in the 45-60 second range. Do not compress it into a 20-30 second script.
+- TARGET: video_script must be 100-130 words, including the follow invitation and final CTA question. Keep the finished video in the 40-55 second range. Do not compress it into a 20-30 second script.
+- PLAIN LANGUAGE: write for a curious 14-year-old with no science background. Use at most two technical terms in the whole script, and explain each one in everyday words in the same sentence. Scene 1 must contain no technical term at all. When a mechanism is hard to picture, give one concrete everyday comparison that the article's facts support, such as metronomes on one table falling into step.
 - Use concrete specifics: real names, measured numbers, places, actions, and consequences.
 - Use second person only when the story directly affects the viewer. Never force "you" or "your".
 - Write complete spoken sentences with varied rhythm. One brief sentence can add emphasis, but never stack fragments or one-word lines.
 - Prefer active voice and everyday words. Remove throat-clearing, filler, and abstract business language.
 - Every claim must be supported by the supplied article. Never heighten a fact beyond the source.
+- Preserve limitations that change the meaning: distinguish a simulation from an observation, an animal study from human evidence, and a correlation from a cause. Do not turn a proposed application into an available product or a tentative signal into a confirmed discovery.
+- Apply that same evidence standard to ALL hooks and cover copy. For an observational screen-time study, say the measures were linked; do not say screen time "boosts" a brain score, even with "could" or "may". A qualifier does not fix a causal claim the study cannot support.
 - Lead with the fact. Do not use throat-clearing such as "here's the thing", faux-insight such as "the part everyone misses", or rhetorical labels such as "plot twist".
 - Name the study, institution, researcher, report, or dataset behind a claim. Never hide behind "experts agree", "studies show", or "many argue".
 - State the consequence directly. Do not add importance puffery such as "marks a pivotal moment" or trailing filler clauses beginning with "highlighting", "underscoring", "reflecting", or "showcasing".
@@ -86,7 +91,7 @@ an intentional hand-drawn science explanation with a clean cutaway, diagram, or
 editorial illustration. It must look designed, not like a fake photograph.
 
 === HOOK VARIANTS ===
-Write 3 consequence-first hook lines using different angles: what changes for the viewer or field, a vivid curiosity gap, and a counterintuitive implication. A specific question is allowed. Keep every hook to 12 words or fewer so it can be understood in under 3 seconds, and make the script pay off what it promises. Then pick the strongest (best_hook_index 0/1/2). The chosen hook must be scene 1 of the scenes array and the opening of video_script.
+Write 3 consequence-first hook lines using different angles: what changes for the viewer or field, a vivid curiosity gap, and a counterintuitive implication. A specific question is allowed. Prefer 6-8 words and keep every hook to 12 words or fewer; word count alone does not guarantee a three-second delivery. All three must lead into the SAME setup and payoff without adding a claim absent from the article, because a user can swap the hook without rewriting the body. Then pick the strongest (best_hook_index 0/1/2). The chosen hook must be scene 1 of the scenes array and the opening of video_script.
 
 === PACKAGING ===
 - cover_line: 3-5 punchy words that capture the central fact. Make it suitable for ALL CAPS, with no sentence punctuation.
@@ -456,6 +461,9 @@ def parse_response(text: str) -> dict:
     # Keep the provider's type/value intact. Coercing "1", True, or 1.7 to an
     # integer would make malformed A/B attribution look valid downstream.
     best_hook_index = result.get('best_hook_index')
+    hook_variants, best_hook_index = _prune_alternate_hooks(
+        hook_variants, best_hook_index, video_script
+    )
 
     return {
         'tldr': result.get('tldr', '') or '',
@@ -476,6 +484,34 @@ def parse_response(text: str) -> dict:
     }
 
 
+def _prune_alternate_hooks(hook_variants, best_hook_index, video_script):
+    """Drop alternate hooks that could never be swapped in.
+
+    Only the chosen hook is rendered. One over-long alternate used to reject an
+    otherwise valid script, and with each provider tripping a different gate no
+    video could be made at all. Malformed input is returned untouched so the
+    contract gate still rejects it.
+    """
+    if not (
+        isinstance(hook_variants, list)
+        and type(best_hook_index) is int
+        and 0 <= best_hook_index < len(hook_variants)
+        and all(isinstance(v, str) and v.strip() for v in hook_variants)
+    ):
+        return hook_variants, best_hook_index
+    selected = hook_variants[best_hook_index]
+    body_words = len(str(video_script or '').split()) - len(selected.split())
+    low, high = SCRIPT_WORD_TARGET
+    kept = [
+        variant for index, variant in enumerate(hook_variants)
+        if index == best_hook_index or (
+            len(variant.split()) <= HOOK_MAX_WORDS
+            and low <= body_words + len(variant.split()) <= high
+        )
+    ]
+    return kept, kept.index(selected)
+
+
 # Claude Sonnet 5 and the Opus 4.7+ family reject non-default sampling
 # parameters with a 400. Kimi still wants temperature, and both share this
 # helper, so the parameter has to be chosen per model rather than removed.
@@ -488,6 +524,25 @@ _NO_SAMPLING_PARAM_MODELS = (
 )
 
 
+# Reasoning models emit a long hidden chain of thought before the first JSON
+# character, and those tokens count against max_tokens. Measured against this
+# exact prompt: qwen3.7-flash spent 6,850 reasoning tokens before answering, so
+# the 4,500 default truncates it mid-string on every single call.
+_REASONING_MODELS = (
+    "qwen3.7-flash",
+    "deepseek-v4-flash",
+    "glm-4.7-flash",
+    "gpt-oss",
+)
+
+_DEFAULT_OUTPUT_TOKENS = 4500
+_REASONING_OUTPUT_TOKENS = 16000
+
+
+def _is_reasoning_model(model_id: str) -> bool:
+    return any(name in model_id for name in _REASONING_MODELS)
+
+
 def _openrouter_payload(model_id: str, prompt: str) -> dict:
     payload = {
         "model": model_id,
@@ -495,7 +550,12 @@ def _openrouter_payload(model_id: str, prompt: str) -> dict:
             {"role": "system", "content": "You are a short-form video storyteller who responds ONLY in valid JSON matching the user's schema."},
             {"role": "user", "content": prompt}
         ],
-        "max_tokens": 4500,
+        "max_tokens": (
+            _REASONING_OUTPUT_TOKENS
+            if _is_reasoning_model(model_id)
+            else _DEFAULT_OUTPUT_TOKENS
+        ),
+        "provider": OPENROUTER_PROVIDER_PREFS,
     }
     if not any(name in model_id for name in _NO_SAMPLING_PARAM_MODELS):
         payload["temperature"] = 0.75
@@ -518,7 +578,9 @@ def _call_openrouter(model_id: str, title: str, content: str) -> dict:
             "X-Title": "Clipper"
         },
         json=_openrouter_payload(model_id, prompt),
-        timeout=90
+        # Thinking time is wall-clock time; a reasoning model on this prompt
+        # measured over a minute before returning its first byte.
+        timeout=240 if _is_reasoning_model(model_id) else 90
     )
 
     response.raise_for_status()
@@ -527,7 +589,14 @@ def _call_openrouter(model_id: str, title: str, content: str) -> dict:
     if 'error' in data:
         raise Exception(data['error'].get('message', 'Unknown OpenRouter error'))
 
-    text = data['choices'][0]['message']['content'].strip()
+    # A model that burns its whole budget thinking returns a null content field
+    # rather than an error, so this has to be checked before .strip().
+    message = (data.get('choices') or [{}])[0].get('message') or {}
+    text = (message.get('content') or '').strip()
+    if not text:
+        raise Exception(
+            f"{model_id} returned no content (likely truncated before it emitted JSON)"
+        )
     return parse_response(text)
 
 
@@ -536,9 +605,10 @@ def summarize_with_kimi(title: str, content: str) -> dict:
     return _call_openrouter("moonshotai/kimi-k2", title, content)
 
 
-def summarize_with_claude(title: str, content: str) -> dict:
-    """Quality fallback: Claude Sonnet 5 via OpenRouter — best hooks, ~$0.015/run."""
-    return _call_openrouter("anthropic/claude-sonnet-5", title, content)
+def summarize_with_qwen(title: str, content: str) -> dict:
+    """Cost fallback: Qwen3.7 Flash via OpenRouter — ~$0.0013/run, ~4x cheaper
+    than Kimi. A reasoning model, so it needs the larger output budget above."""
+    return _call_openrouter("qwen/qwen3.7-flash", title, content)
 
 
 def summarize_with_groq(title: str, content: str) -> dict:
@@ -552,7 +622,8 @@ def summarize_with_groq(title: str, content: str) -> dict:
     prompt = get_prompt(title, content)
 
     response = client.chat.completions.create(
-        model="llama-3.3-70b-versatile",
+        model=GROQ_TEXT_MODEL,
+        extra_body=GROQ_EXTRA_BODY,
         messages=[
             {"role": "system", "content": "You are a short-form video storyteller who responds ONLY in valid JSON matching the user's schema."},
             {"role": "user", "content": prompt}
@@ -590,9 +661,9 @@ def summarize_with_gemini(title: str, content: str) -> dict:
 
 
 # Word-count bands for the narration. Below the target, the story is unlikely
-# to fill the intended 45-60 seconds; over the warn band, delivery gets rushed.
-SCRIPT_WORD_TARGET = (120, 150)
-SCRIPT_WORD_WARN_OVER = 160
+# to fill the intended 40-55 seconds; over the warn band, delivery gets rushed.
+SCRIPT_WORD_TARGET = (100, 130)
+SCRIPT_WORD_WARN_OVER = 140
 
 _CLICKBAIT_PATTERNS = (
     ("you won't believe", re.compile(r"\byou (?:will not|won['’]t) believe\b", re.I)),
@@ -923,14 +994,14 @@ def find_summary_contract_issues(result: dict) -> list[str]:
     hook_variants = result.get('hook_variants')
     hooks_are_valid = (
         isinstance(hook_variants, list)
-        and len(hook_variants) == 3
+        and 1 <= len(hook_variants) <= 3
         and all(
             isinstance(variant, str) and bool(variant.strip())
             for variant in hook_variants
         )
     )
     if not hooks_are_valid:
-        issues.append("hook_variants must contain exactly 3 nonempty strings")
+        issues.append("hook_variants must contain 1-3 nonempty strings")
     elif any(
         len(variant.split()) > HOOK_MAX_WORDS
         for variant in hook_variants
@@ -1044,8 +1115,8 @@ def summarize_article(title: str, content: str) -> dict:
 
     Chain (quality-first with cost awareness):
       1. Kimi K2 (OpenRouter)            — primary; best $/story-quality
-      2. Claude Sonnet 4.6 (OpenRouter)  — quality fallback when Kimi hiccups
-      3. Groq Llama 3.3 70B              — speed fallback (sub-second TTFT)
+      2. Qwen3.7 Flash (OpenRouter)      — ~4x cheaper than Kimi; reasoning model
+      3. Groq Llama 3.3 70B              — speed fallback (sub-second TTFT), free tier
       4. Gemini Flash                    — budget floor
 
     Returns a dict with keys:
@@ -1057,7 +1128,7 @@ def summarize_article(title: str, content: str) -> dict:
 
     for provider, fn in (
         ('kimi', summarize_with_kimi),
-        ('claude', summarize_with_claude),
+        ('qwen', summarize_with_qwen),
         ('groq', summarize_with_groq),
         ('gemini', summarize_with_gemini),
     ):
@@ -1090,7 +1161,29 @@ def summarize_article(title: str, content: str) -> dict:
             errors[provider] = str(e)
             print(f"[Summarizer] {provider} failed: {e}")
 
+    _record_summary_failure(title, errors)
     raise Exception(f"All AI providers failed: {errors}")
+
+
+def _record_summary_failure(title: str, errors: dict) -> None:
+    """Append why every provider failed to instance/summarizer_errors.log.
+
+    The app only prints these reasons to stdout, which is easy to lose, so keep
+    a small on-disk trail. Never let logging break the caller.
+    """
+    try:
+        from datetime import datetime, timezone
+        log_path = os.getenv("SUMMARIZER_ERROR_LOG") or os.path.join(
+            os.path.dirname(os.path.abspath(__file__)),
+            "instance", "summarizer_errors.log",
+        )
+        os.makedirs(os.path.dirname(log_path), exist_ok=True)
+        with open(log_path, "a", encoding="utf-8") as handle:
+            handle.write(f"\n[{datetime.now(timezone.utc).isoformat()}] {title}\n")
+            for provider, reason in errors.items():
+                handle.write(f"  {provider}: {str(reason)[:1500]}\n")
+    except Exception:
+        pass
 
 
 def _strip_dashes(text: str) -> str:
@@ -1206,7 +1299,7 @@ def generate_substack_post(article) -> str:
     errors = {}
     for model_id, label in (
         ("moonshotai/kimi-k2", "kimi"),
-        ("anthropic/claude-sonnet-5", "claude"),
+        ("qwen/qwen3.7-flash", "qwen"),
     ):
         try:
             print(f"[Substack] Trying {label}...")
@@ -1225,16 +1318,26 @@ def generate_substack_post(article) -> str:
                         {"role": "user", "content": prompt}
                     ],
                     "temperature": 0.70,
-                    "max_tokens": 4000
+                    # Same reasoning-budget rule as the summarizer: thinking
+                    # tokens are spent before any prose appears.
+                    "max_tokens": (
+                        _REASONING_OUTPUT_TOKENS
+                        if _is_reasoning_model(model_id)
+                        else 4000
+                    ),
+                    "provider": OPENROUTER_PROVIDER_PREFS,
                 },
-                timeout=120
+                timeout=240 if _is_reasoning_model(model_id) else 120
             )
             response.raise_for_status()
             data = response.json()
             if 'error' in data:
                 raise Exception(data['error'].get('message', 'Unknown error'))
 
-            raw = data['choices'][0]['message']['content'].strip()
+            message = (data.get('choices') or [{}])[0].get('message') or {}
+            raw = (message.get('content') or '').strip()
+            if not raw:
+                raise Exception(f"{model_id} returned no content")
             # Strip markdown fences if the model wraps in ```json ... ```
             if raw.startswith('```'):
                 raw = raw.split('```', 2)[1]

@@ -34,6 +34,7 @@ from video_generator import (
     VIDEO_HEIGHT,
     MAX_IMAGE_WORKERS,
 )
+from llm_models import GROQ_EXTRA_BODY, GROQ_TEXT_MODEL
 
 load_dotenv()
 
@@ -68,7 +69,8 @@ def extract_key_points(title: str, script: str, num_points: int = NUM_SLIDES) ->
     try:
         logger.info("[Carousel] Extracting key points...")
         response = client.chat.completions.create(
-            model="llama-3.3-70b-versatile",
+            model=GROQ_TEXT_MODEL,
+            extra_body=GROQ_EXTRA_BODY,
             messages=[
                 {
                     "role": "system",
@@ -121,7 +123,8 @@ def generate_carousel_prompts(title: str, script: str, num_prompts: int = NUM_SL
     try:
         logger.info("[Carousel] Generating image prompts...")
         response = client.chat.completions.create(
-            model="llama-3.3-70b-versatile",
+            model=GROQ_TEXT_MODEL,
+            extra_body=GROQ_EXTRA_BODY,
             messages=[
                 {
                     "role": "system",

@@ -79,7 +79,7 @@ def test_motion_clip_cap_enforces_count_and_dollar_ceiling():
     # Reused Illustrated Science frames leave room for two optional $0.18
     # motion requests under the same $0.60 ceiling.
     assert video_generator._effective_motion_clip_cap(12, 0.18) == 2
-    assert video_generator._effective_motion_clip_cap(12, 0.25) == 1
+    assert video_generator._effective_motion_clip_cap(12, 0.30) == 1
     assert video_generator._effective_motion_clip_cap(2, 0.18) == 2
     # The helper still respects an explicitly cheaper base configuration.
     assert (

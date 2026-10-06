@@ -72,12 +72,14 @@ When changing the scene schema, update all three: the prompt in `summarizer.get_
 
 `summarize_article()` tries providers in order and returns on first success:
 
-1. **Kimi K2** via OpenRouter (primary, best quality/$)
-2. **Claude Sonnet 4.6** via OpenRouter (quality fallback)
-3. **Groq Llama 3.3 70B** (speed fallback)
+1. **Kimi K2** via OpenRouter (primary, best quality/$ — ~$0.005/story)
+2. **Qwen3.7 Flash** via OpenRouter (cost fallback — ~$0.0013/story)
+3. **Groq Llama 3.3 70B** (speed fallback, free tier)
 4. **Gemini 2.5 Flash** (budget floor)
 
-All four share the same `get_prompt()` and `parse_response()`, so adding a provider means writing a `summarize_with_X()` that returns `parse_response(text)` and inserting it in the chain inside `summarize_article()`. Note: OpenRouter hosts both Kimi and Claude — one key covers two stages.
+All four share the same `get_prompt()` and `parse_response()`, so adding a provider means writing a `summarize_with_X()` that returns `parse_response(text)` and inserting it in the chain inside `summarize_article()`. Note: OpenRouter hosts both Kimi and Qwen — one key covers two stages.
+
+**Reasoning models need a bigger output budget.** Qwen3.7 Flash, DeepSeek V4 Flash, GLM 4.7 Flash and gpt-oss emit a hidden chain of thought before the first JSON character, and those tokens count against `max_tokens`. At the old 4500 default they truncate mid-string on every call (qwen3.7-flash measured 6,850 reasoning tokens before answering). `_is_reasoning_model()` in `summarizer.py` raises the cap to 16000 and the timeout to 240s. Add any new reasoning model to `_REASONING_MODELS` or it will fail 100% of the time. Such a model can also return a **null** `content` field rather than an error when it runs out of budget, so `_call_openrouter()` checks for empty content before parsing.
 
 A **separate** Groq client inside `video_generator.py` and `visual_styles.py` handles style selection, subject extraction, and image-prompt generation. That one falls silently back to hardcoded defaults if `GROQ_API_KEY` is missing.
 
@@ -107,7 +109,9 @@ Any server-side URL fetch must go through `validate_url()` in `app.py`, which re
 
 ## Project-specific conventions
 
-- **Do not burn captions into video frames.** TikTok's native caption generator handles captions; all image prompts and style presets explicitly include "no text no words" directives. `chunk_text()` exists only for visual pacing in the legacy path, not for on-screen text.
+- **Captions are burned in by the renderer, never by the image model.** `create_caption_clips()` draws word-synced (Whisper) captions plus the opening `cover_line` headline. All image prompts and style presets explicitly include "no text no words" directives so generated stills never carry their own lettering. `chunk_text()` exists only for visual pacing in the legacy path.
+- **Pacing:** shots are capped at `MAX_SHOT_DURATION` (2.5s), and consecutive shots of one image must use visibly different framings (`_documentary_photo_variant`) with a perceptible push (`BODY_SHOT_ZOOM`). A scene that looks like one frozen still is the main reason viewers swipe.
+- **Restarting locally:** the app runs under the `com.scapweb.clipper` LaunchAgent with auto-reload off, so code edits need `launchctl kickstart -k gui/$(id -u)/com.scapweb.clipper`.
 - **User-facing errors are generic; full context goes to `logger.error(..., exc_info=True)`.** Don't leak provider error strings to the client.
 - **`print("[Tag] ...")` is the logging convention inside `video_generator.py`** (pipeline progress visible in gunicorn logs). `logger.info/error` is used in `app.py` and `summarizer.py`. Don't mix them within a module.
 - **Frontend has no build step.** `static/app.js` is plain ES-modern JS served directly. Don't introduce bundlers without a reason.

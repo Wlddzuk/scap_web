@@ -11,6 +11,10 @@ const API_BASE = '';
 let articles = [];
 let expandedArticles = new Set();
 let searchQuery = '';
+// The library grows without bound and is ordered newest-first, so only the most
+// recent page is built until the user asks for more.
+const ARTICLE_PAGE_SIZE = 15;
+let articleVisibleCount = ARTICLE_PAGE_SIZE;
 let initialLoadDone = false;
 let availableStyles = [];       // loaded from /api/styles
 let selectedStyleByArticle = {}; // { [articleId]: 'manga' } — user override
@@ -59,6 +63,17 @@ let discoveryState = {
     error: null
 };
 let discoveryRenderSignature = '';
+// The ranked shortlist can run to 30+ stories. Showing them all pushes the
+// article library and its search box five screens down, so the panel opens at
+// a decision-sized list and expands on request.
+let discoveryShowAll = false;
+const DISCOVERY_PREVIEW_COUNT = 5;
+// Which candidate has its "choose a style" panel open, and what is picked in it.
+// Kept in module state so the 5s discovery poll can re-render without closing it.
+let discoveryStyleOpenFor = null;
+let discoveryStyleDraft = {};
+// candidate_id -> style key, or null while the server is still deciding.
+let discoverySuggestedStyle = {};
 let discoveryRequestInFlight = false;
 let discoveryPollTimer = null;
 let discoveryPollDelayMs = 5000;
@@ -101,6 +116,9 @@ async function fetchArticles() {
         const data = await response.json();
         const prevArticles = articles;
         const isFirstLoad = !initialLoadDone;
+        if (!response.ok || !Array.isArray(data.articles)) {
+            throw new Error('Invalid article response');
+        }
         articles = data.articles;
         const generationJustFinished = prevArticles.some(previous => {
             if (!['generating_video', 'generating_carousel'].includes(previous.status)) return false;
@@ -143,12 +161,12 @@ function formatBudgetUsd(value) {
 function generationBudgetProviderMeta(providerId, provider) {
     const links = {
         fal: ['FAL', 'https://fal.ai/dashboard/billing'],
-        openrouter: ['OpenRouter', 'https://openrouter.ai/credits'],
+        openrouter: ['OpenRouter', 'https://openrouter.ai/settings/credits'],
         groq: ['Groq', 'https://console.groq.com/dashboard/usage'],
         gemini: ['Gemini', 'https://aistudio.google.com/app/billing']
     };
     const [name, fallbackUrl] = links[providerId] || [providerId, '#'];
-    const url = provider && provider.dashboard_url ? provider.dashboard_url : fallbackUrl;
+    const url = providerId === 'openrouter' ? fallbackUrl : (provider && provider.dashboard_url ? provider.dashboard_url : fallbackUrl);
     const balance = formatBudgetUsd(provider && provider.balance_usd);
     let value = 'Not configured';
     let detail = 'No API key found';
@@ -157,7 +175,7 @@ function generationBudgetProviderMeta(providerId, provider) {
     if (provider && provider.available && balance) {
         value = `${balance} left`;
         detail = providerId === 'openrouter' && provider.key_usage_usd !== null && provider.key_usage_usd !== undefined && Number.isFinite(Number(provider.key_usage_usd))
-            ? `${formatBudgetUsd(provider.key_usage_usd)} used by this key`
+            ? `${formatBudgetUsd(provider.key_usage_usd)} used by this key in total`
             : 'Live provider balance';
         tone = provider.severity === 'critical'
             ? 'critical'
@@ -442,7 +460,39 @@ function renderPlatformConnection(platform) {
 }
 
 function renderPublisherConnections() {
-    ['tiktok', 'instagram', 'youtube', 'facebook'].forEach(renderPlatformConnection);
+    const platforms = ['tiktok', 'instagram', 'youtube', 'facebook'];
+    platforms.forEach(renderPlatformConnection);
+    const label = document.getElementById('accounts-trigger-label');
+    const menu = document.getElementById('accounts-menu');
+    if (!label || !menu) return;
+    const connected = platforms.filter(p => (platformConnections[p] || {}).connected);
+    const warning = connected.some(p => {
+        const connection = platformConnections[p] || {};
+        return platformNeedsReconnect(connection) || Boolean(platformExpiryMessage(connection));
+    });
+    label.textContent = connected.length
+        ? `${connected.map(platformDisplayName).join(', ')}${warning ? ' \u00B7 check' : ''}`
+        : 'Connect accounts';
+    menu.classList.toggle('connected', connected.length > 0 && !warning);
+    menu.classList.toggle('warning', warning);
+}
+
+function toggleAccountsMenu(event) {
+    if (event) event.stopPropagation();
+    const trigger = document.getElementById('accounts-trigger');
+    const panel = document.getElementById('accounts-panel');
+    if (!trigger || !panel) return;
+    const willOpen = panel.classList.contains('hidden');
+    panel.classList.toggle('hidden', !willOpen);
+    trigger.setAttribute('aria-expanded', willOpen ? 'true' : 'false');
+}
+
+function closeAccountsMenu() {
+    const trigger = document.getElementById('accounts-trigger');
+    const panel = document.getElementById('accounts-panel');
+    if (!trigger || !panel) return;
+    panel.classList.add('hidden');
+    trigger.setAttribute('aria-expanded', 'false');
 }
 
 function connectPlatform(platform) {
@@ -569,12 +619,110 @@ function focusStoryDiscovery() {
     window.setTimeout(() => button.focus({ preventScroll: true }), 450);
 }
 
+/** Suggest a visual style from the story's own words.
+ *
+ * Scored locally against each preset's `good_for` tags rather than with an LLM
+ * call, because this runs for every card on every render and the user has not
+ * committed to spending anything yet. It is a hint, not a decision — the panel
+ * labels it "Suggested" and any chip can be picked instead.
+ */
+function suggestStyleForStory(candidate) {
+    if (!availableStyles.length) return DEFAULT_VISUAL_STYLE;
+    const haystack = [
+        candidate.title,
+        candidate.score_reason,
+        candidate.summary
+    ].filter(Boolean).join(' ').toLowerCase();
+
+    let best = DEFAULT_VISUAL_STYLE;
+    let bestScore = 0;
+    availableStyles.forEach(style => {
+        const score = (style.good_for || [])
+            .reduce((total, tag) => total + (haystack.includes(String(tag).toLowerCase()) ? 1 : 0), 0);
+        if (score > bestScore) {
+            bestScore = score;
+            best = style.key;
+        }
+    });
+    return best;
+}
+
+function discoveryStyleFor(candidate) {
+    return discoveryStyleDraft[candidate.candidate_id]
+        || discoverySuggestedStyle[candidate.candidate_id]
+        || DEFAULT_VISUAL_STYLE;
+}
+
+/** Ask the server which style suits this story.
+ *
+ * Fired only when the picker opens, for the one story being opened, so the
+ * shortlist never triggers a burst of provider calls. The local keyword guess
+ * stays as the offline answer if this fails.
+ */
+async function loadDiscoveryStyleSuggestion(candidate) {
+    const candidateId = candidate.candidate_id;
+    if (discoverySuggestedStyle[candidateId] !== undefined) return;
+    discoverySuggestedStyle[candidateId] = null; // pending — stops duplicate requests
+    try {
+        const response = await fetch(`${API_BASE}/api/styles/suggest`, {
+            method: 'POST',
+            headers: { 'Content-Type': 'application/json' },
+            body: JSON.stringify({
+                title: candidate.title || '',
+                summary: candidate.score_reason || candidate.summary || ''
+            })
+        });
+        if (!response.ok) throw new Error('suggestion unavailable');
+        const data = await response.json();
+        if (data.style) discoverySuggestedStyle[candidateId] = data.style;
+    } catch (error) {
+        console.error('Style suggestion failed:', error);
+        discoverySuggestedStyle[candidateId] = suggestStyleForStory(candidate);
+    }
+    if (discoveryStyleOpenFor === candidateId) renderDiscovery();
+}
+
+function openDiscoveryStylePanel(candidateId) {
+    discoveryStyleOpenFor = discoveryStyleOpenFor === candidateId ? null : candidateId;
+    if (discoveryStyleOpenFor) {
+        const candidate = (discoveryState.candidates || [])
+            .find(item => item.candidate_id === candidateId);
+        if (candidate) loadDiscoveryStyleSuggestion(candidate);
+    }
+    renderDiscovery();
+}
+
+function closeDiscoveryStylePanel() {
+    discoveryStyleOpenFor = null;
+    renderDiscovery();
+}
+
+function selectDiscoveryStyle(candidateId, styleKey) {
+    discoveryStyleDraft[candidateId] = styleKey;
+    renderDiscovery();
+}
+
 async function makeDiscoveryVideo(candidateId) {
+    const candidate = (discoveryState.candidates || []).find(item => item.candidate_id === candidateId);
+    const existing = candidate && articles.find(article => article.url === candidate.url);
+    if (existing) {
+        searchQuery = '';
+        document.getElementById('search-input').value = '';
+        articleVisibleCount = Math.max(articleVisibleCount, articles.indexOf(existing) + 1);
+        expandedArticles.add(existing.id);
+        discoveryStyleOpenFor = null;
+        renderArticles();
+        renderDiscovery();
+        document.querySelector(`.article-card[data-article-id="${existing.id}"]`)?.scrollIntoView({ block: 'start' });
+        showToast('This article is already saved. Review it below and use Generate to retry.', 'info');
+        return;
+    }
     const button = document.querySelector(`[data-discovery-video="${candidateId}"]`);
     if (button) {
         button.disabled = true;
         button.textContent = 'Starting…';
     }
+    discoveryStyleOpenFor = null;
 
     try {
         const colorIntensity = getColorIntensityPref();
@@ -583,7 +731,10 @@ async function makeDiscoveryVideo(candidateId) {
             {
                 method: 'POST',
                 headers: { 'Content-Type': 'application/json' },
-                body: JSON.stringify({ color_intensity: colorIntensity })
+                body: JSON.stringify({
+                    color_intensity: colorIntensity,
+                    style: discoveryStyleDraft[candidateId] || null
+                })
             }
         );
         const data = await response.json();
@@ -677,7 +828,11 @@ function renderDiscovery() {
     }
 
     container.classList.remove('hidden');
-    container.innerHTML = candidates.map(candidate => {
+    const visibleCandidates = discoveryShowAll
+        ? candidates
+        : candidates.slice(0, DISCOVERY_PREVIEW_COUNT);
+    const hiddenCount = candidates.length - visibleCandidates.length;
+    container.innerHTML = visibleCandidates.map(candidate => {
         const score = Math.round(Number(candidate.viral_score) || 0);
         const pipelineStatus = candidate.pipeline_status || 'ready';
         const isProcessing = ['queued', 'processing'].includes(pipelineStatus);
@@ -685,15 +840,19 @@ function renderDiscovery() {
         const isSkipped = pipelineStatus === 'skipped';
         const failedStage = candidate.failure_stage || (candidate.result && candidate.result.failure_stage);
         const pipelineError = candidate.pipeline_error || (candidate.result && candidate.result.pipeline_error);
+        const canChooseStyle = !discoveryState.running && !isProcessing && !isDone && !isSkipped;
+        const isChoosingStyle = canChooseStyle && discoveryStyleOpenFor === candidate.candidate_id;
         const buttonLabel = isProcessing
             ? 'Making video…'
             : isDone
-                ? 'Video ready'
+                ? '\u25B6 Watch'
                 : isSkipped
                     ? 'Already added'
-                    : pipelineStatus === 'failed'
-                        ? 'Retry video'
-                        : 'Make video';
+                    : isChoosingStyle
+                        ? 'Close'
+                        : pipelineStatus === 'failed'
+                            ? 'Retry video'
+                            : 'Make video';
 
         return `
             <article class="discovery-card" data-discovery-candidate="${candidate.candidate_id}">
@@ -720,14 +879,79 @@ function renderDiscovery() {
                 </div>
                 <button type="button" class="btn btn-secondary discovery-video-btn"
                     data-discovery-video="${candidate.candidate_id}"
-                    onclick="makeDiscoveryVideo('${candidate.candidate_id}')"
-                    ${discoveryState.running || isProcessing || isDone || isSkipped ? 'disabled' : ''}>
+                    aria-expanded="${isChoosingStyle}"
+                    onclick="${isDone && candidate.article_id
+                        ? `openVideoPlayer(${Number(candidate.article_id)})`
+                        : canChooseStyle
+                            ? `openDiscoveryStylePanel('${candidate.candidate_id}')`
+                            : `makeDiscoveryVideo('${candidate.candidate_id}')`}"
+                    ${discoveryState.running || isProcessing || (isDone && !candidate.article_id) || isSkipped ? 'disabled' : ''}>
                     ${buttonLabel}
                 </button>
+                ${isChoosingStyle ? renderDiscoveryStylePanel(candidate) : ''}
             </article>
         `;
     }).join('');
+
+    if (hiddenCount > 0 || discoveryShowAll) {
+        container.insertAdjacentHTML('beforeend', `
+            <button type="button" class="discovery-show-all" onclick="toggleDiscoveryShowAll()">
+                ${discoveryShowAll
+                    ? `Show top ${DISCOVERY_PREVIEW_COUNT} only`
+                    : `Show all ${candidates.length} ranked stories`}
+            </button>
+        `);
+    }
     restoreDiscoveryFocus(container, focusDescriptor);
+}
+
+function renderDiscoveryStylePanel(candidate) {
+    const candidateId = candidate.candidate_id;
+    const suggested = discoverySuggestedStyle[candidateId] || null;
+    const suggestionPending = discoverySuggestedStyle[candidateId] === null;
+    const selected = discoveryStyleFor(candidate);
+    const chips = availableStyles.map(style => `
+        <button type="button"
+            class="discovery-style-chip ${style.key === selected ? 'selected' : ''}"
+            onclick="selectDiscoveryStyle('${candidateId}', '${style.key}')"
+            aria-pressed="${style.key === selected}"
+            title="${escapeAttribute(style.description || '')}">
+            <span class="discovery-style-emoji" aria-hidden="true">${style.emoji}</span>
+            <span class="discovery-style-name">${escapeHtml(style.name)}</span>
+            ${style.key === suggested
+                ? '<span class="discovery-style-suggested">Suggested</span>'
+                : ''}
+        </button>
+    `).join('');
+
+    return `
+        <div class="discovery-style-panel" role="group" aria-label="Visual style for this video">
+            <div class="discovery-style-head">
+                <strong>Visual style</strong>
+                <span>
+                    ${suggestionPending
+                        ? 'Picking a suggestion for this story…'
+                        : 'Applies to every scene in this video. Colour intensity uses your dashboard setting.'}
+                </span>
+            </div>
+            <div class="discovery-style-chips">${chips}</div>
+            <div class="discovery-style-actions">
+                <button type="button" class="btn btn-primary"
+                    onclick="makeDiscoveryVideo('${candidateId}')">
+                    Generate video
+                </button>
+                <button type="button" class="discovery-style-cancel"
+                    onclick="closeDiscoveryStylePanel()">
+                    Cancel
+                </button>
+            </div>
+        </div>
+    `;
+}
+
+function toggleDiscoveryShowAll() {
+    discoveryShowAll = !discoveryShowAll;
+    renderDiscovery();
 }
 
 async function scrapeUrl(event) {
@@ -1095,7 +1319,7 @@ async function generateVideo(articleId, imageSource = 'ai', requestedColorIntens
         const data = await response.json();
 
         if (response.ok) {
-            showToast('Video generated!', 'success');
+            showToast(response.status === 202 ? 'Video generation started' : 'Video generated!', 'success');
             await fetchArticles();
             expandedArticles.add(articleId);
             renderArticles();
@@ -1233,6 +1457,72 @@ function showQrModal(articleId, title, type = 'carousel') {
     requestAnimationFrame(() => modal.classList.add('active'));
 }
 
+function renderVideoActions(article) {
+    return `
+        <div class="video-transfer-row">
+            <button class="btn btn-action btn-tiktok btn-post"
+                    onclick="openShareEverywhereDialog(event, ${article.id})">
+                &#8599; Post
+            </button>
+            <a href="/videos/${encodeURIComponent(article.video_path)}"
+               class="btn btn-action btn-carousel-dl" download>
+                Download
+            </a>
+            <button class="btn btn-action btn-video-qr"
+                    onclick="sendVideoToPhone(${article.id})">
+                Send to phone
+            </button>
+        </div>
+        <p class="video-review-note">Before posting: does the first second show the real subject, and does the ending pay off the hook?</p>
+    `;
+}
+
+function sendVideoToPhone(articleId) {
+    const article = articles.find(a => a.id === articleId);
+    closeVideoPlayer();
+    showQrModal(articleId, article ? article.title : '', 'video');
+}
+
+function openVideoPlayer(articleId) {
+    const article = articles.find(a => a.id === articleId);
+    if (!article || !article.video_path) {
+        showToast('That video is not available yet.', 'error');
+        return;
+    }
+    closeVideoPlayer();
+    const modal = document.createElement('div');
+    modal.id = 'video-player-modal';
+    modal.className = 'qr-modal-overlay video-player-overlay';
+    modal.setAttribute('role', 'dialog');
+    modal.setAttribute('aria-modal', 'true');
+    modal.setAttribute('aria-label', `Video: ${article.title}`);
+    modal.onclick = (e) => { if (e.target === modal) closeVideoPlayer(); };
+    modal.innerHTML = `
+        <div class="video-player-content">
+            <button class="qr-modal-close" onclick="closeVideoPlayer()" aria-label="Close video">&times;</button>
+            <video class="video-player" controls autoplay playsinline
+                   src="/videos/${encodeURIComponent(article.video_path)}"></video>
+            <div class="video-player-side">
+                <h3 class="video-player-title">${escapeHtml(article.title)}</h3>
+                ${renderVideoActions(article)}
+                ${renderPlatformPostStates(article)}
+            </div>
+        </div>
+    `;
+    document.body.appendChild(modal);
+    void modal.offsetWidth; // commit the hidden state so the fade-in runs
+    modal.classList.add('active');
+    modal.querySelector('.qr-modal-close').focus();
+}
+
+function closeVideoPlayer() {
+    const modal = document.getElementById('video-player-modal');
+    if (!modal) return;
+    const video = modal.querySelector('video');
+    if (video) video.pause();
+    modal.remove();
+}
+
 function closeQrModal() {
     const modal = document.getElementById('qr-modal');
     if (modal) {
@@ -1328,6 +1618,7 @@ function closeShareModal() {
 }
 
 async function openShareEverywhereDialog(event, articleId, retryPlatform = null) {
+    closeVideoPlayer();
     if (event) event.stopPropagation();
     const article = articles.find(item => item.id === articleId);
     if (!article || !article.video_path) return;
@@ -1693,6 +1984,13 @@ async function submitShareEverywhere(event, articleId) {
 
 function filterArticles() {
     searchQuery = document.getElementById('search-input').value.trim().toLowerCase();
+    // A new query is a new result set — start it at page one.
+    articleVisibleCount = ARTICLE_PAGE_SIZE;
+    renderArticles();
+}
+
+function showMoreArticles() {
+    articleVisibleCount += ARTICLE_PAGE_SIZE;
     renderArticles();
 }
 
@@ -1767,18 +2065,36 @@ function renderArticles() {
     }
 
     const filtered = getFilteredArticles();
+    const visible = filtered.slice(0, articleVisibleCount);
+    const remaining = filtered.length - visible.length;
 
     // Update section header
     sectionHeader.classList.remove('hidden');
     if (searchQuery && filtered.length !== articles.length) {
         sectionTitle.textContent = `${filtered.length} of ${articles.length} articles`;
+    } else if (remaining > 0) {
+        sectionTitle.textContent = `${visible.length} of ${articles.length} articles`;
     } else {
         sectionTitle.textContent = `${articles.length} article${articles.length !== 1 ? 's' : ''}`;
     }
 
-    const shouldAnimate = container.childElementCount !== filtered.length;
+    const shouldAnimate = container.querySelectorAll('.article-card').length !== visible.length;
 
-    container.innerHTML = filtered.map(article => renderArticleCard(article)).join('');
+    const focusedToggle = document.activeElement?.closest('.article-expand');
+    const focusedArticleId = focusedToggle?.closest('.article-card')?.dataset.articleId;
+    container.innerHTML = visible.map(article => renderArticleCard(article)).join('');
+    if (focusedArticleId) {
+        container.querySelector(`.article-card[data-article-id="${focusedArticleId}"] .article-expand`)?.focus({ preventScroll: true });
+    }
+
+    if (remaining > 0) {
+        container.insertAdjacentHTML('beforeend', `
+            <button type="button" class="articles-load-more" onclick="showMoreArticles()">
+                Show ${Math.min(remaining, ARTICLE_PAGE_SIZE)} more
+                &middot; ${remaining} remaining
+            </button>
+        `);
+    }
 
     // Add click handlers for expanding cards
     container.querySelectorAll('.article-header').forEach(header => {
@@ -1827,13 +2143,13 @@ function renderArticleCard(article) {
                 </div>
                 <div class="article-status">
                     ${statusBadges}
-                    <span class="expand-chevron">${isExpanded ? '&#9650;' : '&#9660;'}</span>
+                    ${article.video_path ? `<button type="button" class="btn-watch" onclick="openVideoPlayer(${article.id})" aria-label="Watch video: ${escapeAttribute(article.title)}">&#9654; Watch</button>` : ''}
+                    <button type="button" class="expand-chevron article-expand" aria-expanded="${isExpanded}" aria-controls="article-content-${article.id}" aria-label="${isExpanded ? 'Collapse' : 'Review'} article: ${escapeHtml(article.title)}" onclick="toggleExpand(${article.id})">${isExpanded ? '&#9650;' : '&#9660;'}</button>
                 </div>
             </div>
 
-            <div class="article-content">
-                ${renderSummary(article)}
-                ${renderActions(article)}
+            <div class="article-content" id="article-content-${article.id}">
+                ${isExpanded ? `${renderSummary(article)}${renderActions(article)}` : ''}
             </div>
         </div>
     `;
@@ -2094,6 +2410,21 @@ function renderSummary(article) {
     const hashtags = article.hashtags || [];
 
     return `
+        ${article.video_path ? `
+            <div class="card-video-row">
+                <div class="video-container">
+                    <video controls preload="metadata" playsinline>
+                        <source src="/videos/${encodeURIComponent(article.video_path)}" type="video/mp4">
+                        Your browser does not support the video tag.
+                    </video>
+                </div>
+                <div class="card-video-side">
+                    ${renderVideoActions(article)}
+                    ${renderPlatformPostStates(article)}
+                </div>
+            </div>
+        ` : ''}
+
         <div class="summary-section">
             <div class="summary-label">TL;DR</div>
             <p class="summary-text">${escapeHtml(article.tldr)}</p>
@@ -2106,39 +2437,17 @@ function renderSummary(article) {
             </ul>
         </div>
 
-        ${renderHookVariants(article)}
-        ${renderStylePicker(article)}
-
-        ${article.video_script ? `
-            <div class="summary-section">
-                <div class="summary-label">Video Script</div>
-                <div class="video-script">${escapeHtml(article.video_script)}</div>
-            </div>
-        ` : ''}
-
-    ${article.video_path ? `
-            <div class="video-container">
-                <video controls preload="none" playsinline>
-                    <source src="/videos/${encodeURIComponent(article.video_path)}" type="video/mp4">
-                    Your browser does not support the video tag.
-                </video>
-            </div>
-            <div class="video-transfer-row">
-                <a href="/videos/${encodeURIComponent(article.video_path)}" 
-                   class="btn btn-action btn-carousel-dl" download>
-                    📦 Download Video
-                </a>
-                <button class="btn btn-action btn-video-qr" 
-                        onclick="showQrModal(${article.id}, '${escapeHtml(article.title)}', 'video')">
-                    📱 Send to Phone
-                </button>
-                <button class="btn btn-action btn-tiktok btn-post"
-                        onclick="openShareEverywhereDialog(event, ${article.id})">
-                    ↗ Post
-                </button>
-            </div>
-            ${renderPlatformPostStates(article)}
-        ` : ''}
+        <details class="script-details" ${article.video_path ? '' : 'open'}>
+            <summary>Script, opening hook &amp; visual style</summary>
+            ${renderHookVariants(article)}
+            ${renderStylePicker(article)}
+            ${article.video_script ? `
+                <div class="summary-section">
+                    <div class="summary-label">Video Script</div>
+                    <div class="video-script">${escapeHtml(article.video_script)}</div>
+                </div>
+            ` : ''}
+        </details>
 
         ${article.carousel_dir ? `
             <div class="carousel-preview">
@@ -2560,9 +2869,21 @@ async function handleBookmarkletHash() {
     }
 }
 
+function syncHeaderHeight() {
+    const header = document.querySelector('.header');
+    if (!header) return;
+    document.documentElement.style.setProperty(
+        '--header-height',
+        `${Math.round(header.getBoundingClientRect().height)}px`
+    );
+}
+
 document.addEventListener('DOMContentLoaded', () => {
     // Hide empty state initially (show skeleton instead)
     document.getElementById('empty-state').classList.add('hidden');
+
+    syncHeaderHeight();
+    window.addEventListener('resize', syncHeaderHeight);
 
     syncHookToggle();
     syncColorIntensityControl();
@@ -2624,11 +2945,15 @@ document.addEventListener('DOMContentLoaded', () => {
     document.addEventListener('click', event => {
         const budget = document.getElementById('generation-budget');
         if (budget && !budget.contains(event.target)) closeGenerationBudget();
+        const accounts = document.getElementById('accounts-menu');
+        if (accounts && !accounts.contains(event.target)) closeAccountsMenu();
     });
 
     document.addEventListener('keydown', event => {
         if (event.key === 'Escape') {
             closeGenerationBudget();
+            closeAccountsMenu();
+            closeVideoPlayer();
             closeShareModal();
         }
     });

@@ -12,7 +12,7 @@ import hmac
 import time
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from datetime import datetime, timezone, timedelta
-from urllib.parse import urlparse, urlencode, quote
+from urllib.parse import urlparse, urljoin, urlencode, quote
 from threading import Event, Lock, Thread
 from tempfile import TemporaryDirectory
 import shutil
@@ -168,14 +168,38 @@ def scrape_url_content(url):
         'Accept-Language': 'en-US,en;q=0.9',
     }
 
-    response = requests.get(url, headers=headers, timeout=15, allow_redirects=True)
-    response.raise_for_status()
+    # Validate each redirect before fetching it. Checking response.url after
+    # automatic redirects is too late: the private target has already been read.
+    fetch_url = url
+    for redirect_count in range(6):
+        response = requests.get(
+            fetch_url, headers=headers, timeout=15, allow_redirects=False
+        )
+        if response.status_code in (301, 302, 303, 307, 308):
+            location = response.headers.get('Location')
+            response.close()
+            if not location:
+                raise ValueError('Article redirect has no destination')
+            if redirect_count == 5:
+                raise ValueError('Article URL redirects too many times')
+            fetch_url = validate_url(urljoin(fetch_url, location))
+            continue
+        response.raise_for_status()
+        break
 
-    # Validate final URL after redirects
-    if response.url != url:
-        validate_url(response.url)
-
-    soup = BeautifulSoup(response.text, 'html.parser')
+    # requests assumes ISO-8859-1 for any text/* response without a charset,
+    # which turned UTF-8 curly quotes into "â" in stored titles. Hand
+    # BeautifulSoup the raw bytes so the page's own <meta charset> wins unless
+    # the server explicitly declared one.
+    raw_html = getattr(response, 'content', None)
+    if isinstance(raw_html, bytes):
+        content_type = (getattr(response, 'headers', None) or {}).get('Content-Type', '')
+        charset = re.search(r'charset=([\w-]+)', content_type if isinstance(content_type, str) else '', re.I)
+        soup = BeautifulSoup(
+            raw_html, 'html.parser', from_encoding=charset.group(1) if charset else None
+        )
+    else:
+        soup = BeautifulSoup(response.text, 'html.parser')
 
     # Remove unwanted elements
     for tag in soup(['script', 'style', 'nav', 'footer', 'header', 'aside', 'iframe']):
@@ -1437,11 +1461,12 @@ def _facebook_access_token():
     return _oauth_cipher().decrypt(account.access_token_encrypted), account
 
 
-def _expiry_metadata(account, *, warning_days):
-    if account is None or not account.access_token_expires_at:
+def _expiry_metadata(account, *, warning_days, attribute='access_token_expires_at'):
+    expires_at = getattr(account, attribute, None) if account is not None else None
+    if not expires_at:
         return {'days_until_expiry': None, 'expiry_warning': False, 'expired': False}
     seconds = (
-        _as_utc(account.access_token_expires_at) - datetime.now(timezone.utc)
+        _as_utc(expires_at) - datetime.now(timezone.utc)
     ).total_seconds()
     return {
         'days_until_expiry': max(0, int(seconds // 86_400)),
@@ -1466,7 +1491,11 @@ def _publisher_status_payload():
     }
     if tiktok:
         tiktok_payload.update(tiktok.to_public_dict())
-        tiktok_payload.update(_expiry_metadata(tiktok, warning_days=7))
+        # TikTok access tokens last 24h and _tiktok_access_token() refreshes
+        # them silently; only the long-lived refresh token needs the user.
+        tiktok_payload.update(_expiry_metadata(
+            tiktok, warning_days=7, attribute='refresh_token_expires_at'
+        ))
         granted = _tiktok_granted_scopes(tiktok)
         missing_posting = [
             scope for scope in TIKTOK_POSTING_SCOPES if scope not in granted
@@ -2975,8 +3004,10 @@ def generate_video_endpoint(article_id):
         image_source = 'ai'
 
     style_override = payload.get('style')
-    if style_override and style_override not in VISUAL_STYLES:
-        return jsonify({'error': f'Unknown style: {style_override}'}), 400
+    if style_override is not None and (
+        not isinstance(style_override, str) or style_override not in VISUAL_STYLES
+    ):
+        return jsonify({'error': 'Unknown style'}), 400
 
     voice_tone = payload.get('voice_tone', 'controlled')
     if not isinstance(voice_tone, str) or voice_tone not in VOICE_TONES:
@@ -2997,10 +3028,9 @@ def generate_video_endpoint(article_id):
     # `use_video_hook` is a tri-state: True/False/None.
     #   True  -> AI video hook (FAL); False -> image hook; None -> env default.
     raw_hook = payload.get('use_video_hook', None)
-    if raw_hook is None:
-        use_video_hook = None
-    else:
-        use_video_hook = bool(raw_hook)
+    if raw_hook is not None and not isinstance(raw_hook, bool):
+        return jsonify({'error': 'Video hook must be true, false, or null'}), 400
+    use_video_hook = raw_hook
 
     generation_token = secrets.token_hex(24)
     current_status = article.status
@@ -3724,6 +3754,35 @@ def list_styles_endpoint():
     return jsonify({'styles': list_styles()})
 
 
+@app.route('/api/styles/suggest', methods=['POST'])
+def suggest_style_endpoint():
+    """Suggest one visual style for a story the user is about to render.
+
+    Called on demand when the discovery style picker opens — one story at a
+    time, never for the whole shortlist — so the Groq call only happens once the
+    user is actually choosing. Falls back to the default style whenever the
+    picker cannot decide, so the caller always gets a usable key.
+    """
+    payload = request.get_json(silent=True)
+    if not isinstance(payload, dict):
+        payload = {}
+
+    title = str(payload.get('title') or '').strip()[:300]
+    context = str(payload.get('summary') or '').strip()[:1500]
+    if not title and not context:
+        return jsonify({'error': 'A title or summary is required'}), 400
+
+    from visual_styles import DEFAULT_STYLE, _legacy_auto_pick_style
+
+    try:
+        suggested = _legacy_auto_pick_style(title, context)
+    except Exception:
+        logger.error('Style suggestion failed', exc_info=True)
+        suggested = DEFAULT_STYLE
+
+    return jsonify({'style': suggested or DEFAULT_STYLE})
+
+
 @app.route('/api/generation-budget', methods=['GET'])
 def generation_budget_endpoint():
     """Return cached provider balances and safe generation cost estimates."""
@@ -3762,8 +3821,9 @@ if __name__ == '__main__':
     print("  API Base:  http://localhost:5050/api")
     print("\n" + "=" * 60 + "\n")
 
-    # Flask's debug reloader executes this file twice. Only the serving child
-    # should own the daily discovery scheduler.
-    if os.environ.get('WERKZEUG_RUN_MAIN') == 'true':
+    # Automatic source reloads terminate daemon video workers mid-render.
+    # Keep local generation stable; developers can explicitly opt into reloads.
+    use_reloader = os.getenv('CLIPPER_DEV_RELOAD', 'false').lower() == 'true'
+    if not use_reloader or os.environ.get('WERKZEUG_RUN_MAIN') == 'true':
         ensure_discovery_scheduler(app)
-    app.run(host='0.0.0.0', port=5050, debug=True)
+    app.run(host='0.0.0.0', port=5050, debug=use_reloader, use_reloader=use_reloader)
