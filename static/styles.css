@@ -597,85 +597,6 @@ body {
 }
 
 /* ============================================
-   Substack Post Section
-   ============================================ */
-
-.substack-section {
-    margin-top: var(--spacing-lg);
-    padding-top: var(--spacing-lg);
-    border-top: 1px solid var(--glass-border);
-}
-
-.substack-section .summary-label {
-    display: flex;
-    justify-content: space-between;
-    align-items: center;
-    margin-bottom: var(--spacing-sm);
-}
-
-.substack-hint {
-    color: var(--text-secondary);
-    font-size: 0.875rem;
-    margin-bottom: var(--spacing-md);
-    line-height: 1.5;
-}
-
-.substack-preview {
-    width: 100%;
-    height: 280px;
-    padding: var(--spacing-md);
-    background: var(--bg-secondary);
-    border: 1px solid var(--glass-border);
-    border-radius: var(--radius-md);
-    color: var(--text-secondary);
-    font-family: inherit;
-    font-size: 0.875rem;
-    line-height: 1.6;
-    resize: vertical;
-    box-sizing: border-box;
-}
-
-.substack-preview:focus {
-    outline: none;
-    border-color: var(--accent-blue);
-}
-
-.substack-actions-inline {
-    display: flex;
-    gap: var(--spacing-xs);
-}
-
-.copy-substack-btn,
-.regenerate-substack-btn {
-    padding: 4px 12px;
-    font-size: 0.75rem;
-    border-radius: var(--radius-sm);
-    background: var(--bg-secondary);
-    border: 1px solid var(--glass-border);
-    color: var(--text-secondary);
-    cursor: pointer;
-    transition: background var(--transition-fast), color var(--transition-fast);
-    font-family: inherit;
-}
-
-.copy-substack-btn:hover {
-    background: var(--accent-blue);
-    color: #fff;
-    border-color: var(--accent-blue);
-}
-
-.regenerate-substack-btn:hover {
-    background: var(--accent-purple, #7c3aed);
-    color: #fff;
-    border-color: var(--accent-purple, #7c3aed);
-}
-
-.regenerate-substack-btn:disabled {
-    opacity: 0.6;
-    cursor: wait;
-}
-
-/* ============================================
    Hashtags Section
    ============================================ */
 
@@ -1443,21 +1364,6 @@ body {
     display: flex;
     gap: 8px;
 }
-.btn-video-qr {
-    font-size: 0.75rem !important;
-    padding: 6px 14px !important;
-    border-radius: var(--radius-md) !important;
-    white-space: nowrap;
-    text-decoration: none;
-}
-.btn-video-qr {
-    background: rgba(167, 139, 250, 0.15) !important;
-    border-color: rgba(167, 139, 250, 0.3) !important;
-    color: var(--color-violet) !important;
-}
-.btn-video-qr:hover {
-    background: rgba(167, 139, 250, 0.25) !important;
-}
 
 /* QR Modal Overlay */
 .qr-modal-overlay {
@@ -1478,24 +1384,6 @@ body {
     opacity: 1;
 }
 
-.qr-modal-content {
-    background: var(--color-panel);
-    border: 1px solid var(--border-subtle);
-    border-radius: var(--radius-2xl);
-    padding: 36px 32px;
-    max-width: 400px;
-    width: 90%;
-    text-align: center;
-    position: relative;
-    box-shadow: var(--shadow-elevated);
-    transform: scale(0.95);
-    transition: transform 0.2s var(--ease-spring);
-}
-
-.qr-modal-overlay.active .qr-modal-content {
-    transform: scale(1);
-}
-
 .qr-modal-close {
     position: absolute;
     top: 12px;
@@ -1512,60 +1400,6 @@ body {
 
 .qr-modal-close:hover {
     color: #fff;
-}
-
-.qr-modal-icon {
-    font-size: 2.5rem;
-    margin-bottom: 8px;
-}
-
-.qr-modal-title {
-    font-family: var(--font-display);
-    font-size: 1.25rem;
-    font-weight: 700;
-    color: var(--color-text-primary);
-    margin-bottom: 4px;
-}
-
-.qr-modal-subtitle {
-    font-size: 0.8rem;
-    color: var(--color-slate);
-    margin-bottom: 20px;
-}
-
-.qr-modal-code {
-    background: #fff;
-    border-radius: var(--radius-lg);
-    padding: 20px;
-    display: inline-block;
-    margin-bottom: 16px;
-}
-
-.qr-img {
-    width: 200px;
-    height: 200px;
-    display: block;
-}
-
-.qr-modal-instructions {
-    font-size: 0.8rem;
-    color: var(--color-slate-light);
-    line-height: 1.5;
-    margin-bottom: 16px;
-}
-
-.qr-modal-steps {
-    text-align: left;
-    background: var(--color-ink-light);
-    border-radius: var(--radius-md);
-    padding: 12px 16px;
-}
-
-.qr-step {
-    font-size: 0.75rem;
-    color: var(--color-text-secondary);
-    padding: 4px 0;
-    line-height: 1.4;
 }
 
 /* Video actions (Send to Phone for video) */

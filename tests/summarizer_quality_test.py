@@ -11,7 +11,6 @@ from summarizer import (
     find_script_quality_issues,
     find_summary_contract_issues,
     get_prompt,
-    get_substack_prompt,
 )
 
 
@@ -476,29 +475,6 @@ def test_quality_gate_blocks_rendering_if_no_provider_clears(monkeypatch):
     assert "em/en dash" in message
 
 
-def test_substack_prompt_removes_forced_human_affectations():
-    prompt = get_substack_prompt(
-        title="Ice plume study",
-        site_name="Example Science",
-        tldr="A probe sampled an ice plume.",
-        bullets=["The team measured salt and dust."],
-        hook_variants=["The plume carried grains from below the surface."],
-        scenes=[],
-        dominant_emotion="curious",
-    )
-
-    assert "knowledgeable, curious writer" in prompt
-    assert "most concrete scene, finding, or consequence" in prompt
-    assert "at most one > blockquote" in prompt
-    assert "Use bold only when it carries meaning" in prompt
-    assert "Use a one-word paragraph" not in prompt
-    assert "this broke my brain" not in prompt
-    assert "weird, right?" not in prompt
-    assert "Occasional lowercase" not in prompt
-    assert "single most mind-blowing insight" not in prompt
-    assert "Every technical idea needs" not in prompt
-
-
 @pytest.mark.parametrize(
     ("draft", "expected_issue"),
     [
@@ -547,69 +523,6 @@ def test_longform_quality_checker_allows_substantive_markdown():
     )
 
     assert find_longform_quality_issues(draft) == []
-
-
-def test_substack_quality_gate_tries_the_next_provider(monkeypatch):
-    responses = [
-        {
-            "post_title": "The hidden result",
-            "subtitle": "A vague claim",
-            "body": "## Result\n\nExperts agree this marks a pivotal moment.",
-        },
-        {
-            "post_title": "What the ice plume carried",
-            "subtitle": "Seventy-four samples point to the next field test",
-            "body": (
-                "## What the probe measured\n\n"
-                "A 2025 Oxford study tracked 74 samples at three temperatures: "
-                "5, 15, and 25 degrees.\n\n"
-                "## What comes next\n\n"
-                "The October expedition will test the sensor through an "
-                "Antarctic winter."
-            ),
-        },
-    ]
-    calls = []
-
-    class FakeResponse:
-        def __init__(self, payload):
-            self.payload = payload
-
-        def raise_for_status(self):
-            return None
-
-        def json(self):
-            return {
-                "choices": [
-                    {
-                        "message": {
-                            "content": json.dumps(self.payload),
-                        }
-                    }
-                ]
-            }
-
-    def fake_post(*_args, **_kwargs):
-        calls.append(True)
-        return FakeResponse(responses[len(calls) - 1])
-
-    article = SimpleNamespace(
-        title="Ice plume study",
-        site_name="Example Science",
-        tldr="A probe sampled an ice plume.",
-        bullets=json.dumps(["The team measured salt and dust."]),
-        hook_variants=json.dumps([]),
-        scenes=json.dumps([]),
-        dominant_emotion="curious",
-    )
-    monkeypatch.setenv("OPENROUTER_API_KEY", "test-key")
-    monkeypatch.setattr(summarizer.requests, "post", fake_post)
-
-    result = summarizer.generate_substack_post(article)
-
-    assert len(calls) == 2
-    assert "A 2025 Oxford study tracked 74 samples" in result
-    assert "Experts agree" not in result
 
 
 def test_parse_drops_unusable_alternate_hooks_but_keeps_the_chosen_one():

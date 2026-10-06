@@ -361,10 +361,6 @@ async function loadPublisherStatus() {
     }
 }
 
-function loadTikTokStatus() {
-    return loadPublisherStatus();
-}
-
 function platformAccountLabel(platform, connection) {
     if (platform === 'tiktok') {
         return connection.creator_nickname || connection.creator_username || 'Connected';
@@ -1097,47 +1093,6 @@ async function deleteArticle(articleId) {
 }
 
 // ============================================
-// QR Code Modal
-// ============================================
-
-function showQrModal(articleId, title) {
-    // Remove existing modal
-    closeQrModal();
-
-    const modal = document.createElement('div');
-    modal.id = 'qr-modal';
-    modal.className = 'qr-modal-overlay';
-    modal.onclick = (e) => { if (e.target === modal) closeQrModal(); };
-
-    const shortTitle = title.length > 50 ? title.slice(0, 50) + '...' : title;
-    const qrUrl = `/api/articles/${articleId}/video/qr`;
-    const steps = `<div class="qr-step">1️⃣ Scan QR → opens mobile page</div>
-           <div class="qr-step">2️⃣ Tap "Save Video" → saves to Camera Roll</div>
-           <div class="qr-step">3️⃣ Open TikTok → Create → Upload from Camera Roll</div>`;
-
-    modal.innerHTML = `
-        <div class="qr-modal-content">
-            <button class="qr-modal-close" onclick="closeQrModal()">&times;</button>
-            <div class="qr-modal-icon">📱</div>
-            <h3 class="qr-modal-title">Send Video to Phone</h3>
-            <p class="qr-modal-subtitle">${shortTitle}</p>
-            <div class="qr-modal-code">
-                <img src="${qrUrl}" alt="QR Code" class="qr-img">
-            </div>
-            <p class="qr-modal-instructions">
-                Scan this QR code with your iPhone camera.<br>
-                Make sure your phone is on the <strong>same WiFi</strong> network.
-            </p>
-            <div class="qr-modal-steps">
-                ${steps}
-            </div>
-        </div>
-    `;
-
-    document.body.appendChild(modal);
-    requestAnimationFrame(() => modal.classList.add('active'));
-}
-
 function renderVideoActions(article) {
     return `
         <div class="video-transfer-row">
@@ -1149,19 +1104,9 @@ function renderVideoActions(article) {
                class="btn btn-action btn-download" download>
                 Download
             </a>
-            <button class="btn btn-action btn-video-qr"
-                    onclick="sendVideoToPhone(${article.id})">
-                Send to phone
-            </button>
         </div>
         <p class="video-review-note">Before posting: does the first second show the real subject, and does the ending pay off the hook?</p>
     `;
-}
-
-function sendVideoToPhone(articleId) {
-    const article = articles.find(a => a.id === articleId);
-    closeVideoPlayer();
-    showQrModal(articleId, article ? article.title : '');
 }
 
 function openVideoPlayer(articleId) {
@@ -1202,14 +1147,6 @@ function closeVideoPlayer() {
     const video = modal.querySelector('video');
     if (video) video.pause();
     modal.remove();
-}
-
-function closeQrModal() {
-    const modal = document.getElementById('qr-modal');
-    if (modal) {
-        modal.classList.remove('active');
-        setTimeout(() => modal.remove(), 200);
-    }
 }
 
 // ============================================
@@ -2103,7 +2040,6 @@ function renderSummary(article) {
             </div>
         ` : ''}
 
-        ${renderSubstackSection(article)}
     `;
 }
 
@@ -2279,92 +2215,6 @@ function showToast(message, type = 'info') {
 // ============================================
 // Utility Functions
 // ============================================
-
-function renderSubstackSection(article) {
-    if (!article.tldr) return '';
-
-    if (article.substack_post) {
-        return `
-            <div class="substack-section">
-                <div class="summary-label">
-                    Substack Post
-                    <div class="substack-actions-inline">
-                        <button class="copy-substack-btn" onclick="copySubstackPost(event, ${article.id})">
-                            Copy Post
-                        </button>
-                        <button class="regenerate-substack-btn" id="substack-btn-${article.id}" onclick="generateSubstackPost(event, ${article.id}, true)" title="Regenerate with latest prompt">
-                            Regenerate
-                        </button>
-                    </div>
-                </div>
-                <textarea class="substack-preview" readonly>${escapeHtml(article.substack_post)}</textarea>
-            </div>
-        `;
-    }
-
-    return `
-        <div class="substack-section substack-generate">
-            <div class="summary-label">Substack Post</div>
-            <p class="substack-hint">Turn this story into a long-form newsletter your readers will love — with everyday analogies and a conversational tone.</p>
-            <button class="btn btn-secondary" id="substack-btn-${article.id}" onclick="generateSubstackPost(event, ${article.id})">
-                Generate Substack Post
-            </button>
-        </div>
-    `;
-}
-
-async function generateSubstackPost(event, articleId, regenerate = false) {
-    event.stopPropagation();
-    const btn = document.getElementById(`substack-btn-${articleId}`);
-    const originalText = btn ? btn.textContent : 'Generate Substack Post';
-    if (btn) {
-        btn.disabled = true;
-        btn.textContent = regenerate ? 'Regenerating…' : 'Generating…';
-    }
-
-    try {
-        const url = `/api/articles/${articleId}/substack${regenerate ? '?regenerate=1' : ''}`;
-        const response = await fetch(url, { method: 'POST' });
-        const data = await response.json();
-        if (!response.ok) throw new Error(data.error || 'Generation failed');
-
-        // Update in-memory array and re-render the card
-        const idx = articles.findIndex(a => a.id === articleId);
-        if (idx !== -1) articles[idx] = data.article;
-
-        const card = document.querySelector(`.article-card[data-article-id="${articleId}"]`);
-        if (card) {
-            const contentEl = card.querySelector('.article-content');
-            if (contentEl) {
-                contentEl.querySelector('.substack-section').outerHTML = renderSubstackSection(data.article);
-            }
-        }
-        showToast(regenerate ? 'Substack post regenerated!' : 'Substack post ready!', 'success');
-    } catch (err) {
-        console.error('Substack generation failed:', err);
-        showToast('Failed to generate Substack post', 'error');
-        if (btn) {
-            btn.disabled = false;
-            btn.textContent = originalText;
-        }
-    }
-}
-
-function copySubstackPost(event, articleId) {
-    event.stopPropagation();
-    const article = articles.find(a => a.id === articleId);
-    if (!article || !article.substack_post) return;
-
-    navigator.clipboard.writeText(article.substack_post).then(() => {
-        showToast('Substack post copied to clipboard!', 'success');
-        const btn = event.target.closest('.copy-substack-btn');
-        if (btn) {
-            const original = btn.textContent;
-            btn.textContent = 'Copied!';
-            setTimeout(() => { btn.textContent = original; }, 2000);
-        }
-    }).catch(() => showToast('Failed to copy post', 'error'));
-}
 
 function copyHashtags(event, articleId) {
     event.stopPropagation();

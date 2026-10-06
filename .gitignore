@@ -63,3 +63,6 @@ htmlcov/
 
 # Nested project with its own git history
 website/
+
+# Impeccable downloads its platform binary on first run; never commit it.
+.claude/skills/impeccable/scripts/bin/
