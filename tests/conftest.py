@@ -16,3 +16,9 @@ os.environ.setdefault(
     "SUMMARIZER_ERROR_LOG",
     os.path.join(tempfile.mkdtemp(prefix="clipper-tests-"), "summarizer_errors.log"),
 )
+
+# Modules call load_dotenv(), which never overrides a variable that is already
+# set. Blanking the paid image key here keeps a test that forgets to stub a
+# generator from spending real FAL credit. Export FAL_KEY in the shell to run
+# an intentional integration test.
+os.environ.setdefault("FAL_KEY", "")

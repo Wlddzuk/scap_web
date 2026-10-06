@@ -2091,10 +2091,12 @@ def _style_look(style_key: str | None, fallback: str) -> str:
     if not style_key:
         return fallback
     try:
-        from visual_styles import DEFAULT_STYLE, STYLES, apply_style
+        from visual_styles import STYLES, apply_style
     except Exception:  # visual_styles is optional at import time
         return fallback
-    if style_key == DEFAULT_STYLE or style_key not in STYLES:
+    # The fallback wording IS the Illustrated Science look, so that preset must
+    # keep it verbatim even though it is no longer the channel default.
+    if style_key == "illustrated_science" or style_key not in STYLES:
         return fallback
     return apply_style("", style_key)
 
@@ -2218,10 +2220,20 @@ def _grade_alpha_mask(width: int, height: int) -> Image.Image:
     return Image.fromarray(np.repeat(column[:, None], width, axis=1), mode="L")
 
 
+_DOCUMENTARY_FRAMINGS = (
+    (1.0, (0.50, 0.50)),
+    (1.3, (0.62, 0.40)),
+    (1.15, (0.30, 0.62)),
+    (1.3, (0.38, 0.30)),
+    (1.15, (0.70, 0.66)),
+)
+
+
 def _documentary_photo_variant(
     image: Image.Image,
     shot: dict,
     variant_index: int,
+    framings: tuple = _DOCUMENTARY_FRAMINGS,
 ) -> Image.Image:
     """Create a distinct editorial crop without inventing visual evidence."""
     source = resize_and_crop_image(image.convert("RGB"), VIDEO_WIDTH, VIDEO_HEIGHT)
@@ -2229,13 +2241,6 @@ def _documentary_photo_variant(
     # 3.5-18% crops were invisible, so a 10s scene looked like one frozen still
     # and viewers swiped. Alternate full frame, tight detail, and medium. The
     # detail stays at 1.3x because FLUX stills are already upscaled ~1.9x.
-    framings = (
-        (1.0, (0.50, 0.50)),
-        (1.3, (0.62, 0.40)),
-        (1.15, (0.30, 0.62)),
-        (1.3, (0.38, 0.30)),
-        (1.15, (0.70, 0.66)),
-    )
     scale, (anchor_x, anchor_y) = framings[variant_index % len(framings)]
 
     width = max(VIDEO_WIDTH, int(round(VIDEO_WIDTH * scale)))
@@ -3738,7 +3743,18 @@ def generate_video(
                 planned_still_cost + max_motion_cost,
             )
         # Step 4: Generate body images
-        if use_scenes:
+        from visual_styles import is_mascot_style
+
+        if use_scenes and is_mascot_style(style_key):
+            logger.info("Step 4: Generating Pixel Night Lab scenes...")
+            from mascot_style import generate_mascot_scene_images
+
+            themed_images = generate_mascot_scene_images(
+                full_shots,
+                article_title=title,
+                visual_sources_out=visual_sources_out,
+            )
+        elif use_scenes:
             logger.info("Step 4: Building documentary image edit...")
             themed_images = generate_referent_scene_images(
                 full_shots,

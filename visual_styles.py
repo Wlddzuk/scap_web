@@ -18,6 +18,24 @@ from llm_models import GROQ_EXTRA_BODY, GROQ_TEXT_MODEL
 
 
 STYLES = {
+    # The locked channel look (docs/style-lock/STYLE.md). "render": "mascot"
+    # routes scene videos through mascot_style.py: every scene is pixel art
+    # generated from Moss's reference, and archive photos are not used.
+    "pixel_night_lab": {
+        "name": "Pixel Night Lab",
+        "emoji": "👾",
+        "description": "Channel look: pixel-art Moss explores a dark universe; forces drawn in neon",
+        "palette": ["#0B1026", "#FF3DA8", "#FFB000", "#9ED9C3"],
+        "render": "mascot",
+        "base": (
+            "chunky 16-bit pixel art with a crisp visible pixel grid, solid flat deep "
+            "navy background with sparse twinkling pixel stars, invisible forces drawn "
+            "as neon magenta and amber lines, the subject is the brightest shape, "
+            "vertical 9:16, no text, no letters, no words, no labels"
+        ),
+        "hook_modifier": "the subject glowing brightest, one bold neon force line",
+        "good_for": ["science", "space", "physics", "biology", "discovery", "curious"],
+    },
     "illustrated_science": {
         "name": "Illustrated Science",
         "emoji": "🔬",
@@ -208,7 +226,12 @@ STYLES = {
     },
 }
 
-DEFAULT_STYLE = "illustrated_science"
+DEFAULT_STYLE = "pixel_night_lab"
+
+
+def is_mascot_style(key: str | None) -> bool:
+    """True when a style renders every scene from the mascot reference."""
+    return bool(key) and STYLES.get(key, {}).get("render") == "mascot"
 
 
 def list_styles() -> list:
@@ -223,6 +246,7 @@ def list_styles() -> list:
             # Surfaced so the dashboard can suggest a style for a story without
             # spending an LLM call before the user has committed to a render.
             "good_for": v["good_for"],
+            "render": v.get("render", "scenes"),
         }
         for k, v in STYLES.items()
     ]

@@ -55,11 +55,13 @@ def _summary_payload():
     }
 
 
-def test_illustrated_science_is_the_automatic_first_render_style():
-    assert visual_styles.DEFAULT_STYLE == "illustrated_science"
-    assert visual_styles.list_styles()[0]["key"] == "illustrated_science"
+def test_pixel_night_lab_is_the_locked_channel_style():
+    # Locked 2026-10-06 (docs/style-lock/STYLE.md); Illustrated Science remains
+    # available as a manual choice with its original wording.
+    assert visual_styles.DEFAULT_STYLE == "pixel_night_lab"
+    assert visual_styles.list_styles()[0]["key"] == "pixel_night_lab"
     assert visual_styles.auto_pick_style("Any science story", "Any script") == (
-        "illustrated_science"
+        "pixel_night_lab"
     )
     prompt = visual_styles.apply_style("a whale cutaway", "illustrated_science")
     assert "warm off-white paper" in prompt
@@ -70,7 +72,7 @@ def test_illustrated_science_is_the_automatic_first_render_style():
 def test_summary_parser_forces_brand_style_and_keeps_teaching_metadata():
     parsed = summarizer.parse_response(json.dumps(_summary_payload()))
 
-    assert parsed["suggested_style"] == "illustrated_science"
+    assert parsed["suggested_style"] == "pixel_night_lab"
     assert parsed["scenes"][0]["focus_label"] == "OXYGEN RESERVE EXTRA WORDS"
     assert parsed["scenes"][0]["visual_action"] == "reveal"
     # An unphotographable subject keeps its query: a whale's internal anatomy

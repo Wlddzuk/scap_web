@@ -57,7 +57,7 @@ def test_hook_and_body_keep_color_and_original_shot_alignment(
 
     vg.generate_video(1, "A discovery", script, scenes=scenes if scene_mode else None,
                       image_source="mixed", captions=False, use_video_hook=False,
-                      color_intensity="electric")
+                      color_intensity="electric", style_key="illustrated_science")
 
     if scene_mode:
         # Opening frames are graded once, exactly like body frames.

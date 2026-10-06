@@ -71,7 +71,7 @@ Shape that one fact as:
 === SCENE BEATS ===
 Break the script into 10-14 SCENES. For each scene provide:
 - speech: the exact narration for that beat (a slice of video_script, in order). Use complete sentences rather than disconnected fragments.
-- visual: a vivid concrete description of what is ON SCREEN - one clear subject, one clear action, one clear setting. Compose it as one illustration that can be progressively explained with a zoom, focus ring, arrow, and reveal. Keep the key detail near the center-right and leave clean space in the upper-left. Do NOT mention art style or medium here (style is applied separately). Do NOT include text/words/captions (platform adds captions).
+- visual: a vivid concrete description of what is ON SCREEN - one clear subject, one clear action, one clear setting. Compose it as one illustration that can be progressively explained with a zoom, focus ring, arrow, and reveal. Keep the key detail near the center-right and leave clean space in the upper-left. Do NOT mention art style or medium here (style is applied separately). Do NOT include text/words/captions (platform adds captions). Describe only physical things built from the literal science objects of this scene (cells, molecules, organs, rocks, planets, stars, instruments). Never describe a chart, graph, timeline, bar, axis, icon, badge, label, checkmark, readout or screen, and never substitute a metaphor such as plants, trees or buildings. Show an amount as a count or size of the real objects and time as those objects changing. No human hands. Never describe the background colour, lighting, glow, art style or any mascot or recurring character; the renderer adds those. For the final follow or question beat, show the story's main science object again rather than a book, desk or other everyday object.
 - emotion: one of [curious, shocking, urgent, triumphant, dark, funny]
 - focus_label: 1-4 factual concept words already spoken in this scene. Never use a person's name or an unanchored measurement. Never invent a new fact.
 - visual_action: one of [reveal, trace, compare, locate, sequence, highlight]
@@ -86,15 +86,15 @@ Break the script into 10-14 SCENES. For each scene provide:
 When concatenated in order, all scene.speech values must equal video_script.
 
 === STYLE SUGGESTION ===
-Always use illustrated_science. This is the channel's recognizable visual language:
-an intentional hand-drawn science explanation with a clean cutaway, diagram, or
-editorial illustration. It must look designed, not like a fake photograph.
+Always use pixel_night_lab. The renderer applies the whole look (medium,
+background, colours, lighting and any recurring character) by itself, so scene
+visuals must describe only the science subject and its action.
 
 === HOOK VARIANTS ===
 Write 3 consequence-first hook lines using different angles: what changes for the viewer or field, a vivid curiosity gap, and a counterintuitive implication. A specific question is allowed. Prefer 6-8 words and keep every hook to 12 words or fewer; word count alone does not guarantee a three-second delivery. All three must lead into the SAME setup and payoff without adding a claim absent from the article, because a user can swap the hook without rewriting the body. Then pick the strongest (best_hook_index 0/1/2). The chosen hook must be scene 1 of the scenes array and the opening of video_script.
 
 === PACKAGING ===
-- cover_line: 3-5 punchy words that capture the central fact. Make it suitable for ALL CAPS, with no sentence punctuation.
+- cover_line: 3-5 punchy words that capture the central fact. Make it suitable for ALL CAPS, with no sentence punctuation. It must not claim more than video_script does: keep the script's hedge ("may", "helped", "could") instead of turning a possibility into a certainty.
 - cta_question: one specific, easy-to-answer question about this story. It must also be the exact final spoken line of video_script and the final scene speech.
 - hashtags: exactly 3 high-relevance hashtags, with # prefixes. Prefer story-specific search terms over generic reach tags.
 - search_caption: one natural-language sentence a real person might type into TikTok search to find this exact story. Do not put the CTA or hashtags inside it.
@@ -108,7 +108,7 @@ Write 3 consequence-first hook lines using different angles: what changes for th
   "hook_variants": ["Hook option 1", "Hook option 2", "Hook option 3"],
   "best_hook_index": 0,
   "dominant_emotion": "curious|shocking|urgent|triumphant|dark|funny",
-  "suggested_style": "illustrated_science",
+  "suggested_style": "pixel_night_lab",
   "cover_line": "THREE TO FIVE WORDS",
   "cta_question": "Would you live on this planet?",
   "search_caption": "What scientists found in the atmosphere of K2-18b.",
