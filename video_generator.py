@@ -2,6 +2,7 @@
 TikTok-Style Video Generator - Parallel image generation + fast rendering.
 """
 
+import functools
 import os
 import re
 import time
@@ -192,6 +193,9 @@ MAX_IMAGE_WORKERS = 6
 DOCUMENTARY_PAGE_WHITE_SHARE = float(
     os.getenv("DOCUMENTARY_PAGE_WHITE_SHARE", "0.35") or 0.35
 )
+# Largest enlargement accepted when a wide photo is cropped full-bleed to 9:16.
+# Commons thumbnails arrive 1800px wide, so a 16:9 source needs about 1.9x.
+WIDE_PHOTO_MAX_UPSCALE = 2.2
 DOCUMENTARY_PAGE_MID_SHARE = float(
     os.getenv("DOCUMENTARY_PAGE_MID_SHARE", "0.35") or 0.35
 )
@@ -840,6 +844,8 @@ def transcribe_word_timestamps(
                         words.append({"text": text, "start": start, "end": end})
 
                 logger.info("[Captions] Transcribed %d timed words", len(words))
+                if script_text:
+                    words = align_words_to_script(words, script_text)
                 return words
             except Exception as exc:
                 logger.warning(
@@ -852,6 +858,89 @@ def transcribe_word_timestamps(
 
     logger.warning("[Captions] Continuing without word-synced captions")
     return []
+
+
+# Whisper emits the tail of "calcium-aluminum-rich" or "200,000" as separate
+# words ("-rich", ",000"); they start with a joiner and no space.
+_CONTINUATION_TOKEN = re.compile(r"^[-‐-–,.'’](?=\w)")
+# Script/transcript disagreements no larger than this are respelled from the
+# script; anything bigger is a real divergence and keeps Whisper's words.
+_ALIGN_MAX_SPAN = 4
+
+
+def _merge_continuation_words(words: list) -> list:
+    """Join word fragments that Whisper split at a hyphen, comma or apostrophe."""
+    merged = []
+    for word in words:
+        text = str(word.get("text", ""))
+        if merged and _CONTINUATION_TOKEN.match(text):
+            previous = merged[-1]
+            merged[-1] = {
+                **previous,
+                "text": previous["text"] + text,
+                "end": max(float(previous["end"]), float(word["end"])),
+            }
+        else:
+            merged.append(dict(word))
+    return merged
+
+
+def _alignment_key(text: str) -> str:
+    return re.sub(r"[^0-9a-z]", "", str(text).lower())
+
+
+def _spread_tokens(tokens: list, start: float, end: float) -> list:
+    """Time ``tokens`` across [start, end] in proportion to their length."""
+    weights = [max(1, len(_alignment_key(token))) for token in tokens]
+    total = float(sum(weights))
+    span = max(0.0, end - start)
+    timed = []
+    cursor = start
+    for token, weight in zip(tokens, weights):
+        token_end = cursor + span * weight / total
+        timed.append({"text": token, "start": cursor, "end": max(cursor + 0.05, token_end)})
+        cursor = token_end
+    return timed
+
+
+def align_words_to_script(words: list, script_text: str) -> list:
+    """Respell Whisper's timed words with the narration script's own words.
+
+    The narration is synthesized from the script, so the script is the true
+    text; Whisper only contributes timing. Misheard words ("micro -testless"
+    for "microteslas") and split numbers (",000") are replaced by the script
+    token over the same time span. Large disagreements keep Whisper's output
+    rather than guess.
+    """
+    words = _merge_continuation_words(words)
+    script_tokens = [token for token in str(script_text).split() if _alignment_key(token)]
+    if not words or not script_tokens:
+        return words
+
+    from difflib import SequenceMatcher
+
+    heard = [_alignment_key(word["text"]) for word in words]
+    written = [_alignment_key(token) for token in script_tokens]
+    aligned = []
+    matcher = SequenceMatcher(None, heard, written, autojunk=False)
+    for tag, i1, i2, j1, j2 in matcher.get_opcodes():
+        if tag == "equal":
+            for offset in range(i2 - i1):
+                aligned.append({**words[i1 + offset], "text": script_tokens[j1 + offset]})
+        elif tag == "replace" and max(i2 - i1, j2 - j1) <= _ALIGN_MAX_SPAN:
+            aligned.extend(_spread_tokens(
+                script_tokens[j1:j2], float(words[i1]["start"]), float(words[i2 - 1]["end"])
+            ))
+        elif tag == "delete" and i2 - i1 <= 2:
+            continue  # words Whisper heard that the narration never said
+        elif tag == "insert" and j2 - j1 <= 3:
+            gap_start = float(aligned[-1]["end"]) if aligned else 0.0
+            gap_end = float(words[i1]["start"]) if i1 < len(words) else gap_start
+            if gap_end - gap_start >= 0.08 * (j2 - j1):
+                aligned.extend(_spread_tokens(script_tokens[j1:j2], gap_start, gap_end))
+        else:
+            aligned.extend(dict(word) for word in words[i1:i2])
+    return aligned
 
 
 _CAPTION_WEAK_END_WORDS = {
@@ -2119,6 +2208,16 @@ def _symbolic_prompt(
     )
 
 
+@functools.lru_cache(maxsize=4)
+def _grade_alpha_mask(width: int, height: int) -> Image.Image:
+    """Vertical alpha ramp darkening the headline and caption zones smoothly."""
+    y = np.arange(height, dtype=np.float32) * (1920.0 / max(1, height))
+    top = 46.0 * np.clip(1.0 - y / 360.0, 0.0, 1.0) ** 1.5
+    bottom = 70.0 * np.clip((y - 1250.0) / (1920.0 - 1250.0), 0.0, 1.0) ** 1.5
+    column = np.maximum(top, bottom).astype(np.uint8)
+    return Image.fromarray(np.repeat(column[:, None], width, axis=1), mode="L")
+
+
 def _documentary_photo_variant(
     image: Image.Image,
     shot: dict,
@@ -2152,24 +2251,22 @@ def _documentary_photo_variant(
 
     # A restrained cinematic grade keeps captions readable while preserving
     # the photograph as the visual—not a card, diagram, or generated scene.
+    # Ramped, not solid: hard-edged bands read as letterbox bars on a phone.
     rgba = edited.convert("RGBA")
-    overlay = Image.new("RGBA", rgba.size, (0, 0, 0, 0))
-    draw = ImageDraw.Draw(overlay)
-    draw.rectangle((0, 0, VIDEO_WIDTH, 250), fill=(7, 12, 25, 38))
-    draw.rectangle((0, 1450, VIDEO_WIDTH, VIDEO_HEIGHT), fill=(7, 12, 25, 54))
+    overlay = Image.new("RGBA", rgba.size, (7, 12, 25, 0))
+    overlay.putalpha(_grade_alpha_mask(*rgba.size))
     return Image.alpha_composite(rgba, overlay).convert("RGB")
 
 
-def _salient_square_crop(source: Image.Image) -> Image.Image:
-    """Crop a wide photo to the square window holding the most detail.
+def _salient_square_crop(source: Image.Image, aspect: float = 1.0) -> Image.Image:
+    """Crop a wide photo to the ``aspect`` (w/h) window holding the most detail.
 
     A 16:9 photo fitted to a 9:16 frame fills only a third of the screen and
-    reads as letterboxing. A square keeps over half the photo and fills over
-    half the screen; choosing it by edge density rather than the centre keeps
-    an off-centre subject in frame.
+    reads as letterboxing. Choosing the window by edge density rather than the
+    centre keeps an off-centre subject in frame.
     """
     width, height = source.size
-    side = min(width, height)
+    side = min(width, int(round(height * aspect)))
     if width <= side:
         return source
     scale = 8
@@ -2216,6 +2313,14 @@ def _documentary_frame_image(
     # Only genuinely wide or tall sources get the blurred surround.
     if 0.62 <= source_ratio / max(0.01, target_ratio) <= 1.9:
         return resize_and_crop_image(source, target_width, target_height)
+
+    # A wide photo with enough resolution fills the frame with its most
+    # detailed vertical slice. The boxed-over-blur layout below read as black
+    # bars on every 4:3 and 16:9 archive photo, so it is kept only for sources
+    # too small to enlarge cleanly.
+    if source_ratio > target_ratio and target_height / source.height <= WIDE_PHOTO_MAX_UPSCALE:
+        window = _salient_square_crop(source, aspect=target_ratio)
+        return resize_and_crop_image(window, target_width, target_height)
 
     background = resize_and_crop_image(source, target_width, target_height)
     background = background.filter(
@@ -2283,8 +2388,15 @@ def _documentary_is_diagram_scan(image: Image.Image) -> bool:
     )
 
 
-def _documentary_image_is_usable(image: Image.Image) -> bool:
-    """Reject empty frames and unreadable scanned diagrams."""
+def _documentary_image_is_usable(image: Image.Image, *, generated: bool = False) -> bool:
+    """Reject empty frames and unreadable scanned diagrams.
+
+    ``generated`` skips the scanned-diagram test. That test exists for archive
+    scans with 6pt labels; our own illustrations are prompted to carry no
+    lettering, and the default Illustrated Science style is ink on off-white
+    paper, which the tone test cannot tell from a scan. Applying it to them
+    discarded every generated frame and left one pooled photo repeating.
+    """
     sample = image.convert("L")
     sample.thumbnail((96, 96), Image.Resampling.BILINEAR)
     contrast = float(ImageStat.Stat(sample).stddev[0])
@@ -2294,7 +2406,7 @@ def _documentary_image_is_usable(image: Image.Image) -> bool:
     edge_energy = float(ImageStat.Stat(edges).mean[0])
     if not (contrast >= 20.0 or edge_energy >= 5.0):
         return False
-    return not _documentary_is_diagram_scan(image)
+    return generated or not _documentary_is_diagram_scan(image)
 
 
 _DOCUMENTARY_QUERY_STOPWORDS = frozenset({
@@ -2892,7 +3004,12 @@ def generate_referent_scene_images(
             for index in generated_indexes
         ], premium_flags=[True] * len(generated_indexes))
         for index, image in zip(generated_indexes, generated):
-            if image is None or not _documentary_image_is_usable(image):
+            if image is None or not _documentary_image_is_usable(image, generated=True):
+                logger.info(
+                    "[DocumentaryVisuals] Generated frame for scene %d was blank; "
+                    "falling back to the image pool",
+                    index,
+                )
                 continue
             generated_lane = route_scene(scenes[index])
             scene_assets[index] = (image, {
@@ -2909,7 +3026,11 @@ def generate_referent_scene_images(
 
     images = []
     records = []
-    reuse_cursor = 0
+    # Count how often each pooled image already appears so a fallback spreads
+    # across the pool. Picking the first "relevant" candidate used to repeat a
+    # single photo for every unfilled scene -- 25 seconds of one frame.
+    usage = Counter(id(asset[0]) for asset in scene_assets if asset is not None)
+    previous_image_id = None
     for index, scene in enumerate(scenes):
         asset = scene_assets[index]
         reused = False
@@ -2918,19 +3039,10 @@ def generate_referent_scene_images(
             # gradient used to be emitted here, which shipped a blank card in
             # the middle of the edit -- at 2 seconds that reads as a broken
             # video and costs the whole view. Any real image already earned by
-            # this story is better than a blank frame, so reuse before
-            # despairing: prefer one whose query overlaps this scene, else take
-            # the next pooled image in rotation so one photo is not repeated.
-            relevant_pool = [
-                candidate for candidate in image_pool
-                if _expanded_reference_tokens(_scene_evidence_query(scene, article_title))
-                & _expanded_reference_tokens(" ".join((
-                    str(candidate[1].get("search_query") or ""),
-                    str(candidate[1].get("evidence_query") or ""),
-                )))
-            ]
-            fallback_pool = relevant_pool or image_pool
-            if not fallback_pool:
+            # this story is better than a blank frame, so reuse the least-used
+            # pooled image, preferring one whose query overlaps this scene and
+            # never the image the previous scene just showed.
+            if not image_pool:
                 # Nothing was found or generated for the entire story. There is
                 # no video worth publishing here, so fail loudly and let the
                 # caller mark the article failed rather than emit blank frames.
@@ -2938,9 +3050,26 @@ def generate_referent_scene_images(
                     "No usable imagery for any scene; refusing to render "
                     "placeholder frames"
                 )
-            asset = fallback_pool[reuse_cursor % len(fallback_pool)]
-            reuse_cursor += 1
+            scene_tokens = _expanded_reference_tokens(
+                _scene_evidence_query(scene, article_title)
+            )
+            candidates = [
+                candidate for candidate in image_pool
+                if id(candidate[0]) != previous_image_id
+            ] or image_pool
+            asset = min(
+                candidates,
+                key=lambda candidate: (
+                    usage[id(candidate[0])],
+                    not (scene_tokens & _expanded_reference_tokens(" ".join((
+                        str(candidate[1].get("search_query") or ""),
+                        str(candidate[1].get("evidence_query") or ""),
+                    )))),
+                ),
+            )
+            usage[id(asset[0])] += 1
             reused = True
+        previous_image_id = id(asset[0])
         image, base_record = asset
         record = dict(base_record)
         if reused:
