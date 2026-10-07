@@ -57,7 +57,7 @@ URL ──scrape──▶ Article(status=scraped)
 This is the most important cross-file invariant. `summarizer.py` emits a `scenes[]` array where each scene has `{speech, visual, emotion}`, and **concatenating all `scene.speech` in order must equal `video_script`**. `parse_response()` reconstructs `video_script` from scenes if the model omits it. Downstream:
 
 - `pixel_scenes.generate_scene_images(shots)` produces one image per scene from `scene.visual`.
-- `compute_scene_durations()` allocates time per scene proportional to `len(speech.split())` so visuals stay aligned with narration.
+- `build_scene_shot_plan(scenes, total, timed_words)` cuts each scene on its first spoken word (`scene_speech_starts()` matches scene tokens against the aligned Whisper words). Without usable timings it falls back to `compute_scene_durations()`, which splits by `len(speech.split())` — that split ignores pauses and drifts 1–2s ahead of the voice, so it is only a fallback.
 - If `scenes` is missing, `generate_video()` builds one scene per `chunk_text()` chunk.
 
 When changing the scene schema, update the prompt in `summarizer.get_prompt()`, `parse_response()`'s normalization, and `generate_video()`. Also add a column to `models.Article` **and** to `_migrate_schema()` in `app.py` (see below).
