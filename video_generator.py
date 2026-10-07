@@ -37,6 +37,7 @@ from moviepy.audio.fx import all as afx
 from PIL import Image, ImageDraw, ImageEnhance, ImageFilter, ImageFont, ImageStat
 import requests
 from dotenv import load_dotenv
+import pixel_grid
 import tts_engine
 from visual_styles import strip_lettering_requests
 
@@ -1202,7 +1203,19 @@ def create_clip(
     zoom_factor: float = 0.03,
     motion: str = "push",
 ) -> VideoClip:
-    """Create a smooth varied Ken Burns move with no exposed frame edges."""
+    """Create a smooth varied Ken Burns move with no exposed frame edges.
+
+    A gridded Pixel Night Lab shot moves in whole pixels on 12 fps steps instead.
+    """
+    grid = pixel_grid.grid_of(image)
+    if grid is not None:
+        low, anchor = grid
+        duration = max(0.05, float(duration))
+        motion = motion if motion in SHOT_MOTIONS else "push"
+        return VideoClip(
+            make_frame=lambda t: pixel_grid.frame_at(low, t, duration, motion, anchor),
+            duration=duration,
+        )
     source = resize_and_crop_image(image.convert("RGB"), VIDEO_WIDTH, VIDEO_HEIGHT)
     duration = max(0.05, float(duration))
     motion = motion if motion in SHOT_MOTIONS else "push"

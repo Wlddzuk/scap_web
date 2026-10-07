@@ -12,6 +12,7 @@ from concurrent.futures import ThreadPoolExecutor, as_completed
 
 from PIL import Image
 
+import pixel_grid
 import scene_check
 import video_generator as vg
 from llm_models import GROQ_EXTRA_BODY, GROQ_TEXT_MODEL
@@ -121,6 +122,11 @@ def build_scene_prompt(scene: dict) -> str:
     if _SPACE_SCENE.search(subject):
         parts.append(SPACE_SCIENCE)
     return " ".join(parts)
+
+
+def pixel_grid_enabled() -> bool:
+    """PIXEL_GRID=off falls back to the smooth LANCZOS framings."""
+    return os.getenv("PIXEL_GRID", "on").strip().lower() not in {"0", "off", "false", "no"}
 
 
 def check_and_retry(scenes: list, images: list) -> dict:
@@ -237,7 +243,18 @@ def generate_scene_images(shots: list, *, visual_sources_out: list | None = None
         "[Pixel] generated=%d reused=%d",
         len(generated), len(images) - len(generated),
     )
+    steps = [int((shot or {}).get("_shot_step", slot)) for slot, shot in enumerate(shots)]
+    if not pixel_grid_enabled():
+        return [
+            vg.shot_variant(images[unique_index], step, FRAMINGS)
+            for step, unique_index in zip(steps, slot_to_unique)
+        ]
+    # One grid per scene image; each shot is a framing window that create_clip moves.
+    grids = {}
+    for unique_index in slot_to_unique:
+        if unique_index not in grids:
+            grids[unique_index] = pixel_grid.gridify(images[unique_index], grade_mask=vg._grade_alpha_mask)
     return [
-        vg.shot_variant(images[unique_index], int((shot or {}).get("_shot_step", slot)), FRAMINGS)
-        for slot, (shot, unique_index) in enumerate(zip(shots, slot_to_unique))
+        pixel_grid.gridded_shot(grids[unique_index], FRAMINGS[step % len(FRAMINGS)][1])
+        for step, unique_index in zip(steps, slot_to_unique)
     ]

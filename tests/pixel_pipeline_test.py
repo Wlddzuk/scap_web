@@ -95,6 +95,53 @@ def test_no_generated_scene_refuses_to_render(monkeypatch):
         pixel_scenes.generate_scene_images(_shots("a cell"))
 
 
+# --- pixel grid -------------------------------------------------------------------
+
+def _blocks_are_whole_pixels(frame, px):
+    """Every px x px block of the frame is a single colour."""
+    blocks = frame.reshape(frame.shape[0] // px, px, frame.shape[1] // px, px, 3)
+    return bool((blocks == blocks[:, :1, :, :1]).all())
+
+
+def test_grid_snaps_to_a_limited_palette_of_whole_pixels():
+    import pixel_grid
+
+    smooth = Image.radial_gradient("L").resize((1080, 1920)).convert("RGB")   # all soft edges
+    low = pixel_grid.gridify(smooth, grade_mask=vg._grade_alpha_mask)
+    assert low.shape == (384, 216, 3)
+    assert len(np.unique(low.reshape(-1, 3), axis=0)) <= pixel_grid.COLORS + 3
+    assert _blocks_are_whole_pixels(pixel_grid.upscale(low, pixel_grid.BASE_PX), pixel_grid.BASE_PX)
+
+
+def test_every_motion_moves_in_whole_pixels_on_12fps_steps():
+    import pixel_grid
+
+    low = pixel_grid.gridify(_pixel_frame())
+    for motion in vg.SHOT_MOTIONS:
+        frames = [pixel_grid.frame_at(low, t / 30, 2.5, motion, (0.5, 0.05)) for t in range(75)]
+        assert all(f.shape == (1920, 1080, 3) for f in frames)
+        assert all(_blocks_are_whole_pixels(f, 5) or _blocks_are_whole_pixels(f, 6) for f in frames)
+        # 30 fps frames inside one 12 fps step are identical
+        assert np.array_equal(frames[0], frames[1])
+        assert not np.array_equal(frames[0], frames[-1])        # but the shot does move
+
+
+def test_scene_images_come_back_gridded_and_create_clip_moves_them(monkeypatch):
+    monkeypatch.setenv("FAL_KEY", "test")
+    monkeypatch.setattr(vg, "get_groq_client", lambda: None)
+    monkeypatch.setattr(vg, "generate_image_fal", lambda *a, **k: _pixel_frame())
+    images = pixel_scenes.generate_scene_images(_shots("a meteorite", "a young star"))
+    import pixel_grid
+
+    assert all(pixel_grid.grid_of(image) is not None and image.size == (1080, 1920) for image in images)
+    clip = vg.create_clip(images[0], 2.0, motion="pan-left")
+    assert _blocks_are_whole_pixels(clip.get_frame(1.0), pixel_grid.CROP_PX)
+
+    monkeypatch.setenv("PIXEL_GRID", "off")
+    smooth = pixel_scenes.generate_scene_images(_shots("a meteorite"))
+    assert pixel_grid.grid_of(smooth[0]) is None
+
+
 # --- scene check ----------------------------------------------------------------
 
 def test_verdict_blocks_on_text_character_and_off_brief_but_not_stray_objects():
