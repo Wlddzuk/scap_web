@@ -2,7 +2,8 @@
 
 One look only (docs/style-lock/STYLE.md). Pipeline:
     1. TTS narration, then word timings (captions, Moss's reactions, music ducking)
-    2. Scene shot plan sized by each scene's words, capped at MAX_SHOT_DURATION
+    2. Scene shot plan cut on each scene's first spoken word (word-count split
+       without timings), capped at MAX_SHOT_DURATION
     3. One pixel scene image per scene (pixel_scenes.py)
     4. Hook cuts, body shots with a push/pan, then Moss (moss_sprite.py) over the
        picture and captions over everything
@@ -1264,6 +1265,74 @@ def compute_scene_durations(scenes: list, total_time: float) -> list:
     return [max(0.3, d) for d in durations]
 
 
+MIN_SCENE_DURATION = 0.3
+
+
+def scene_speech_starts(scenes: list, timed_words: list) -> list | None:
+    """When each scene's first word is spoken, from aligned word timings.
+
+    Word counts ignore sentence pauses and the narrator's lead-in, so a
+    word-proportional split drifts ahead of the voice (a second or more by
+    mid-video). Each scene's tokens are matched against the timed words; a
+    scene starts at its first matched word. Returns None when the timings
+    can't anchor the scenes, so callers fall back to the word-count split.
+    """
+    if not scenes or not timed_words:
+        return None
+
+    from difflib import SequenceMatcher
+
+    tokens, token_scene = [], []
+    for scene_index, scene in enumerate(scenes):
+        for token in str(scene.get("speech") or "").split():
+            key = _alignment_key(token)
+            if key:
+                tokens.append(key)
+                token_scene.append(scene_index)
+    heard = [_alignment_key(word.get("text", "")) for word in timed_words]
+
+    first_heard: dict[int, float] = {}
+    matched = 0
+    matcher = SequenceMatcher(None, tokens, heard, autojunk=False)
+    for block in matcher.get_matching_blocks():
+        matched += block.size
+        for offset in range(block.size):
+            scene_index = token_scene[block.a + offset]
+            if scene_index not in first_heard:
+                first_heard[scene_index] = float(timed_words[block.b + offset]["start"])
+    if not tokens or matched < 0.6 * len(tokens):
+        return None
+
+    starts = [0.0]
+    for scene_index in range(1, len(scenes)):
+        start = first_heard.get(scene_index)
+        if start is None or start < starts[-1]:
+            return None
+        starts.append(start)
+    return starts
+
+
+def compute_timed_scene_durations(
+    scenes: list, total_time: float, timed_words: list | None = None,
+) -> list:
+    """Scene durations that cut on each scene's first spoken word.
+
+    Falls back to the word-count split when timings are missing or unusable.
+    Durations always sum to ``total_time``.
+    """
+    starts = scene_speech_starts(scenes, timed_words or [])
+    if starts is None:
+        return compute_scene_durations(scenes, total_time)
+    # Keep every scene on screen long enough to register without shifting the
+    # cuts that follow it.
+    for index in range(1, len(starts)):
+        starts[index] = max(starts[index], starts[index - 1] + MIN_SCENE_DURATION)
+    if starts[-1] > total_time - MIN_SCENE_DURATION:
+        return compute_scene_durations(scenes, total_time)
+    ends = starts[1:] + [float(total_time)]
+    return [end - start for start, end in zip(starts, ends)]
+
+
 def split_shot_duration(
     duration: float,
     max_duration: float = MAX_SHOT_DURATION,
@@ -1295,10 +1364,16 @@ def create_final_padding_clips(main_video, duration: float) -> list:
     ]
 
 
-def build_scene_shot_plan(scenes: list, total_time: float) -> list:
-    """Expand narration scenes into deterministic, shot-capped visual beats."""
+def build_scene_shot_plan(
+    scenes: list, total_time: float, timed_words: list | None = None,
+) -> list:
+    """Expand narration scenes into deterministic, shot-capped visual beats.
+
+    With ``timed_words`` each scene's first shot starts when its first word is
+    spoken; without them scenes are sized by word count.
+    """
     plan = []
-    scene_durations = compute_scene_durations(scenes, total_time)
+    scene_durations = compute_timed_scene_durations(scenes, total_time, timed_words)
     for scene_index, scene in enumerate(scenes):
         duration = (
             scene_durations[scene_index]
@@ -1492,7 +1567,7 @@ def generate_video(
         caption_groups = group_words_for_captions(timed_words) if captions else []
 
         hook_len = min(HOOK_DURATION, max(2.0, audio_duration * 0.25))
-        full_shots = build_scene_shot_plan(scenes, audio_duration)
+        full_shots = build_scene_shot_plan(scenes, audio_duration, timed_words)
         body_slots = split_plan_at_hook(full_shots, hook_len)
 
         logger.info("Step 3: Generating scene images...")
