@@ -114,6 +114,8 @@ Any server-side URL fetch must go through `validate_url()` in `app.py`, which re
 
 `pixel_scenes.generate_scene_images()` generates one image per scene in a `ThreadPoolExecutor(max_workers=MAX_IMAGE_WORKERS=6)`, then expands it into per-shot framings. A failed scene reuses the nearest generated scene; if none succeeds the render fails instead of shipping blank frames. A video costs about $0.005 per scene (`pixel_scenes.estimate_video_cost`).
 
+**Scene check** (`scene_check.py`): before stitching, a cheap OpenRouter vision model (`SCENE_CHECK_MODEL`, default `google/gemini-2.5-flash-lite`) looks at each scene image. Lettering, an unasked-for character, or an image that doesn't show the scene's `visual` triggers one regeneration (at most `MAX_SCENE_RETRIES`=3 per video), and the image with fewer issues is kept. Stray objects are advisory only, because the checker kept flagging the style's own energy lines and glows. The checker never blocks a render, and results land in `visual_sources`. Tests run with `SCENE_CHECK=off` (conftest). The Gemini free tier was tried and is unusable for this: 5 requests/min, plus 503s.
+
 ## Project-specific conventions
 
 - **Captions are burned in by the renderer, never by the image model.** `create_caption_clips()` draws word-synced (Whisper) captions plus the opening `cover_line` headline. Scene prompts never ask for text, and `generate_image_fal()` appends a no-text suffix. Captions take their spelling from the script (`align_words_to_script()`), not from Whisper's guesses.

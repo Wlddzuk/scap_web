@@ -22,3 +22,7 @@ os.environ.setdefault(
 # generator from spending real FAL credit. Export FAL_KEY in the shell to run
 # an intentional integration test.
 os.environ.setdefault("FAL_KEY", "")
+
+# The scene checker calls a paid vision model; tests that exercise it turn it on
+# themselves with monkeypatch.setenv("SCENE_CHECK", "on").
+os.environ.setdefault("SCENE_CHECK", "off")

@@ -95,6 +95,83 @@ def test_no_generated_scene_refuses_to_render(monkeypatch):
         pixel_scenes.generate_scene_images(_shots("a cell"))
 
 
+# --- scene check ----------------------------------------------------------------
+
+def test_verdict_blocks_on_text_character_and_off_brief_but_not_stray_objects():
+    import scene_check
+
+    stray = scene_check.parse_verdict('{"text": false, "character": false, "unrequested": ["asteroids"], "matches": true}')
+    assert stray.passed and stray.score == 1
+    bad = scene_check.parse_verdict('```json\n{"text": true, "character": true, "unrequested": [], "matches": false}\n```')
+    assert bad.issues == ["text", "character", "off-brief"] and bad.score > stray.score
+
+
+def _checked_run(monkeypatch, verdict_for):
+    """Run generate_scene_images with fake FAL images and a fake checker keyed on colour."""
+    import scene_check
+
+    monkeypatch.setenv("FAL_KEY", "test")
+    monkeypatch.setenv("SCENE_CHECK", "on")
+    monkeypatch.setenv("OPENROUTER_API_KEY", "test")
+    monkeypatch.setattr(vg, "get_groq_client", lambda: None)
+    colours = iter([(255, 61, 168), (255, 176, 0), (158, 217, 195), (240, 240, 240)] * 3)
+    calls = []
+
+    def fake_fal(prompt, *, model=None, num_inference_steps=None):
+        calls.append(prompt)
+        return _pixel_frame(next(colours))
+
+    monkeypatch.setattr(vg, "generate_image_fal", fake_fal)
+    monkeypatch.setattr(scene_check, "check_scene_image",
+                        lambda image, visual: verdict_for(image.getpixel((540, 600)), visual))
+    return calls
+
+
+def test_failed_scene_is_regenerated_and_the_better_image_kept(monkeypatch):
+    import scene_check
+
+    def verdict_for(colour, visual):
+        # the first image of "a meteorite" (magenta) has lettering; its retry does not
+        text = colour == (255, 61, 168)
+        return scene_check.SceneVerdict(text=text, checked=True)
+
+    calls = _checked_run(monkeypatch, verdict_for)
+    records = []
+    images = pixel_scenes.generate_scene_images(_shots("a meteorite", "a young star"), visual_sources_out=records)
+    assert len(calls) == 3                                   # two scenes + one retry
+    assert records[0]["check"] == ["text"] and records[0]["kept"] == "retry"
+    assert records[1]["check"] == ["pass"] and "retry" not in records[1]
+    assert len(images) == 2
+
+
+def test_retry_that_is_no_better_keeps_the_first_image_and_retries_are_capped(monkeypatch):
+    import scene_check
+
+    monkeypatch.setattr(pixel_scenes, "MAX_SCENE_RETRIES", 2)
+    calls = _checked_run(monkeypatch, lambda colour, visual: scene_check.SceneVerdict(matches=False, checked=True))
+    records = []
+    pixel_scenes.generate_scene_images(_shots("a", "b", "c", "d"), visual_sources_out=records)
+    assert len(calls) == 4 + 2
+    assert [r.get("kept") for r in records] == ["first", "first", None, None]
+
+
+def test_checker_off_or_unavailable_never_blocks(monkeypatch):
+    import scene_check
+
+    monkeypatch.setenv("SCENE_CHECK", "off")
+    assert not scene_check.enabled()
+    assert scene_check.check_scene_image(_pixel_frame(), "a cell").passed
+    monkeypatch.setenv("SCENE_CHECK", "on")
+    monkeypatch.setenv("OPENROUTER_API_KEY", "test")
+
+    def boom(*a, **k):
+        raise TimeoutError("no network in tests")
+
+    monkeypatch.setattr(scene_check.requests, "post", boom)
+    verdict = scene_check.check_scene_image(_pixel_frame(), "a cell")
+    assert verdict.passed and not verdict.checked
+
+
 # --- Moss ---------------------------------------------------------------------
 
 def test_moss_hosts_the_hook_every_other_scene_and_the_last():

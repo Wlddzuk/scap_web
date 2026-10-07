@@ -12,6 +12,7 @@ from concurrent.futures import ThreadPoolExecutor, as_completed
 
 from PIL import Image
 
+import scene_check
 import video_generator as vg
 from llm_models import GROQ_EXTRA_BODY, GROQ_TEXT_MODEL
 
@@ -23,6 +24,8 @@ SCENE_IMAGE_MODEL = (
     os.getenv("SCENE_IMAGE_MODEL", "fal-ai/z-image/turbo").strip() or "fal-ai/z-image/turbo"
 )
 SCENE_IMAGE_COST_USD = vg._bounded_float_env("SCENE_IMAGE_COST_USD", 0.005, 0.0, 10.0)
+# Scene images the checker may regenerate per video (each costs one more image).
+MAX_SCENE_RETRIES = vg._bounded_int_env("MAX_SCENE_RETRIES", 3, 0, 20)
 
 # The scene model has no negative prompt: every noun it reads, it draws
 # ("never planets or rings" produced a ringed planet over a lab bench). Keep
@@ -120,6 +123,53 @@ def build_scene_prompt(scene: dict) -> str:
     return " ".join(parts)
 
 
+def check_and_retry(scenes: list, images: list) -> dict:
+    """Check each generated image; regenerate a failed scene once and keep the better image.
+
+    Mutates ``images`` in place and returns {scene index: record fields} for the
+    visual_sources log. Retries are capped per video so a bad prompt can't run up cost.
+    """
+    if not scene_check.enabled():
+        return {}
+    todo = [index for index, image in enumerate(images) if image is not None]
+    visual = lambda index: str(scenes[index].get("_physical_visual") or scenes[index].get("visual") or "")
+    with ThreadPoolExecutor(max_workers=vg.MAX_IMAGE_WORKERS) as executor:
+        verdicts = dict(zip(todo, executor.map(lambda i: scene_check.check_scene_image(images[i], visual(i)), todo)))
+
+    failed = [index for index in todo if not verdicts[index].passed][:MAX_SCENE_RETRIES]
+
+    def retry(index):
+        try:
+            image = vg.generate_image_fal(build_scene_prompt(scenes[index]), model=SCENE_IMAGE_MODEL, num_inference_steps=None)
+        except Exception as exc:
+            logger.info("[SceneCheck] Retry of scene %d failed: %s", index, exc)
+            return None, None
+        if image is None or not vg.is_usable_frame(image):
+            return None, None
+        return image, scene_check.check_scene_image(image, visual(index))
+
+    retried = {}
+    if failed:
+        with ThreadPoolExecutor(max_workers=vg.MAX_IMAGE_WORKERS) as executor:
+            retried = dict(zip(failed, executor.map(retry, failed)))
+
+    out = {}
+    for index, verdict in verdicts.items():
+        record = {"check": verdict.issues or ["pass"]} if verdict.checked else {}
+        image, second = retried.get(index, (None, None))
+        if image is not None:
+            kept_retry = second.score < verdict.score
+            if kept_retry:
+                images[index] = image
+            record.update(retry=second.issues or ["pass"], kept="retry" if kept_retry else "first")
+        if verdict.checked and not verdict.passed:
+            logger.info("[SceneCheck] Scene %d %s: %s -> %s", index, verdict.issues, verdict.note,
+                        record.get("kept", "no retry"))
+        out[index] = record
+    logger.info("[SceneCheck] %d checked, %d failed, %d regenerated", len(verdicts), len(failed), len(retried))
+    return out
+
+
 def generate_scene_images(shots: list, *, visual_sources_out: list | None = None) -> list:
     """Return one pixel frame per shot, in shot order (one image per scene)."""
     unique_positions, slot_to_unique, scene_to_unique = [], [], {}
@@ -167,6 +217,8 @@ def generate_scene_images(shots: list, *, visual_sources_out: list | None = None
                 # generate_image_fal returns a flat gradient on failure.
                 images[index] = image if image is not None and vg.is_usable_frame(image) else None
 
+    checks = check_and_retry(scenes, images)
+
     generated = [index for index, image in enumerate(images) if image is not None]
     if not generated:
         raise RuntimeError("No scene image could be generated; refusing to render a blank video")
@@ -178,7 +230,7 @@ def generate_scene_images(shots: list, *, visual_sources_out: list | None = None
             images[index] = images[nearest]
             records.append({"lane": "pixel", "provider": SCENE_IMAGE_MODEL, "reused_from": nearest})
         else:
-            records.append({"lane": "pixel", "provider": SCENE_IMAGE_MODEL})
+            records.append({"lane": "pixel", "provider": SCENE_IMAGE_MODEL, **checks.get(index, {})})
     if visual_sources_out is not None:
         visual_sources_out.extend(records)
     logger.info(
