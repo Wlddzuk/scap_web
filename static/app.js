@@ -456,8 +456,11 @@ function renderPublisherConnections() {
         const connection = platformConnections[p] || {};
         return platformNeedsReconnect(connection) || Boolean(platformExpiryMessage(connection));
     });
+    // Always say "Accounts": a chip that only read "TikTok" hid where to connect the rest.
+    const notConnected = platforms.length - connected.length;
     label.textContent = connected.length
-        ? `${connected.map(platformDisplayName).join(', ')}${warning ? ' \u00B7 check' : ''}`
+        ? `Accounts \u00B7 ${connected.map(platformDisplayName).join(', ')}` +
+          (warning ? ' \u00B7 check' : notConnected ? ` +${notConnected}` : '')
         : 'Connect accounts';
     menu.classList.toggle('connected', connected.length > 0 && !warning);
     menu.classList.toggle('warning', warning);
