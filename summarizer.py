@@ -40,11 +40,11 @@ Shape that one fact as:
 3. ESCALATION - Add the strongest source-backed evidence that raises the stakes or sharpens the picture.
 4. TURN - Reveal the mechanism, contradiction, or detail that changes how the viewer understands the fact.
 5. PAYOFF - Deliver the concrete consequence promised by the hook. Any curiosity gap must be fully paid off before the CTA.
-6. FOLLOW REASON - After delivering the payoff, include one brief invitation of at most 10 words to follow for a specific kind of explanation in this story's series lane. For example, "Follow for the evidence behind space discoveries." Adapt the topic to the story. Offer a repeatable editorial benefit, never an invented sequel, posting schedule, or withheld answer.
+6. FOLLOW REASON - After delivering the payoff, include one brief invitation of at most 7 words to follow for a specific kind of explanation in this story's series lane. For example, "Follow for more space evidence." Adapt the topic to the story. Offer a repeatable editorial benefit, never an invented sequel, posting schedule, or withheld answer.
 7. CTA QUESTION - End with one specific, answerable question tied to this story. This exact question is the final spoken line. Keep both closing lines brief so they do not crowd out the explanation.
 
 === WRITING RULES ===
-- TARGET: video_script must be 100-130 words, including the follow invitation and final CTA question. Keep the finished video in the 40-55 second range. Do not compress it into a 20-30 second script.
+- TARGET: video_script must be 65-80 words, including the follow invitation and final CTA question. Keep the finished video in the 30-35 second range. Most viewers decide by second 5, so state the central fact in scene 1 or 2 (within about 3 seconds) and spend the rest explaining it. Keep SETUP, ESCALATION and TURN to about one sentence each; cut any detail that does not serve the central fact.
 - PLAIN LANGUAGE: write for a curious 14-year-old with no science background. Use at most two technical terms in the whole script, and explain each one in everyday words in the same sentence. Scene 1 must contain no technical term at all. When a mechanism is hard to picture, give one concrete everyday comparison that the article's facts support, such as metronomes on one table falling into step.
 - Use concrete specifics: real names, measured numbers, places, actions, and consequences.
 - Use second person only when the story directly affects the viewer. Never force "you" or "your".
@@ -52,6 +52,7 @@ Shape that one fact as:
 - Prefer active voice and everyday words. Remove throat-clearing, filler, and abstract business language.
 - Every claim must be supported by the supplied article. Never heighten a fact beyond the source.
 - Preserve limitations that change the meaning: distinguish a simulation from an observation, an animal study from human evidence, and a correlation from a cause. Do not turn a proposed application into an available product or a tentative signal into a confirmed discovery.
+- SHORT DOES NOT MEAN STRONGER: when you cut words, cut detail, never the hedge or the condition a number depends on. Keep "may", "could", "linked to" and "in mice" when the source uses them, and keep the condition with its number ("21 percent fewer gut species for every extra 100 grams of sugar", not "sugar cuts gut species by 21 percent").
 - Apply that same evidence standard to ALL hooks and cover copy. For an observational screen-time study, say the measures were linked; do not say screen time "boosts" a brain score, even with "could" or "may". A qualifier does not fix a causal claim the study cannot support.
 - Lead with the fact. Do not use throat-clearing such as "here's the thing", faux-insight such as "the part everyone misses", or rhetorical labels such as "plot twist".
 - Name the study, institution, researcher, report, or dataset behind a claim. Never hide behind "experts agree", "studies show", or "many argue".
@@ -69,7 +70,7 @@ Shape that one fact as:
 - Choose one dominant story emotion for visuals from: curious, shocking, urgent, triumphant, dark, funny. This label does not instruct the narrator to perform that emotion at maximum intensity.
 
 === SCENE BEATS ===
-Break the script into 10-14 SCENES. For each scene provide:
+Break the script into 6-9 SCENES. For each scene provide:
 - speech: the exact narration for that beat (a slice of video_script, in order). Use complete sentences rather than disconnected fragments.
 - visual: a vivid concrete description of what is ON SCREEN - one clear subject, one clear action, one clear setting. Keep the main subject large and in the upper half of the frame. Do NOT mention art style or medium here (style is applied separately). Do NOT include text/words/captions (platform adds captions). Describe only physical things built from the literal science objects of this scene (cells, molecules, organs, rocks, planets, stars, instruments). Never describe a chart, graph, timeline, bar, axis, icon, badge, label, checkmark, readout or screen, and never substitute a metaphor such as plants, trees or buildings. Show an amount as a count or size of the real objects and time as those objects changing. No human hands. Never describe the background colour, lighting, glow, art style or any mascot or recurring character; the renderer adds those. For the final follow or question beat, show the story's main science object again rather than a book, desk or other everyday object.
 - emotion: one of [curious, shocking, urgent, triumphant, dark, funny]
@@ -81,7 +82,7 @@ background, colours, lighting and any recurring character) by itself, so scene
 visuals must describe only the science subject and its action.
 
 === HOOK VARIANTS ===
-Write 3 consequence-first hook lines using different angles: what changes for the viewer or field, a vivid curiosity gap, and a counterintuitive implication. A specific question is allowed. Prefer 6-8 words and keep every hook to 12 words or fewer; word count alone does not guarantee a three-second delivery. All three must lead into the SAME setup and payoff without adding a claim absent from the article, because a user can swap the hook without rewriting the body. Then pick the strongest (best_hook_index 0/1/2). The chosen hook must be scene 1 of the scenes array and the opening of video_script.
+Write 3 consequence-first hook lines using different angles: what changes for the viewer or field, a vivid curiosity gap, and a counterintuitive implication. A specific question is allowed. Use 5-8 words and never more than 10: the hook must be spoken in under three seconds, so cut qualifiers that the next sentence can carry. All three must lead into the SAME setup and payoff without adding a claim absent from the article, because a user can swap the hook without rewriting the body. Then pick the strongest (best_hook_index 0/1/2). The chosen hook must be scene 1 of the scenes array and the opening of video_script.
 
 === PACKAGING ===
 - cover_line: 3-5 punchy words that capture the central fact. Make it suitable for ALL CAPS, with no sentence punctuation. It must not claim more than video_script does: keep the script's hedge ("may", "helped", "could") instead of turning a possibility into a certainty.
@@ -119,7 +120,7 @@ ARTICLE CONTENT:
 
 
 SERIES_LANES = frozenset({"space", "human_body", "future_tech", "other"})
-HOOK_MAX_WORDS = 12
+HOOK_MAX_WORDS = 10
 SEARCH_CAPTION_MAX_CHARS = 220
 CTA_QUESTION_MAX_CHARS = 220
 HASHTAG_MAX_CHARS = 64
@@ -531,9 +532,10 @@ def summarize_with_gemini(title: str, content: str) -> dict:
 
 
 # Word-count bands for the narration. Below the target, the story is unlikely
-# to fill the intended 40-55 seconds; over the warn band, delivery gets rushed.
-SCRIPT_WORD_TARGET = (100, 130)
-SCRIPT_WORD_WARN_OVER = 140
+# to fill the intended 30-35 seconds (~2.2 spoken words/s); over the warn band,
+# the video runs past the length viewers stay for.
+SCRIPT_WORD_TARGET = (65, 80)
+SCRIPT_WORD_WARN_OVER = 88
 
 _CLICKBAIT_PATTERNS = (
     ("you won't believe", re.compile(r"\byou (?:will not|won['’]t) believe\b", re.I)),
@@ -965,12 +967,12 @@ def _log_script_stats(result: dict, provider: str) -> None:
     if wc < lo:
         print(
             f"[Summarizer] WARN {provider}: script is {wc} words "
-            f"(target {lo}-{hi}). Delivery may be shorter than 45 seconds."
+            f"(target {lo}-{hi}). Delivery may be shorter than 30 seconds."
         )
     elif wc > SCRIPT_WORD_WARN_OVER:
         print(
             f"[Summarizer] WARN {provider}: script is {wc} words "
-            f"(target {lo}-{hi}). Delivery will feel rushed at ~60s."
+            f"(target {lo}-{hi}). Video will run past ~40 seconds."
         )
     elif wc > hi:
         print(
