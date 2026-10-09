@@ -1,4 +1,4 @@
-"""Fast unit coverage for bounded motion and narration-safe music helpers."""
+"""Fast unit coverage for image retries, narration-safe music and failed renders."""
 
 from pathlib import Path
 import wave
@@ -8,41 +8,6 @@ from moviepy.audio.AudioClip import AudioClip
 import pytest
 
 import video_generator
-
-
-def sample_scenes():
-    return [
-        {"visual": "opening telescope", "speech": "Look at this.", "emotion": "curiosity"},
-        {"visual": "quiet laboratory", "speech": "Researchers measured it.", "emotion": "neutral"},
-        {"visual": "star exploding", "speech": "Then everything changed!", "emotion": "awe"},
-        {"visual": "new planet", "speech": "A world appeared.", "emotion": "surprise"},
-    ]
-
-
-def test_motion_scene_selection_respects_limit_and_skips_hook_scene():
-    selected = video_generator.select_motion_scene_indexes(sample_scenes(), 2)
-
-    assert len(selected) == 2
-    assert 0 not in selected
-    assert 2 in selected
-
-
-def test_failed_body_motion_generation_returns_still_fallbacks(monkeypatch):
-    monkeypatch.setattr(
-        video_generator,
-        "generate_motion_video_fal",
-        lambda *args, **kwargs: None,
-    )
-
-    clips = video_generator.create_body_motion_clips(
-        sample_scenes(),
-        durations=[1.0, 1.0, 1.0, 1.0],
-        style_key=None,
-        video_model="test-model",
-        clip_limit=2,
-    )
-
-    assert clips == {}
 
 
 def test_music_envelope_ducks_during_speech():
@@ -73,12 +38,6 @@ def test_fal_still_generation_has_bounded_wait_and_fallback(monkeypatch):
     assert result == "fallback"
     assert call["timeout"] == video_generator.FAL_IMAGE_TIMEOUT_SECONDS
     assert call["start_timeout"] <= call["timeout"]
-
-
-def test_motion_clip_cap_enforces_count_and_dollar_ceiling():
-    assert video_generator._effective_motion_clip_cap(12, 0.18) == 3
-    assert video_generator._effective_motion_clip_cap(12, 0.25) == 2
-    assert video_generator._effective_motion_clip_cap(2, 0.18) == 2
 
 
 def test_music_mix_normalizes_track_before_target_gain(tmp_path):
@@ -146,8 +105,10 @@ def test_failed_render_removes_partial_output(monkeypatch, tmp_path):
     monkeypatch.setenv("MUSIC_ENABLED", "false")
     monkeypatch.setattr(video_generator.tts_engine, "synthesize", lambda *_args, **_kwargs: "voice.wav")
     monkeypatch.setattr(video_generator, "AudioFileClip", lambda _path: _FakeAudio())
-    monkeypatch.setattr(video_generator, "generate_themed_images", lambda *_args, **_kwargs: [object()])
+    monkeypatch.setattr(video_generator, "transcribe_word_timestamps", lambda *_args, **_kwargs: [])
+    monkeypatch.setattr("pixel_scenes.generate_scene_images", lambda shots, **_kwargs: [object()] * len(shots))
     monkeypatch.setattr(video_generator, "create_hook_clips", lambda *_args, **_kwargs: [object()])
+    monkeypatch.setattr("moss_sprite.create_moss_overlay", lambda *_args, **_kwargs: None)
     monkeypatch.setattr(video_generator, "create_clip", lambda *_args, **_kwargs: object())
     monkeypatch.setattr(video_generator, "concatenate_videoclips", lambda *_args, **_kwargs: _FailingRenderClip())
     monkeypatch.setattr(video_generator, "create_headline_clip", lambda *_args, **_kwargs: None)
@@ -157,9 +118,7 @@ def test_failed_render_removes_partial_output(monkeypatch, tmp_path):
             article_id=9,
             title="Test",
             script="short script",
-            image_source="ai",
             captions=False,
-            use_video_hook=False,
         )
 
     assert list((tmp_path / "static" / "videos").glob("article_9_*.mp4")) == []

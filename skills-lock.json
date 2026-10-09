@@ -1,0 +1,23 @@
+{
+  "version": 1,
+  "skills": {
+    "character-design-continuity": {
+      "source": "calesthio/generative-media-skills",
+      "sourceType": "github",
+      "skillPath": "skills/production/creative-direction/character-design-continuity/SKILL.md",
+      "computedHash": "379166cc8ead7080958507e91333aabcf38b976547f049a2558af2f62e8c4e16"
+    },
+    "social-short-production": {
+      "source": "calesthio/generative-media-skills",
+      "sourceType": "github",
+      "skillPath": "skills/production/content-formats/social-short-production/SKILL.md",
+      "computedHash": "073dd5c01eebe03747f7704cd41c658b89a81424f25d3ada1e1b7faa859be3ea"
+    },
+    "visual-style-direction": {
+      "source": "calesthio/generative-media-skills",
+      "sourceType": "github",
+      "skillPath": "skills/production/creative-direction/visual-style-direction/SKILL.md",
+      "computedHash": "3e129c33dd5d548941737bc2dfe641392554e18883fd32e7f58f761f5e5e597c"
+    }
+  }
+}

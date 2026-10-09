@@ -6,6 +6,35 @@ from datetime import datetime, timezone
 db = SQLAlchemy()
 
 
+def find_matching_hook_index(hook_variants, scenes):
+    """Return the variant whose text exactly matches scene one's speech.
+
+    Whitespace at either edge is ignored, but this intentionally does not do
+    fuzzy matching: attribution should remain unknown when the stored script
+    is not one of the generated variants.
+    """
+    if not isinstance(hook_variants, list) or not isinstance(scenes, list) or not scenes:
+        return None
+    first_scene = scenes[0]
+    if not isinstance(first_scene, dict):
+        return None
+    first_speech = first_scene.get("speech")
+    if not isinstance(first_speech, str) or not first_speech.strip():
+        return None
+    normalized_speech = first_speech.strip()
+    for index, variant in enumerate(hook_variants):
+        if isinstance(variant, str) and variant.strip() == normalized_speech:
+            return index
+    return None
+
+
+def valid_hook_index(value, hook_variants):
+    """Return a strict in-range hook index, otherwise ``None``."""
+    if type(value) is not int or not isinstance(hook_variants, list):
+        return None
+    return value if 0 <= value < len(hook_variants) else None
+
+
 class Article(db.Model):
     """Scraped article from the browser."""
 
@@ -32,13 +61,21 @@ class Article(db.Model):
     tldr = db.Column(db.Text, nullable=True)
     bullets = db.Column(db.Text, nullable=True)  # JSON array stored as text
     video_script = db.Column(db.Text, nullable=True)
-    hashtags = db.Column(db.Text, nullable=True)  # JSON array of 5 hashtags
+    hashtags = db.Column(db.Text, nullable=True)  # JSON array of 3 hashtags
+    cover_line = db.Column(db.String(128), nullable=True)
+    cta_question = db.Column(db.String(512), nullable=True)
+    search_caption = db.Column(db.Text, nullable=True)
+    series_lane = db.Column(db.String(32), nullable=True)
 
     # Engagement metadata (populated by summarizer for story-shaped video gen)
     scenes = db.Column(db.Text, nullable=True)  # JSON array of {speech, visual, emotion}
     hook_variants = db.Column(db.Text, nullable=True)  # JSON array of 3 alt opening lines
+    best_hook_index = db.Column(db.Integer, nullable=True)
+    hook_index_used = db.Column(db.Integer, nullable=True)
     dominant_emotion = db.Column(db.String(32), nullable=True)
     style = db.Column(db.String(32), nullable=True)  # visual_styles key
+    color_intensity = db.Column(db.String(16), nullable=True)
+    visual_sources = db.Column(db.Text, nullable=True)  # JSON audit record per scene
 
     # Video output
     video_path = db.Column(db.String(512), nullable=True)
@@ -91,10 +128,18 @@ class Article(db.Model):
             'bullets': json.loads(self.bullets) if self.bullets else None,
             'video_script': self.video_script,
             'hashtags': json.loads(self.hashtags) if self.hashtags else None,
+            'cover_line': self.cover_line,
+            'cta_question': self.cta_question,
+            'search_caption': self.search_caption,
+            'series_lane': self.series_lane,
             'scenes': json.loads(self.scenes) if self.scenes else None,
             'hook_variants': json.loads(self.hook_variants) if self.hook_variants else None,
+            'best_hook_index': self.best_hook_index,
+            'hook_index_used': self.hook_index_used,
             'dominant_emotion': self.dominant_emotion,
             'style': self.style,
+            'color_intensity': self.color_intensity or 'vivid',
+            'visual_sources': json.loads(self.visual_sources) if self.visual_sources else None,
             'video_path': self.video_path,
             'tiktok_publish_id': self.tiktok_publish_id,
             'tiktok_publish_status': self.tiktok_publish_status,

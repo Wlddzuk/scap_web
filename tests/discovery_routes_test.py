@@ -105,6 +105,53 @@ class DiscoveryRouteTests(unittest.TestCase):
         self.assertTrue(response.get_json()["started"])
         start.assert_called_once_with(self.app, "0123456789abcdef")
 
+    def test_make_video_ignores_legacy_style_and_color_fields(self):
+        """Old clients may still send style/color; the locked look ignores them."""
+        self._save_shortlist()
+        candidate = {"candidate_id": "0123456789abcdef", "title": "Story"}
+        with patch.object(
+            discovery_web,
+            "start_candidate_pipeline",
+            return_value=("started", candidate),
+        ) as start:
+            response = self.client.post(
+                "/api/discovery/candidates/0123456789abcdef/make-video",
+                json={"style": "manga", "color_intensity": "electric"},
+            )
+
+        self.assertEqual(response.status_code, 202)
+        start.assert_called_once_with(self.app, "0123456789abcdef")
+
+    def test_candidate_worker_runs_the_pipeline_for_the_candidate(self):
+        self._save_shortlist()
+
+        class FakeCandidate:
+            def __init__(self, **values):
+                self.__dict__.update(values)
+
+        fake_story_finder = types.ModuleType("story_finder")
+        fake_story_finder.StoryCandidate = FakeCandidate
+        process = unittest.mock.Mock(
+            return_value={"status": "video_done", "article_id": 44}
+        )
+        fake_story_finder._process_candidate = process
+        owner = discovery_web._try_file_lock(
+            self.app,
+            "candidate-worker-color",
+        )
+
+        with patch.dict(sys.modules, {"story_finder": fake_story_finder}):
+            discovery_web._run_candidate_worker(
+                self.app,
+                owner,
+                "0123456789abcdef",
+                discovery_web._read_state(self.app)["candidates"][0],
+                0,
+            )
+
+        process.assert_called_once()
+        self.assertEqual(process.call_args.kwargs, {})
+
     def test_make_video_rejects_unknown_or_malformed_candidate(self):
         malformed = self.client.post(
             "/api/discovery/candidates/not-a-candidate/make-video"
@@ -151,12 +198,24 @@ class DiscoveryRouteTests(unittest.TestCase):
 
         discovery_web._update_state(self.app, mark_processing)
 
-        with patch.object(discovery_web, "Thread") as thread_type:
-            self.assertFalse(discovery_web.start_discovery(self.app, trigger="manual"))
+        owner = discovery_web._try_file_lock(self.app, "candidate-0123456789abcdef")
+        try:
+            with patch.object(discovery_web, "Thread") as thread_type:
+                self.assertFalse(discovery_web.start_discovery(self.app, trigger="manual"))
+            self.assertFalse(thread_type.called)
+            state = discovery_web._read_state(self.app)
+            self.assertEqual(state["candidates"][0]["pipeline_status"], "processing")
+        finally:
+            discovery_web._release_file_lock(owner)
 
+    def test_abandoned_candidate_becomes_retryable_without_starting_worker(self):
+        self._save_shortlist()
+        discovery_web._update_state(self.app, lambda state: state["candidates"][0].update(pipeline_status="processing"))
+        with patch.object(discovery_web, "Thread") as thread_type:
+            payload = self.client.get("/api/discovery/candidates").get_json()
+        self.assertEqual(payload["candidates"][0]["pipeline_status"], "failed")
+        self.assertIn("interrupted", payload["candidates"][0]["pipeline_error"])
         self.assertFalse(thread_type.called)
-        state = discovery_web._read_state(self.app)
-        self.assertEqual(state["candidates"][0]["pipeline_status"], "processing")
 
     def test_candidate_queue_rejects_a_stale_shortlist_version(self):
         self._save_shortlist()
@@ -297,6 +356,14 @@ class DiscoveryFrontendTests(unittest.TestCase):
         self.assertIn("Math.min(discoveryPollDelayMs * 2, DISCOVERY_POLL_MAX_MS)", script)
         self.assertIn("if (document.hidden || !discoveryIsBusy()) return;", script)
         self.assertIn("if (document.hidden) {\n            stopDiscoveryPolling();", script)
+
+    def test_failed_ranking_is_visible_and_not_rendered_as_no_unseen_stories(self):
+        script = (PROJECT_ROOT / "static" / "app.js").read_text(encoding="utf-8")
+
+        self.assertIn("previousDiscoveryStatus === 'running' && data.status === 'failed'", script)
+        self.assertIn("const isFailed = discoveryState.status === 'failed';", script)
+        self.assertIn("discoveryState.error || 'Story discovery failed. Please try again.'", script)
+        self.assertIn("container.classList.toggle('hidden', !isComplete && !isFailed);", script)
 
     def test_empty_dashboard_renders_on_first_fetch_and_hidden_is_global(self):
         markup = (PROJECT_ROOT / "static" / "index.html").read_text(encoding="utf-8")

@@ -21,7 +21,7 @@ from pathlib import Path
 from threading import Lock, Thread
 from typing import Any, Iterator, Optional, TextIO
 
-from flask import Blueprint, current_app, jsonify
+from flask import Blueprint, current_app, jsonify, request
 
 try:  # fcntl is available on the Linux/macOS hosts Clipper supports.
     import fcntl
@@ -51,6 +51,12 @@ _SCRAPE_FAILURE_MESSAGES = {
         "summary was too short to use."
     ),
     "not_enough_text": "Scrape failed: the source did not contain enough readable text.",
+}
+_DISCOVERY_FAILURE_MESSAGES = {
+    "scoring_unavailable": (
+        "Stories were found, but the ranking service is temporarily unavailable. "
+        "Please try again."
+    ),
 }
 
 
@@ -197,7 +203,34 @@ def _read_state_unlocked(flask_app) -> dict[str, Any]:
 
 def _read_state(flask_app) -> dict[str, Any]:
     with _state_file_guard(flask_app):
-        return _read_state_unlocked(flask_app)
+        state = _read_state_unlocked(flask_app)
+        changed = False
+        # A persisted busy flag is not proof that a worker survived a restart.
+        # Live workers hold this lock from queueing through final-state commit.
+        if fcntl is not None:
+            for candidate in state.get("candidates", []):
+                if candidate.get("pipeline_status") not in {"queued", "processing"}:
+                    continue
+                candidate_id = str(candidate.get("candidate_id") or "")
+                if len(candidate_id) != 16 or any(c not in "0123456789abcdef" for c in candidate_id):
+                    continue
+                owner = _try_file_lock(flask_app, f"candidate-{candidate_id}")
+                if owner is None:
+                    continue
+                try:
+                    candidate["pipeline_status"] = "failed"
+                    candidate["failure_stage"] = "pipeline"
+                    candidate["pipeline_error"] = (
+                        "Video job was interrupted. Review the article and retry when ready."
+                    )
+                    candidate["result"] = {"status": "failed", "failure_stage": "pipeline",
+                                           "pipeline_error": candidate["pipeline_error"]}
+                    changed = True
+                finally:
+                    _release_file_lock(owner)
+        if changed:
+            _write_state_unlocked(flask_app, state)
+        return state
 
 
 def _write_state_unlocked(flask_app, state: dict[str, Any]) -> None:
@@ -254,6 +287,14 @@ def _public_candidate(candidate, rank: int) -> dict[str, Any]:
     return payload
 
 
+def _public_discovery_error(error: Exception) -> str:
+    """Map known discovery failures to safe, actionable browser copy."""
+    return _DISCOVERY_FAILURE_MESSAGES.get(
+        str(getattr(error, "error_code", "") or ""),
+        "Story discovery failed. Please try again.",
+    )
+
+
 def _run_discovery_worker(
     flask_app,
     owner: TextIO,
@@ -290,8 +331,9 @@ def _run_discovery_worker(
 
         _update_state(flask_app, complete)
         logger.info("Discovery completed with %d ranked candidates (%s)", len(candidates), trigger)
-    except Exception:
+    except Exception as error:
         logger.error("Discovery run failed", exc_info=True)
+        public_error = _public_discovery_error(error)
 
         def fail(state):
             if int(state.get("run_version") or 0) != run_version:
@@ -300,7 +342,7 @@ def _run_discovery_worker(
                 {
                     "status": "failed",
                     "running": False,
-                    "error": "Story discovery failed. Please try again.",
+                    "error": public_error,
                     "trigger": trigger,
                 }
             )
@@ -483,7 +525,10 @@ def _run_candidate_worker(
         _release_file_lock(owner)
 
 
-def start_candidate_pipeline(flask_app, candidate_id: str) -> tuple[str, Optional[dict[str, Any]]]:
+def start_candidate_pipeline(
+    flask_app,
+    candidate_id: str,
+) -> tuple[str, Optional[dict[str, Any]]]:
     """Queue one shortlist candidate and guard against duplicate video jobs."""
     state = _read_state(flask_app)
     candidate = _find_candidate(state, candidate_id)
@@ -656,9 +701,11 @@ def make_discovery_video_route(candidate_id: str):
     if len(candidate_id) != 16 or any(char not in "0123456789abcdef" for char in candidate_id):
         return jsonify({"error": "Story candidate not found"}), 404
 
+    # The look is the locked channel style; a request body is accepted but unused.
     try:
         outcome, candidate = start_candidate_pipeline(
-            current_app._get_current_object(), candidate_id
+            current_app._get_current_object(),
+            candidate_id,
         )
     except Exception:
         return jsonify({"error": "Video creation could not be started"}), 500

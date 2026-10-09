@@ -12,8 +12,9 @@ import hmac
 import time
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from datetime import datetime, timezone, timedelta
-from urllib.parse import urlparse, urlencode, quote
+from urllib.parse import urlparse, urljoin, urlencode, quote
 from threading import Event, Lock, Thread
+from tempfile import TemporaryDirectory
 import shutil
 import zipfile
 from io import BytesIO
@@ -31,15 +32,22 @@ load_dotenv()
 from models import (
     db,
     Article,
+    find_matching_hook_index,
     PlatformPost,
     PublisherAccount,
     TikTokAccount,
+    valid_hook_index,
     VideoMetrics,
 )
-from summarizer import summarize_article
+from summarizer import (
+    HASHTAG_MAX_CHARS,
+    SEARCH_CAPTION_MAX_CHARS,
+    CTA_QUESTION_MAX_CHARS,
+    summarize_article,
+)
 from video_generator import generate_video
-from carousel_generator import generate_carousel
-from visual_styles import list_styles, get_style, STYLES as VISUAL_STYLES
+import tts_engine
+from visual_styles import DEFAULT_STYLE
 from tiktok_service import (
     AUTH_URL as TIKTOK_AUTH_URL,
     TikTokAPIError,
@@ -75,6 +83,12 @@ logging.basicConfig(
     format='%(asctime)s - %(name)s - %(levelname)s - %(message)s'
 )
 logger = logging.getLogger(__name__)
+
+VOICE_TONES = frozenset(tts_engine.VOICE_TONE_PRESETS)
+VOICE_PREVIEW_TEXT = (
+    "A single bolt of lightning can heat the air five times hotter than the "
+    "surface of the sun. The surrounding air expands so fast that we hear thunder."
+)
 
 
 # ============================================================
@@ -144,14 +158,38 @@ def scrape_url_content(url):
         'Accept-Language': 'en-US,en;q=0.9',
     }
 
-    response = requests.get(url, headers=headers, timeout=15, allow_redirects=True)
-    response.raise_for_status()
+    # Validate each redirect before fetching it. Checking response.url after
+    # automatic redirects is too late: the private target has already been read.
+    fetch_url = url
+    for redirect_count in range(6):
+        response = requests.get(
+            fetch_url, headers=headers, timeout=15, allow_redirects=False
+        )
+        if response.status_code in (301, 302, 303, 307, 308):
+            location = response.headers.get('Location')
+            response.close()
+            if not location:
+                raise ValueError('Article redirect has no destination')
+            if redirect_count == 5:
+                raise ValueError('Article URL redirects too many times')
+            fetch_url = validate_url(urljoin(fetch_url, location))
+            continue
+        response.raise_for_status()
+        break
 
-    # Validate final URL after redirects
-    if response.url != url:
-        validate_url(response.url)
-
-    soup = BeautifulSoup(response.text, 'html.parser')
+    # requests assumes ISO-8859-1 for any text/* response without a charset,
+    # which turned UTF-8 curly quotes into "â" in stored titles. Hand
+    # BeautifulSoup the raw bytes so the page's own <meta charset> wins unless
+    # the server explicitly declared one.
+    raw_html = getattr(response, 'content', None)
+    if isinstance(raw_html, bytes):
+        content_type = (getattr(response, 'headers', None) or {}).get('Content-Type', '')
+        charset = re.search(r'charset=([\w-]+)', content_type if isinstance(content_type, str) else '', re.I)
+        soup = BeautifulSoup(
+            raw_html, 'html.parser', from_encoding=charset.group(1) if charset else None
+        )
+    else:
+        soup = BeautifulSoup(response.text, 'html.parser')
 
     # Remove unwanted elements
     for tag in soup(['script', 'style', 'nav', 'footer', 'header', 'aside', 'iframe']):
@@ -261,8 +299,16 @@ def _migrate_schema():
     new_cols = [
         ("scenes", "TEXT"),
         ("hook_variants", "TEXT"),
+        ("best_hook_index", "INTEGER"),
+        ("hook_index_used", "INTEGER"),
         ("dominant_emotion", "VARCHAR(32)"),
         ("style", "VARCHAR(32)"),
+        ("color_intensity", "VARCHAR(16)"),
+        ("visual_sources", "TEXT"),
+        ("cover_line", "VARCHAR(128)"),
+        ("cta_question", "VARCHAR(512)"),
+        ("search_caption", "TEXT"),
+        ("series_lane", "VARCHAR(32)"),
         ("substack_post", "TEXT"),
         ("carousel_dir", "VARCHAR(512)"),
         ("carousel_audio", "VARCHAR(512)"),
@@ -794,20 +840,33 @@ def _video_duration_seconds(video_path):
 
 
 def suggested_tiktok_caption(article):
-    """Build the same title + hashtag caption used by the dashboard."""
+    """Build search copy + CTA + three hashtags for the posting dialog."""
     hashtags = []
     if article.hashtags:
         try:
             parsed = json.loads(article.hashtags)
             if isinstance(parsed, list):
-                hashtags = [str(tag) for tag in parsed if str(tag).strip()]
+                hashtags = [
+                    str(tag).strip()[:HASHTAG_MAX_CHARS].rstrip()
+                    for tag in parsed
+                    if str(tag).strip()
+                ][:3]
         except (json.JSONDecodeError, TypeError):
             pass
-    hashtag_text = ' '.join(hashtags)
-    caption = article.title
-    if hashtag_text:
-        caption += f'\n\n{hashtag_text}'
-    return caption[:2_200]
+    search_caption = str(
+        getattr(article, 'search_caption', None) or article.title
+    ).strip()[:SEARCH_CAPTION_MAX_CHARS].rstrip()
+    cta_question = str(
+        getattr(article, 'cta_question', None) or ''
+    ).strip()[:CTA_QUESTION_MAX_CHARS].rstrip()
+    # Bound each field before joining instead of slicing the final block. That
+    # keeps the required CTA and three hashtags intact at the tail.
+    caption_parts = [
+        search_caption,
+        cta_question,
+        ' '.join(hashtags),
+    ]
+    return '\n\n'.join(part for part in caption_parts if part)
 
 
 def _make_tiktok_publisher():
@@ -1392,11 +1451,12 @@ def _facebook_access_token():
     return _oauth_cipher().decrypt(account.access_token_encrypted), account
 
 
-def _expiry_metadata(account, *, warning_days):
-    if account is None or not account.access_token_expires_at:
+def _expiry_metadata(account, *, warning_days, attribute='access_token_expires_at'):
+    expires_at = getattr(account, attribute, None) if account is not None else None
+    if not expires_at:
         return {'days_until_expiry': None, 'expiry_warning': False, 'expired': False}
     seconds = (
-        _as_utc(account.access_token_expires_at) - datetime.now(timezone.utc)
+        _as_utc(expires_at) - datetime.now(timezone.utc)
     ).total_seconds()
     return {
         'days_until_expiry': max(0, int(seconds // 86_400)),
@@ -1421,7 +1481,11 @@ def _publisher_status_payload():
     }
     if tiktok:
         tiktok_payload.update(tiktok.to_public_dict())
-        tiktok_payload.update(_expiry_metadata(tiktok, warning_days=7))
+        # TikTok access tokens last 24h and _tiktok_access_token() refreshes
+        # them silently; only the long-lived refresh token needs the user.
+        tiktok_payload.update(_expiry_metadata(
+            tiktok, warning_days=7, attribute='refresh_token_expires_at'
+        ))
         granted = _tiktok_granted_scopes(tiktok)
         missing_posting = [
             scope for scope in TIKTOK_POSTING_SCOPES if scope not in granted
@@ -1952,16 +2016,27 @@ def run_summarize_in_background(app_context, article_id):
             article.bullets = json.dumps(result['bullets'])
             article.video_script = result['video_script']
             article.hashtags = json.dumps(result.get('hashtags', []))
+            article.cover_line = result.get('cover_line') or None
+            article.cta_question = result.get('cta_question') or None
+            article.search_caption = result.get('search_caption') or None
+            article.series_lane = result.get('series_lane') or None
 
             # Engagement metadata
             scenes = result.get('scenes') or []
             article.scenes = json.dumps(scenes) if scenes else None
+            article.visual_sources = None
             hook_variants = result.get('hook_variants') or []
             article.hook_variants = json.dumps(hook_variants) if hook_variants else None
+            article.best_hook_index = valid_hook_index(
+                result.get('best_hook_index'),
+                hook_variants,
+            )
+            # Re-summarizing replaces the hook options, so an index attributed
+            # to the previous list can no longer identify the old MP4's opening
+            # accurately. The next successful render restores attribution.
+            article.hook_index_used = None
             article.dominant_emotion = result.get('dominant_emotion') or None
-            suggested = result.get('suggested_style')
-            if suggested and suggested in VISUAL_STYLES:
-                article.style = suggested
+            article.style = DEFAULT_STYLE
 
             article.status = 'summarized'
             article.summarized_at = datetime.now(timezone.utc)
@@ -1980,9 +2055,7 @@ def run_summarize_in_background(app_context, article_id):
 def run_video_in_background(
     app_context,
     article_id,
-    image_source="ai",
-    style_override=None,
-    use_video_hook=None,
+    voice_tone="controlled",
     generation_token=None,
 ):
     """Run video generation in a background thread, with a watchdog timeout.
@@ -2025,17 +2098,16 @@ def run_video_in_background(
 
             try:
                 scenes = json.loads(article.scenes) if article.scenes else None
-                style_key = style_override or article.style or None
-
+                visual_sources = []
                 video_path = generate_video(
                     article_id=article.id,
                     title=article.title,
                     script=article.video_script,
-                    image_source=image_source,
                     scenes=scenes,
-                    style_key=style_key,
                     emotion=article.dominant_emotion,
-                    use_video_hook=use_video_hook,
+                    voice_tone=voice_tone,
+                    cover_line=article.cover_line,
+                    visual_sources_out=visual_sources,
                 )
 
                 # Re-fetch: watchdog may have already marked us failed while we
@@ -2057,12 +2129,17 @@ def run_video_in_background(
                         pass
                     return
 
-                # Persist the style that was actually used (in case it was auto-picked inside)
-                if style_override:
-                    article.style = style_override
+                article.style = DEFAULT_STYLE
+                article.visual_sources = json.dumps(visual_sources)
 
                 relative_path = os.path.basename(video_path)
                 article.video_path = relative_path
+                article.hook_index_used = find_matching_hook_index(
+                    json.loads(article.hook_variants)
+                    if article.hook_variants
+                    else [],
+                    json.loads(article.scenes) if article.scenes else [],
+                )
                 article.status = 'video_done'
                 article.video_generation_token = None
                 article.video_generated_at = datetime.now(timezone.utc)
@@ -2082,34 +2159,6 @@ def run_video_in_background(
                     db.session.commit()
     finally:
         timer.cancel()
-
-
-def run_carousel_in_background(app_context, article_id, image_source="ai"):
-    """Run carousel generation in a background thread."""
-    with app_context:
-        article = db.session.get(Article, article_id)
-        if not article:
-            return
-
-        try:
-            result = generate_carousel(
-                article_id=article.id,
-                title=article.title,
-                script=article.video_script,
-                image_source=image_source
-            )
-
-            article.carousel_dir = result['carousel_dir']
-            article.carousel_audio = result['carousel_audio']
-            article.status = 'carousel_done'
-            article.carousel_generated_at = datetime.now(timezone.utc)
-            db.session.commit()
-            logger.info(f"Carousel generated for article {article_id}")
-
-        except Exception as e:
-            logger.error(f"Failed to generate carousel for article {article_id}: {e}", exc_info=True)
-            article.status = 'failed'
-            db.session.commit()
 
 
 # ============================================================
@@ -2167,389 +2216,6 @@ def serve_signed_public_video(filename):
     response = send_from_directory('static/videos', safe_filename)
     response.headers['Cache-Control'] = 'private, max-age=300'
     return response
-
-
-@app.route('/carousels/<int:article_id>/<path:filename>')
-def serve_carousel_file(article_id, filename):
-    """Serve carousel images and audio files."""
-    safe_filename = secure_filename(filename)
-    if not safe_filename or safe_filename != filename:
-        return jsonify({'error': 'Invalid filename'}), 400
-    carousel_dir = os.path.join('static', 'carousels', str(article_id))
-    if not os.path.isdir(carousel_dir):
-        return jsonify({'error': 'Carousel not found'}), 404
-    return send_from_directory(carousel_dir, safe_filename)
-
-
-@app.route('/api/articles/<int:article_id>/carousel/download')
-def download_carousel_zip(article_id):
-    """Download all carousel assets as a ZIP file."""
-    article = db.session.get(Article, article_id)
-    if not article or not article.carousel_dir:
-        return jsonify({'error': 'Carousel not found'}), 404
-
-    carousel_path = os.path.join('static', 'carousels', article.carousel_dir)
-    if not os.path.isdir(carousel_path):
-        return jsonify({'error': 'Carousel files not found'}), 404
-
-    # Create ZIP in memory
-    zip_buffer = BytesIO()
-    with zipfile.ZipFile(zip_buffer, 'w', zipfile.ZIP_DEFLATED) as zf:
-        for fname in sorted(os.listdir(carousel_path)):
-            fpath = os.path.join(carousel_path, fname)
-            if os.path.isfile(fpath):
-                zf.write(fpath, fname)
-
-    zip_buffer.seek(0)
-
-    # Clean title for filename
-    safe_title = re.sub(r'[^\w\s-]', '', article.title)[:40].strip().replace(' ', '_')
-    zip_name = f"carousel_{safe_title}_{article_id}.zip"
-
-    return send_file(
-        zip_buffer,
-        mimetype='application/zip',
-        as_attachment=True,
-        download_name=zip_name
-    )
-
-
-@app.route('/api/articles/<int:article_id>/carousel/qr')
-def carousel_qr_code(article_id):
-    """Generate a QR code pointing to the mobile download page."""
-    import qrcode
-
-    article = db.session.get(Article, article_id)
-    if not article or not article.carousel_dir:
-        return jsonify({'error': 'Carousel not found'}), 404
-
-    # Get the local network IP so the phone can access it
-    local_ip = _get_local_ip()
-    port = request.host.split(':')[-1] if ':' in request.host else '5050'
-    mobile_url = f"http://{local_ip}:{port}/carousels/{article_id}/mobile"
-
-    # Generate QR code
-    qr = qrcode.QRCode(version=1, box_size=10, border=2)
-    qr.add_data(mobile_url)
-    qr.make(fit=True)
-    img = qr.make_image(fill_color="black", back_color="white")
-
-    # Convert to PNG bytes
-    buf = BytesIO()
-    img.save(buf, format='PNG')
-    buf.seek(0)
-
-    return send_file(buf, mimetype='image/png')
-
-
-def _get_local_ip():
-    """Get the local network IP address."""
-    try:
-        s = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
-        s.connect(('8.8.8.8', 80))
-        ip = s.getsockname()[0]
-        s.close()
-        return ip
-    except Exception:
-        return '127.0.0.1'
-
-
-@app.route('/carousels/<int:article_id>/mobile')
-def carousel_mobile_page(article_id):
-    """Serve a mobile-friendly page to save carousel images to Camera Roll."""
-    article = db.session.get(Article, article_id)
-    if not article or not article.carousel_dir:
-        return "Carousel not found", 404
-
-    carousel_path = os.path.join('static', 'carousels', article.carousel_dir)
-    if not os.path.isdir(carousel_path):
-        return "Carousel files not found", 404
-
-    # Get list of slide files
-    slides = sorted([f for f in os.listdir(carousel_path) if f.startswith('slide_') and f.endswith('.png')])
-    audio_file = article.carousel_audio
-
-    # Build a self-contained mobile HTML page
-    slides_html = ""
-    for i, slide in enumerate(slides, 1):
-        slides_html += f'''
-        <div class="slide-card">
-            <div class="slide-number">Slide {i}</div>
-            <img src="/carousels/{article_id}/{slide}" alt="Slide {i}" class="slide-img">
-            <a href="/carousels/{article_id}/{slide}" download="{slide}" class="save-btn">
-                💾 Save Image {i}
-            </a>
-        </div>
-        '''
-
-    audio_html = ""
-    if audio_file:
-        audio_html = f'''
-        <div class="audio-card">
-            <div class="slide-number">🎙️ Voiceover</div>
-            <audio controls preload="metadata" class="audio-player">
-                <source src="/carousels/{article_id}/{audio_file}">
-            </audio>
-            <a href="/carousels/{article_id}/{audio_file}" download="{audio_file}" class="save-btn">
-                💾 Save Audio
-            </a>
-        </div>
-        '''
-
-    html = f'''<!DOCTYPE html>
-<html lang="en">
-<head>
-    <meta charset="UTF-8">
-    <meta name="viewport" content="width=device-width, initial-scale=1.0, user-scalable=no">
-    <title>Clipper — Save Carousel</title>
-    <link href="https://fonts.googleapis.com/css2?family=Inter:wght@400;600;700&display=swap" rel="stylesheet">
-    <style>
-        * {{ margin: 0; padding: 0; box-sizing: border-box; }}
-        body {{
-            font-family: 'Inter', -apple-system, sans-serif;
-            background: #0B0F14;
-            color: #F3F4F6;
-            min-height: 100vh;
-            padding: 20px;
-            padding-bottom: 40px;
-            -webkit-font-smoothing: antialiased;
-        }}
-        .header {{
-            text-align: center;
-            padding: 20px 0 24px;
-        }}
-        .logo {{ color: #5EEAD4; font-size: 0.9rem; }}
-        h1 {{
-            font-size: 1.5rem;
-            font-weight: 700;
-            margin: 8px 0 4px;
-            letter-spacing: -0.02em;
-        }}
-        .subtitle {{
-            color: #9CA3AF;
-            font-size: 0.85rem;
-            line-height: 1.4;
-        }}
-        .tip {{
-            background: rgba(94, 234, 212, 0.1);
-            border: 1px solid rgba(94, 234, 212, 0.2);
-            border-radius: 12px;
-            padding: 12px 16px;
-            margin: 16px 0 20px;
-            font-size: 0.8rem;
-            color: #5EEAD4;
-            text-align: center;
-        }}
-        .slide-card {{
-            background: #111827;
-            border: 1px solid rgba(255,255,255,0.08);
-            border-radius: 16px;
-            overflow: hidden;
-            margin-bottom: 16px;
-        }}
-        .slide-number {{
-            padding: 12px 16px;
-            font-size: 0.75rem;
-            font-weight: 600;
-            text-transform: uppercase;
-            letter-spacing: 0.05em;
-            color: #9CA3AF;
-        }}
-        .slide-img {{
-            width: 100%;
-            display: block;
-            border-top: 1px solid rgba(255,255,255,0.06);
-            border-bottom: 1px solid rgba(255,255,255,0.06);
-        }}
-        .save-btn {{
-            display: block;
-            text-align: center;
-            padding: 14px;
-            color: #0B0F14;
-            background: #5EEAD4;
-            font-weight: 600;
-            font-size: 0.9rem;
-            text-decoration: none;
-            transition: background 0.2s;
-        }}
-        .save-btn:active {{ background: #3dd1b9; }}
-        .audio-card {{
-            background: #111827;
-            border: 1px solid rgba(255,255,255,0.08);
-            border-radius: 16px;
-            overflow: hidden;
-            margin-bottom: 16px;
-        }}
-        .audio-player {{
-            width: calc(100% - 32px);
-            margin: 0 16px 12px;
-            height: 44px;
-        }}
-        .instructions {{
-            text-align: center;
-            padding: 20px 0;
-            color: #667085;
-            font-size: 0.75rem;
-            line-height: 1.6;
-        }}
-    </style>
-</head>
-<body>
-    <div class="header">
-        <div class="logo">▲ Clipper</div>
-        <h1>{article.title[:60]}</h1>
-        <p class="subtitle">Photo Carousel — {len(slides)} slides</p>
-    </div>
-    <div class="tip">
-        📱 <strong>Tip:</strong> Long-press each image → "Save to Photos"<br>
-        Or tap the save buttons below each slide
-    </div>
-    {slides_html}
-    {audio_html}
-    <div class="instructions">
-        After saving, open TikTok → Create → Photo Mode<br>
-        Select all images from Camera Roll → Add voiceover
-    </div>
-</body>
-</html>'''
-
-    return html
-
-
-@app.route('/api/articles/<int:article_id>/video/qr')
-def video_qr_code(article_id):
-    """Generate a QR code pointing to the mobile video download page."""
-    import qrcode
-
-    article = db.session.get(Article, article_id)
-    if not article or not article.video_path:
-        return jsonify({'error': 'Video not found'}), 404
-
-    local_ip = _get_local_ip()
-    port = request.host.split(':')[-1] if ':' in request.host else '5050'
-    mobile_url = f"http://{local_ip}:{port}/videos/{article_id}/mobile"
-
-    qr = qrcode.QRCode(version=1, box_size=10, border=2)
-    qr.add_data(mobile_url)
-    qr.make(fit=True)
-    img = qr.make_image(fill_color="black", back_color="white")
-
-    buf = BytesIO()
-    img.save(buf, format='PNG')
-    buf.seek(0)
-
-    return send_file(buf, mimetype='image/png')
-
-
-@app.route('/videos/<int:article_id>/mobile')
-def video_mobile_page(article_id):
-    """Serve a mobile-friendly page to save a video to Camera Roll."""
-    article = db.session.get(Article, article_id)
-    if not article or not article.video_path:
-        return "Video not found", 404
-
-    video_url = f"/videos/{article.video_path}"
-
-    html = f'''<!DOCTYPE html>
-<html lang="en">
-<head>
-    <meta charset="UTF-8">
-    <meta name="viewport" content="width=device-width, initial-scale=1.0, user-scalable=no">
-    <title>Clipper — Save Video</title>
-    <link href="https://fonts.googleapis.com/css2?family=Inter:wght@400;600;700&display=swap" rel="stylesheet">
-    <style>
-        * {{ margin: 0; padding: 0; box-sizing: border-box; }}
-        body {{
-            font-family: 'Inter', -apple-system, sans-serif;
-            background: #0B0F14;
-            color: #F3F4F6;
-            min-height: 100vh;
-            padding: 20px;
-            padding-bottom: 40px;
-            -webkit-font-smoothing: antialiased;
-        }}
-        .header {{
-            text-align: center;
-            padding: 20px 0 24px;
-        }}
-        .logo {{ color: #5EEAD4; font-size: 0.9rem; }}
-        h1 {{
-            font-size: 1.4rem;
-            font-weight: 700;
-            margin: 8px 0 4px;
-            letter-spacing: -0.02em;
-        }}
-        .subtitle {{
-            color: #9CA3AF;
-            font-size: 0.85rem;
-        }}
-        .tip {{
-            background: rgba(94, 234, 212, 0.1);
-            border: 1px solid rgba(94, 234, 212, 0.2);
-            border-radius: 12px;
-            padding: 12px 16px;
-            margin: 16px 0 20px;
-            font-size: 0.8rem;
-            color: #5EEAD4;
-            text-align: center;
-        }}
-        .video-card {{
-            background: #111827;
-            border: 1px solid rgba(255,255,255,0.08);
-            border-radius: 16px;
-            overflow: hidden;
-            margin-bottom: 16px;
-        }}
-        .video-card video {{
-            width: 100%;
-            display: block;
-        }}
-        .save-btn {{
-            display: block;
-            text-align: center;
-            padding: 16px;
-            color: #0B0F14;
-            background: #5EEAD4;
-            font-weight: 600;
-            font-size: 1rem;
-            text-decoration: none;
-            transition: background 0.2s;
-        }}
-        .save-btn:active {{ background: #3dd1b9; }}
-        .instructions {{
-            text-align: center;
-            padding: 20px 0;
-            color: #667085;
-            font-size: 0.75rem;
-            line-height: 1.6;
-        }}
-    </style>
-</head>
-<body>
-    <div class="header">
-        <div class="logo">▲ Clipper</div>
-        <h1>{article.title[:60]}</h1>
-        <p class="subtitle">Generated Video</p>
-    </div>
-    <div class="tip">
-        📱 <strong>Tip:</strong> Tap "Save Video" or long-press the video → "Save to Photos"
-    </div>
-    <div class="video-card">
-        <video controls playsinline preload="metadata">
-            <source src="{video_url}" type="video/mp4">
-        </video>
-        <a href="{video_url}" download="{article.video_path}" class="save-btn">
-            💾 Save Video
-        </a>
-    </div>
-    <div class="instructions">
-        After saving, open TikTok → Create → Upload<br>
-        Select the video from Camera Roll
-    </div>
-</body>
-</html>'''
-
-    return html
 
 
 # ============================================================
@@ -2734,11 +2400,149 @@ def summarize_article_endpoint(article_id):
     }), 202
 
 
+@app.route('/api/articles/<int:article_id>/hook', methods=['POST'])
+def select_article_hook(article_id):
+    """Select one generated hook and keep scenes/script in exact alignment."""
+    article = db.session.get(Article, article_id)
+    if not article:
+        return jsonify({'error': 'Article not found'}), 404
+
+    processing_statuses = {
+        'summarizing',
+        'generating_video',
+        'generating_carousel',
+    }
+    if article.status in processing_statuses:
+        return jsonify({'error': 'Article is already being processed'}), 409
+
+    payload = request.get_json(silent=True)
+    if not isinstance(payload, dict) or 'hook_index' not in payload:
+        return jsonify({'error': 'hook_index is required'}), 400
+    hook_index = payload['hook_index']
+    if type(hook_index) is not int:
+        return jsonify({'error': 'hook_index must be an integer'}), 400
+
+    try:
+        hook_variants = json.loads(article.hook_variants) if article.hook_variants else []
+    except (TypeError, ValueError):
+        return jsonify({'error': 'Stored hook options are invalid; re-summarize this article'}), 409
+    if not isinstance(hook_variants, list) or not hook_variants:
+        return jsonify({'error': 'Article has no hook options; re-summarize it first'}), 400
+    if hook_index < 0 or hook_index >= len(hook_variants):
+        return jsonify({'error': 'hook_index is out of range'}), 400
+
+    selected_hook = hook_variants[hook_index]
+    if not isinstance(selected_hook, str) or not selected_hook.strip():
+        return jsonify({'error': 'Selected hook is empty; re-summarize this article'}), 409
+    selected_hook = selected_hook.strip()
+
+    original_scenes_json = article.scenes
+    try:
+        scenes = json.loads(original_scenes_json) if original_scenes_json else []
+    except (TypeError, ValueError):
+        return jsonify({'error': 'Stored scenes are invalid; re-summarize this article'}), 409
+    if not isinstance(scenes, list) or not scenes:
+        return jsonify({'error': 'Article has no scenes; re-summarize it first'}), 409
+    if any(
+        not isinstance(scene, dict)
+        or not isinstance(scene.get('speech'), str)
+        or not scene['speech'].strip()
+        for scene in scenes
+    ):
+        return jsonify({'error': 'Stored scenes are incomplete; re-summarize this article'}), 409
+
+    previous_script = (article.video_script or '').strip()
+    previous_opening = scenes[0]['speech'].strip()
+    scenes[0] = {**scenes[0], 'speech': selected_hook}
+    rewritten_script = ' '.join(scene['speech'].strip() for scene in scenes)
+    requires_regeneration = bool(
+        article.video_path
+        and (
+            previous_opening != selected_hook
+            or previous_script != rewritten_script
+        )
+    )
+
+    # Match the generation endpoint's optimistic ownership pattern so a hook
+    # change cannot race a render that claims the same Article.
+    current_status = article.status
+    update = Article.query.filter(
+        Article.id == article_id,
+        Article.scenes == original_scenes_json,
+    )
+    if current_status is None:
+        update = update.filter(Article.status.is_(None))
+    else:
+        update = update.filter(Article.status == current_status)
+    updated = update.update(
+        {
+            Article.scenes: json.dumps(scenes),
+            Article.video_script: rewritten_script,
+        },
+        synchronize_session=False,
+    )
+    if updated != 1:
+        db.session.rollback()
+        return jsonify({'error': 'Article is already being processed'}), 409
+    db.session.commit()
+
+    article = db.session.get(Article, article_id)
+    message = f'Hook {hook_index + 1} selected'
+    if requires_regeneration:
+        message += '. Regenerate the video to use it.'
+    return jsonify({
+        'message': message,
+        'requires_regeneration': requires_regeneration,
+        'article': article.to_dict(),
+    })
+
+
+@app.route('/api/tts/preview', methods=['POST'])
+def preview_voice_tone():
+    """Return a short WAV preview for one of Clipper's voice-tone presets."""
+    payload = request.get_json(silent=True)
+    if payload is None:
+        payload = {}
+    elif not isinstance(payload, dict):
+        return jsonify({'error': 'JSON body must be an object'}), 400
+    voice_tone = payload.get('voice_tone', 'controlled')
+    if not isinstance(voice_tone, str) or voice_tone not in VOICE_TONES:
+        return jsonify({'error': 'Unknown voice tone'}), 400
+
+    try:
+        with TemporaryDirectory(prefix='clipper-voice-preview-') as temp_dir:
+            requested_path = os.path.join(temp_dir, f'{voice_tone}.wav')
+            audio_path = tts_engine.synthesize(
+                VOICE_PREVIEW_TEXT,
+                requested_path,
+                voice_tone=voice_tone,
+            )
+            with open(audio_path, 'rb') as audio_file:
+                audio_bytes = audio_file.read()
+
+        return send_file(
+            BytesIO(audio_bytes),
+            mimetype='audio/wav',
+            as_attachment=False,
+            download_name=f'{voice_tone}-voice-preview.wav',
+        )
+    except Exception:
+        logger.error(
+            "Failed to generate voice preview for tone=%s",
+            voice_tone,
+            exc_info=True,
+        )
+        return jsonify({
+            'error': 'Voice preview is unavailable right now. Please try again.'
+        }), 503
+
+
 @app.route('/api/articles/<int:article_id>/video', methods=['POST'])
 def generate_video_endpoint(article_id):
     """Trigger video generation for an article (runs in background).
 
-    Optional JSON body: {"style": "manga"} overrides the auto-picked style.
+    Optional JSON body: {"voice_tone": ...}. The look is the locked Pixel
+    Night Lab style, so there is nothing else to choose.
     """
     article = db.session.get(Article, article_id)
     if not article:
@@ -2750,23 +2554,15 @@ def generate_video_endpoint(article_id):
     if article.status in ('summarizing', 'generating_video', 'generating_carousel'):
         return jsonify({'error': 'Article is already being processed'}), 409
 
-    payload = request.get_json(silent=True) or {}
+    payload = request.get_json(silent=True)
+    if payload is None:
+        payload = {}
+    elif not isinstance(payload, dict):
+        return jsonify({'error': 'JSON body must be an object'}), 400
 
-    image_source = payload.get('image_source', 'ai')
-    if image_source not in ('ai', 'stock'):
-        image_source = 'ai'
-
-    style_override = payload.get('style')
-    if style_override and style_override not in VISUAL_STYLES:
-        return jsonify({'error': f'Unknown style: {style_override}'}), 400
-
-    # `use_video_hook` is a tri-state: True/False/None.
-    #   True  -> AI video hook (FAL); False -> image hook; None -> env default.
-    raw_hook = payload.get('use_video_hook', None)
-    if raw_hook is None:
-        use_video_hook = None
-    else:
-        use_video_hook = bool(raw_hook)
+    voice_tone = payload.get('voice_tone', 'controlled')
+    if not isinstance(voice_tone, str) or voice_tone not in VOICE_TONES:
+        return jsonify({'error': 'Unknown voice tone'}), 400
 
     generation_token = secrets.token_hex(24)
     current_status = article.status
@@ -2790,14 +2586,7 @@ def generate_video_endpoint(article_id):
 
     thread = Thread(
         target=run_video_in_background,
-        args=(
-            app.app_context(),
-            article.id,
-            image_source,
-            style_override,
-            use_video_hook,
-            generation_token,
-        )
+        args=(app.app_context(), article.id, voice_tone, generation_token),
     )
     thread.daemon = True
     thread.start()
@@ -2806,76 +2595,6 @@ def generate_video_endpoint(article_id):
         'message': 'Video generation started',
         'article': article.to_dict()
     }), 202
-
-
-@app.route('/api/articles/<int:article_id>/carousel', methods=['POST'])
-def generate_carousel_endpoint(article_id):
-    """Trigger carousel generation for an article (runs in background)."""
-    article = db.session.get(Article, article_id)
-    if not article:
-        return jsonify({'error': 'Article not found'}), 404
-
-    if not article.video_script:
-        return jsonify({'error': 'Article must be summarized first'}), 400
-
-    if article.status in ('summarizing', 'generating_video', 'generating_carousel'):
-        return jsonify({'error': 'Article is already being processed'}), 409
-
-    # Get image source from request body
-    data = request.get_json(silent=True) or {}
-    image_source = data.get('image_source', 'ai')
-    if image_source not in ('ai', 'stock'):
-        image_source = 'ai'
-
-    article.status = 'generating_carousel'
-    db.session.commit()
-
-    # Run in background thread
-    thread = Thread(
-        target=run_carousel_in_background,
-        args=(app.app_context(), article.id, image_source)
-    )
-    thread.daemon = True
-    thread.start()
-
-    return jsonify({
-        'message': 'Carousel generation started',
-        'article': article.to_dict()
-    }), 202
-
-
-@app.route('/api/articles/<int:article_id>/substack', methods=['POST'])
-def generate_substack_endpoint(article_id):
-    """Generate (or return cached) Substack companion post for an article.
-
-    Synchronous — the LLM call takes ~5-10s, far short of request timeout.
-    Returns the updated article dict on success (200).
-    """
-    from summarizer import generate_substack_post
-
-    article = db.session.get(Article, article_id)
-    if not article:
-        return jsonify({'error': 'Article not found'}), 404
-
-    if not article.tldr:
-        return jsonify({'error': 'Article must be summarized first'}), 400
-
-    # Regeneration via ?regenerate=1 or JSON {regenerate: true}
-    payload = request.get_json(silent=True) or {}
-    force = request.args.get('regenerate') == '1' or payload.get('regenerate') is True
-
-    # Return cached post if already generated (unless force regenerate)
-    if article.substack_post and not force:
-        return jsonify({'article': article.to_dict()})
-
-    try:
-        post = generate_substack_post(article)
-        article.substack_post = post
-        db.session.commit()
-        return jsonify({'article': article.to_dict()})
-    except Exception as e:
-        logger.error("Substack post generation failed for article %s: %s", article_id, e, exc_info=True)
-        return jsonify({'error': 'Failed to generate Substack post'}), 500
 
 
 @app.route('/api/publishers/status', methods=['GET'])
@@ -3482,12 +3201,6 @@ def tiktok_article_publish_status(article_id):
         return _tiktok_error_response(error)
 
 
-@app.route('/api/styles', methods=['GET'])
-def list_styles_endpoint():
-    """Return available visual style presets for UI consumption."""
-    return jsonify({'styles': list_styles()})
-
-
 @app.route('/api/generation-budget', methods=['GET'])
 def generation_budget_endpoint():
     """Return cached provider balances and safe generation cost estimates."""
@@ -3526,8 +3239,9 @@ if __name__ == '__main__':
     print("  API Base:  http://localhost:5050/api")
     print("\n" + "=" * 60 + "\n")
 
-    # Flask's debug reloader executes this file twice. Only the serving child
-    # should own the daily discovery scheduler.
-    if os.environ.get('WERKZEUG_RUN_MAIN') == 'true':
+    # Automatic source reloads terminate daemon video workers mid-render.
+    # Keep local generation stable; developers can explicitly opt into reloads.
+    use_reloader = os.getenv('CLIPPER_DEV_RELOAD', 'false').lower() == 'true'
+    if not use_reloader or os.environ.get('WERKZEUG_RUN_MAIN') == 'true':
         ensure_discovery_scheduler(app)
-    app.run(host='0.0.0.0', port=5050, debug=True)
+    app.run(host='0.0.0.0', port=5050, debug=use_reloader, use_reloader=use_reloader)

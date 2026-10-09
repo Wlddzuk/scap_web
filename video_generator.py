@@ -1,19 +1,27 @@
-"""
-TikTok-Style Video Generator - Parallel image generation + fast rendering.
+"""Pixel Night Lab video renderer: narration, word-synced captions, Moss, music.
+
+One look only (docs/style-lock/STYLE.md). Pipeline:
+    1. TTS narration, then word timings (captions, Moss's reactions, music ducking)
+    2. Scene shot plan cut on each scene's first spoken word (word-count split
+       without timings), capped at MAX_SHOT_DURATION
+    3. One pixel scene image per scene (pixel_scenes.py)
+    4. Hook cuts, body shots with a push/pan, then Moss (moss_sprite.py) over the
+       picture and captions over everything
+    5. Ducked music bed and H.264/AAC encode
 """
 
-import os
-import re
-import time
-import json
+import functools
 import logging
 import math
-import random
+import os
+import re
+import tempfile
 import threading
+import time
 from datetime import datetime
-from pathlib import Path
 from io import BytesIO
-from concurrent.futures import ThreadPoolExecutor, as_completed
+from pathlib import Path
+from uuid import uuid4
 
 from groq import Groq
 import numpy as np
@@ -23,15 +31,16 @@ from moviepy.editor import (
     CompositeVideoClip,
     ImageClip,
     VideoClip,
-    VideoFileClip,
     concatenate_videoclips,
     vfx,
 )
 from moviepy.audio.fx import all as afx
-from PIL import Image, ImageDraw, ImageFont
+from PIL import Image, ImageDraw, ImageEnhance, ImageFilter, ImageFont, ImageStat
 import requests
 from dotenv import load_dotenv
+import pixel_grid
 import tts_engine
+from visual_styles import strip_lettering_requests
 
 load_dotenv()
 
@@ -47,26 +56,6 @@ except ValueError:
 os.environ.setdefault("HF_HUB_ETAG_TIMEOUT", "10")
 os.environ.setdefault("HF_HUB_DOWNLOAD_TIMEOUT", str(_model_download_timeout))
 
-# Video settings
-VIDEO_WIDTH = 1080
-VIDEO_HEIGHT = 1920
-FPS = 30
-
-# Hook settings
-HOOK_DURATION = 5.0
-NUM_HOOK_IMAGES = 4
-
-# AI video hook. When the per-request `use_video_hook` flag is True (set by the
-# UI toggle), or when HOOK_VIDEO_MODEL is set in the env, the 5s hook becomes a
-# single FAL video clip instead of 4 stills with Ken Burns zoom. Falls back to
-# image hook on any failure.
-# Models tested: fal-ai/ltx-video (cheap/fast), fal-ai/kling-video/v1/standard/text-to-video,
-# fal-ai/minimax/video-01.
-HOOK_VIDEO_MODEL = os.getenv("HOOK_VIDEO_MODEL", "").strip()
-HOOK_VIDEO_ASPECT = os.getenv("HOOK_VIDEO_ASPECT", "9:16")
-DEFAULT_HOOK_VIDEO_MODEL = "fal-ai/ltx-video"  # used when UI toggle is on and env is empty
-
-
 def _bounded_int_env(name: str, default: int, minimum: int, maximum: int) -> int:
     """Read a bounded integer setting without letting bad env values break startup."""
     try:
@@ -75,91 +64,132 @@ def _bounded_int_env(name: str, default: int, minimum: int, maximum: int) -> int
         return default
 
 
-# This cap applies to every generated motion clip, including the hook. Keeping
-# the default at three holds the estimated motion spend below the work-order's
-# $0.60/video ceiling while still allowing two body scenes after a video hook.
-_REQUESTED_MAX_VIDEO_CLIPS_PER_VIDEO = _bounded_int_env(
-    "MAX_VIDEO_CLIPS_PER_VIDEO", 3, 0, 12
-)
-FAL_VIDEO_TIMEOUT_SECONDS = _bounded_int_env(
-    "FAL_VIDEO_TIMEOUT_SECONDS", 180, 30, 900
-)
+def _bounded_float_env(
+    name: str,
+    default: float,
+    minimum: float,
+    maximum: float,
+) -> float:
+    """Read a bounded float setting without letting bad env values break startup."""
+    try:
+        return max(minimum, min(maximum, float(os.getenv(name, str(default)))))
+    except (TypeError, ValueError):
+        return default
+
+
+# Video settings
+VIDEO_WIDTH = 1080
+
+
+VIDEO_HEIGHT = 1920
+
+FPS = 30
+
+# Hook settings
+HOOK_DURATION = 5.0
+
+
+NUM_HOOK_IMAGES = 4
+
 FAL_IMAGE_TIMEOUT_SECONDS = _bounded_int_env(
     "FAL_IMAGE_TIMEOUT_SECONDS", 120, 30, 900
 )
-try:
-    VIDEO_CLIP_ESTIMATED_COST_USD = max(
-        0.0, float(os.getenv("VIDEO_CLIP_ESTIMATED_COST_USD", "0.18"))
-    )
-except (TypeError, ValueError):
-    VIDEO_CLIP_ESTIMATED_COST_USD = 0.18
 
-BASE_VIDEO_ESTIMATED_COST_USD = 0.05
-MAX_VIDEO_ESTIMATED_COST_USD = 0.60
-ABSOLUTE_MAX_VIDEO_CLIPS_PER_VIDEO = 3
-
-
-def _effective_motion_clip_cap(
-    requested: int,
-    estimated_cost_per_clip: float,
-    base_cost: float = BASE_VIDEO_ESTIMATED_COST_USD,
-    max_total_cost: float = MAX_VIDEO_ESTIMATED_COST_USD,
-) -> int:
-    """Enforce both the three-clip cap and the configured dollar ceiling."""
-    count_cap = min(
-        ABSOLUTE_MAX_VIDEO_CLIPS_PER_VIDEO,
-        max(0, int(requested)),
-    )
-    if estimated_cost_per_clip <= 0:
-        return count_cap
-    remaining_budget = max(0.0, float(max_total_cost) - float(base_cost))
-    budget_cap = int(math.floor((remaining_budget + 1e-9) / estimated_cost_per_clip))
-    return min(count_cap, max(0, budget_cap))
-
-
-MAX_VIDEO_CLIPS_PER_VIDEO = _effective_motion_clip_cap(
-    _REQUESTED_MAX_VIDEO_CLIPS_PER_VIDEO,
-    VIDEO_CLIP_ESTIMATED_COST_USD,
+# Z-Image turbo ($0.005/MP vs schnell's $0.003) won a side-by-side on real
+# scene prompts: clearer subjects than schnell, and unlike FLUX.2 flash (same
+# price) it does not print proper names from the prompt ("Beta Pictoris b",
+# researcher names) as lettering under the burned-in captions.
+FAL_IMAGE_MODEL = (
+    os.getenv("FAL_IMAGE_MODEL", "fal-ai/z-image/turbo").strip()
+    or "fal-ai/z-image/turbo"
 )
 
-# Body image count (reduced from 20 for speed)
-NUM_BODY_IMAGES = 14
+
+# The step override only suits FLUX.1 schnell; newer models use their own tuned
+# defaults and may reject or degrade under a forced 4-step run.
+FAL_IMAGE_STEPS = (
+    _bounded_int_env("FAL_IMAGE_STEPS", 4, 1, 100)
+    if "flux/schnell" in FAL_IMAGE_MODEL
+    else None
+)
+
 
 # Parallel image generation workers
 MAX_IMAGE_WORKERS = 6
 
+
 # Timing constraints
 MIN_CHUNK_DURATION = 1.2
+
+
 MAX_CHUNK_DURATION = 3.2
+
 DEFAULT_CHUNK_DURATION = 2.5
+
+MAX_SHOT_DURATION = 2.5
+
 DEFAULT_WORDS_PER_CHUNK = 4
+
 RETRY_ATTEMPTS = 2
+
+SHOT_TYPES = (
+    "macro close-up",
+    "wide establishing shot",
+    "human-scale perspective",
+    "detail with scale contrast",
+)
+
+SHOT_MOTIONS = ("push", "pan-left", "pan-right", "pull")
+
+# A 4.5% move over 2.5s is below what a phone viewer perceives as motion.
+BODY_SHOT_ZOOM = 0.10
+
 
 # Caption settings
 CAPTION_FONT_PATH = Path(__file__).resolve().parent / "static" / "fonts" / "Montserrat-Variable.ttf"
+
+
 CAPTION_FONT_SIZE = 88
+
 CAPTION_MIN_FONT_SIZE = 56
+
 CAPTION_STROKE_WIDTH = 7
+
 CAPTION_SIDE_MARGIN = 80
+
 CAPTION_SAFE_BOTTOM = 1500
+
 CAPTION_POP_DURATION = 0.1
+
 CAPTION_ACTIVE_COLOR = (255, 216, 77, 255)
+
 HEADLINE_DURATION = 2.5
+
 WHISPER_MODELS = {"tiny", "base"}
 
 # Audio settings. Each bundled track is peak-normalized at mix time before these
 # target gains are applied, while the narration gain reserves summing headroom.
 MUSIC_DIR = Path(__file__).resolve().parent / "static" / "audio" / "music"
+
+
 MUSIC_DUCKED_DB = -22.0
+
 MUSIC_GAP_DB = -12.0
+
 MUSIC_FADE_IN_SECONDS = 0.5
+
 MUSIC_FADE_OUT_SECONDS = 1.0
+
 MUSIC_DUCK_ATTACK_SECONDS = 0.08
+
 MUSIC_DUCK_RELEASE_SECONDS = 0.18
+
 NARRATION_MIX_GAIN = 0.74
 
 _WHISPER_MODEL = None
+
 _WHISPER_MODEL_NAME = None
+
 _WHISPER_LOCK = threading.Lock()
 
 # Pillow 10+ compatibility
@@ -167,7 +197,13 @@ if not hasattr(Image, 'ANTIALIAS'):
     Image.ANTIALIAS = Image.Resampling.LANCZOS
 
 
-def generate_image_fal(prompt: str, retry_count: int = RETRY_ATTEMPTS) -> Image.Image:
+def generate_image_fal(
+    prompt: str,
+    retry_count: int = RETRY_ATTEMPTS,
+    *,
+    model: str | None = None,
+    num_inference_steps: int | None = FAL_IMAGE_STEPS,
+) -> Image.Image:
     """Generate image using FAL.ai FLUX model."""
     import fal_client
 
@@ -177,265 +213,67 @@ def generate_image_fal(prompt: str, retry_count: int = RETRY_ATTEMPTS) -> Image.
         return create_gradient_background()
 
     enhanced_prompt = (
-        f"{prompt}, vibrant bright colors, high contrast, eye-catching, "
-        f"clean composition, vertical 9:16, professional quality, no text no words"
+        f"{prompt}, clear high-contrast focal hierarchy, faithful to the requested "
+        f"medium and palette, clean composition, vertical 9:16, professional quality, "
+        f"no text, no letters, no numbers, no labels, no captions"
     )
 
+    selected_model = model or FAL_IMAGE_MODEL
+    image_url = None
     for attempt in range(retry_count):
         try:
-            logger.info(f"[Image] Generating: {prompt[:40]}...")
+            arguments = {
+                "prompt": enhanced_prompt,
+                "image_size": "portrait_16_9",
+                "num_images": 1,
+            }
+            # FLUX dev's official default is 28. Hook callers deliberately pass
+            # None so the premium model is not accidentally reduced to 4 steps.
+            if num_inference_steps is not None:
+                arguments["num_inference_steps"] = num_inference_steps
+            logger.info(
+                "[Image] Generating via %s: %s...",
+                selected_model,
+                prompt[:40],
+            )
             result = fal_client.run(
-                "fal-ai/flux/schnell",
-                arguments={
-                    "prompt": enhanced_prompt,
-                    "image_size": "portrait_16_9",
-                    "num_images": 1,
-                    "num_inference_steps": 4
-                },
+                selected_model,
+                arguments=arguments,
                 timeout=FAL_IMAGE_TIMEOUT_SECONDS,
                 start_timeout=min(30, FAL_IMAGE_TIMEOUT_SECONDS),
             )
 
             if result and "images" in result and result["images"]:
-                image_url = result["images"][0]["url"]
+                image_url = result["images"][0].get("url")
+            if not image_url:
+                raise ValueError("FAL image response did not include a URL")
+            break
+
+        except Exception as e:
+            logger.info(f"[Image] Inference attempt {attempt + 1} failed: {e}")
+            if attempt + 1 < retry_count:
+                time.sleep(2)
+
+    if image_url:
+        # Once inference succeeds, never repeat the paid model call just because
+        # the provider CDN is briefly unavailable. Retry only the free download.
+        for attempt in range(retry_count):
+            try:
                 response = requests.get(image_url, timeout=30)
+                response.raise_for_status()
                 img = Image.open(BytesIO(response.content)).convert("RGB")
                 img = resize_and_crop_image(img, VIDEO_WIDTH, VIDEO_HEIGHT)
                 logger.info("[Image] Generated")
                 return img
-
-        except Exception as e:
-            logger.info(f"[Image] Attempt {attempt + 1} failed: {e}")
-            time.sleep(2)
+            except Exception as e:
+                logger.info(
+                    f"[Image] Download attempt {attempt + 1} failed: {e}"
+                )
+                if attempt + 1 < retry_count:
+                    time.sleep(2)
 
     logger.info("[Image] Failed, using gradient")
     return create_gradient_background()
-
-
-def generate_motion_video_fal(
-    prompt: str,
-    model: str,
-    log_label: str = "MotionVideo",
-) -> str | None:
-    """Generate a short AI motion clip via FAL, with a bounded wait.
-
-    Caller is responsible for unlinking the returned path. We write to the system
-    temp dir (not static/) so failures don't leak public files.
-    """
-    import fal_client
-    import tempfile
-
-    if not os.getenv("FAL_KEY"):
-        logger.info(f"[{log_label}] No FAL_KEY, skipping motion clip")
-        return None
-
-    local_path = None
-    try:
-        logger.info(f"[{log_label}] Generating via {model}: {prompt[:80]}...")
-        result = fal_client.run(
-            model,
-            arguments={"prompt": prompt, "aspect_ratio": HOOK_VIDEO_ASPECT},
-            timeout=FAL_VIDEO_TIMEOUT_SECONDS,
-            start_timeout=min(30, FAL_VIDEO_TIMEOUT_SECONDS),
-        )
-
-        video_url = None
-        if isinstance(result, dict):
-            video_field = result.get("video")
-            if isinstance(video_field, dict):
-                video_url = video_field.get("url")
-            elif isinstance(video_field, str):
-                video_url = video_field
-            elif "url" in result:
-                video_url = result["url"]
-
-        if not video_url:
-            logger.info(
-                f"[{log_label}] No video URL in response keys="
-                f"{list(result) if isinstance(result, dict) else type(result)}"
-            )
-            return None
-
-        fd, local_path = tempfile.mkstemp(suffix=".mp4", prefix="clipper_motion_")
-        os.close(fd)
-        response = requests.get(video_url, timeout=120, stream=True)
-        response.raise_for_status()
-        with open(local_path, "wb") as f:
-            for chunk in response.iter_content(chunk_size=65536):
-                f.write(chunk)
-
-        logger.info(f"[{log_label}] Saved: {local_path}")
-        return local_path
-    except Exception as e:
-        logger.info(f"[{log_label}] Failed: {e}")
-        if local_path:
-            try:
-                Path(local_path).unlink(missing_ok=True)
-            except OSError:
-                pass
-        return None
-
-
-def generate_hook_video_fal(prompt: str, model: str) -> str | None:
-    """Backward-compatible hook wrapper around the shared motion generator."""
-    return generate_motion_video_fal(prompt, model, log_label="HookVideo")
-
-
-def load_hook_video_clip(video_path: str, target_duration: float):
-    """Load a downloaded FAL video as a moviepy clip fitted to 1080x1920 / target_duration."""
-    clip = VideoFileClip(video_path).without_audio()
-
-    if clip.duration > target_duration:
-        clip = clip.subclip(0, target_duration)
-    elif clip.duration < target_duration:
-        # If close, ease via speed; otherwise loop.
-        if clip.duration >= target_duration * 0.7:
-            clip = clip.fx(vfx.speedx, clip.duration / target_duration)
-        else:
-            loops = int(target_duration / clip.duration) + 1
-            clip = concatenate_videoclips([clip] * loops, method="compose").subclip(0, target_duration)
-
-    cw, ch = clip.size
-    target_ratio = VIDEO_WIDTH / VIDEO_HEIGHT
-    src_ratio = cw / ch
-
-    if abs(src_ratio - target_ratio) > 0.01:
-        if src_ratio > target_ratio:
-            new_w = int(ch * target_ratio)
-            x_center = cw // 2
-            clip = clip.crop(x1=x_center - new_w // 2, x2=x_center + new_w // 2)
-        else:
-            new_h = int(cw / target_ratio)
-            y_center = ch // 2
-            clip = clip.crop(y1=y_center - new_h // 2, y2=y_center + new_h // 2)
-
-    return clip.resize((VIDEO_WIDTH, VIDEO_HEIGHT))
-
-
-def search_pexels_images(query: str, num_images: int, orientation: str = "portrait") -> list:
-    """Search Pexels for stock photos matching the query.
-
-    Returns a list of PIL Images resized to VIDEO_WIDTH x VIDEO_HEIGHT.
-    Falls back to gradient backgrounds if Pexels key is missing or search fails.
-    """
-    api_key = os.getenv("PEXELS_API_KEY")
-    if not api_key:
-        logger.info("[Pexels] No PEXELS_API_KEY set, using gradients")
-        return [create_gradient_background() for _ in range(num_images)]
-
-    try:
-        logger.info(f"[Pexels] Searching: '{query[:50]}' ({num_images} images)...")
-        headers = {"Authorization": api_key}
-        params = {
-            "query": query,
-            "per_page": min(num_images * 2, 80),  # fetch extra for variety
-            "orientation": orientation,
-            "size": "large",
-        }
-        resp = requests.get(
-            "https://api.pexels.com/v1/search",
-            headers=headers,
-            params=params,
-            timeout=15,
-        )
-        resp.raise_for_status()
-        data = resp.json()
-
-        photos = data.get("photos", [])
-        if not photos:
-            logger.info(f"[Pexels] No results for '{query}', trying shorter query")
-            # Retry with just first 2 words
-            short_query = " ".join(query.split()[:2])
-            params["query"] = short_query
-            resp = requests.get(
-                "https://api.pexels.com/v1/search",
-                headers=headers,
-                params=params,
-                timeout=15,
-            )
-            resp.raise_for_status()
-            data = resp.json()
-            photos = data.get("photos", [])
-
-        if not photos:
-            logger.info("[Pexels] Still no results, using gradients")
-            return [create_gradient_background() for _ in range(num_images)]
-
-        # Shuffle to get variety, then take num_images
-        random.shuffle(photos)
-        selected = photos[:num_images]
-
-        # Download images in parallel
-        images = []
-
-        def _download_pexels(photo):
-            # Use portrait or large2x for best quality
-            url = photo.get("src", {}).get("portrait") or photo.get("src", {}).get("large2x")
-            if not url:
-                return create_gradient_background()
-            try:
-                r = requests.get(url, timeout=30)
-                img = Image.open(BytesIO(r.content)).convert("RGB")
-                return resize_and_crop_image(img, VIDEO_WIDTH, VIDEO_HEIGHT)
-            except Exception as e:
-                logger.info(f"[Pexels] Download failed: {e}")
-                return create_gradient_background()
-
-        with ThreadPoolExecutor(max_workers=MAX_IMAGE_WORKERS) as executor:
-            futures = [executor.submit(_download_pexels, p) for p in selected]
-            for f in futures:
-                images.append(f.result())
-
-        # Pad with gradients if not enough
-        while len(images) < num_images:
-            images.append(create_gradient_background())
-
-        logger.info(f"[Pexels] Got {len(images)} images")
-        return images[:num_images]
-
-    except Exception as e:
-        logger.info(f"[Pexels] Error: {e}")
-        return [create_gradient_background() for _ in range(num_images)]
-
-
-def _extract_search_keywords(title: str, script: str) -> list:
-    """Use Groq to extract good search keywords from the article for stock photo search."""
-    client = get_groq_client()
-    if not client:
-        # Fallback: use title words
-        return [title]
-
-    try:
-        response = client.chat.completions.create(
-            model="llama-3.3-70b-versatile",
-            messages=[
-                {
-                    "role": "system",
-                    "content": (
-                        "Extract 5-8 short, vivid search terms for finding stock photos "
-                        "that would illustrate this article visually. Each term should be "
-                        "1-3 words, suitable for a stock photo search. Respond with JSON array."
-                    ),
-                },
-                {
-                    "role": "user",
-                    "content": f"TITLE: {title}\nSCRIPT: {script[:2000]}\n\nReturn JSON array of search terms.",
-                },
-            ],
-            temperature=0.5,
-            max_tokens=200,
-        )
-        text = response.choices[0].message.content.strip()
-        match = re.search(r"\[[\s\S]*\]", text)
-        if match:
-            terms = json.loads(match.group(0))
-            if isinstance(terms, list) and terms:
-                logger.info(f"[Pexels] Keywords: {terms[:5]}")
-                return [str(t) for t in terms]
-    except Exception as e:
-        logger.info(f"[Pexels] Keyword extraction failed: {e}")
-
-    return [title]
 
 
 def create_gradient_background() -> Image.Image:
@@ -543,6 +381,8 @@ def transcribe_word_timestamps(
                         words.append({"text": text, "start": start, "end": end})
 
                 logger.info("[Captions] Transcribed %d timed words", len(words))
+                if script_text:
+                    words = align_words_to_script(words, script_text)
                 return words
             except Exception as exc:
                 logger.warning(
@@ -557,6 +397,91 @@ def transcribe_word_timestamps(
     return []
 
 
+# Whisper emits the tail of "calcium-aluminum-rich" or "200,000" as separate
+# words ("-rich", ",000"); they start with a joiner and no space.
+_CONTINUATION_TOKEN = re.compile(r"^[-‐-–,.'’](?=\w)")
+
+
+# Script/transcript disagreements no larger than this are respelled from the
+# script; anything bigger is a real divergence and keeps Whisper's words.
+_ALIGN_MAX_SPAN = 4
+
+
+def _merge_continuation_words(words: list) -> list:
+    """Join word fragments that Whisper split at a hyphen, comma or apostrophe."""
+    merged = []
+    for word in words:
+        text = str(word.get("text", ""))
+        if merged and _CONTINUATION_TOKEN.match(text):
+            previous = merged[-1]
+            merged[-1] = {
+                **previous,
+                "text": previous["text"] + text,
+                "end": max(float(previous["end"]), float(word["end"])),
+            }
+        else:
+            merged.append(dict(word))
+    return merged
+
+
+def _alignment_key(text: str) -> str:
+    return re.sub(r"[^0-9a-z]", "", str(text).lower())
+
+
+def _spread_tokens(tokens: list, start: float, end: float) -> list:
+    """Time ``tokens`` across [start, end] in proportion to their length."""
+    weights = [max(1, len(_alignment_key(token))) for token in tokens]
+    total = float(sum(weights))
+    span = max(0.0, end - start)
+    timed = []
+    cursor = start
+    for token, weight in zip(tokens, weights):
+        token_end = cursor + span * weight / total
+        timed.append({"text": token, "start": cursor, "end": max(cursor + 0.05, token_end)})
+        cursor = token_end
+    return timed
+
+
+def align_words_to_script(words: list, script_text: str) -> list:
+    """Respell Whisper's timed words with the narration script's own words.
+
+    The narration is synthesized from the script, so the script is the true
+    text; Whisper only contributes timing. Misheard words ("micro -testless"
+    for "microteslas") and split numbers (",000") are replaced by the script
+    token over the same time span. Large disagreements keep Whisper's output
+    rather than guess.
+    """
+    words = _merge_continuation_words(words)
+    script_tokens = [token for token in str(script_text).split() if _alignment_key(token)]
+    if not words or not script_tokens:
+        return words
+
+    from difflib import SequenceMatcher
+
+    heard = [_alignment_key(word["text"]) for word in words]
+    written = [_alignment_key(token) for token in script_tokens]
+    aligned = []
+    matcher = SequenceMatcher(None, heard, written, autojunk=False)
+    for tag, i1, i2, j1, j2 in matcher.get_opcodes():
+        if tag == "equal":
+            for offset in range(i2 - i1):
+                aligned.append({**words[i1 + offset], "text": script_tokens[j1 + offset]})
+        elif tag == "replace" and max(i2 - i1, j2 - j1) <= _ALIGN_MAX_SPAN:
+            aligned.extend(_spread_tokens(
+                script_tokens[j1:j2], float(words[i1]["start"]), float(words[i2 - 1]["end"])
+            ))
+        elif tag == "delete" and i2 - i1 <= 2:
+            continue  # words Whisper heard that the narration never said
+        elif tag == "insert" and j2 - j1 <= 3:
+            gap_start = float(aligned[-1]["end"]) if aligned else 0.0
+            gap_end = float(words[i1]["start"]) if i1 < len(words) else gap_start
+            if gap_end - gap_start >= 0.08 * (j2 - j1):
+                aligned.extend(_spread_tokens(script_tokens[j1:j2], gap_start, gap_end))
+        else:
+            aligned.extend(dict(word) for word in words[i1:i2])
+    return aligned
+
+
 _CAPTION_WEAK_END_WORDS = {
     "a", "about", "above", "across", "after", "against", "along", "among",
     "an", "around", "as", "at", "before", "behind", "below", "beneath",
@@ -566,10 +491,13 @@ _CAPTION_WEAK_END_WORDS = {
     "through", "throughout", "to", "toward", "under", "until", "up", "upon",
     "with", "within", "without",
 }
+
 _CAPTION_NUMBER_MAGNITUDES = {
     "hundred", "thousand", "million", "billion", "trillion", "quadrillion",
 }
+
 _CAPTION_COMPOUND_UNIT_PREFIXES = {"light", "square", "cubic"}
+
 _CAPTION_MEASUREMENT_UNITS = {
     "%", "percent", "percentage", "second", "seconds", "minute", "minutes", "hour", "hours",
     "day", "days", "week", "weeks", "month", "months", "year", "years",
@@ -582,12 +510,12 @@ _CAPTION_MEASUREMENT_UNITS = {
     "watt", "watts", "volt", "volts", "hertz", "hz", "khz", "mhz", "ghz",
     "mm", "cm", "m", "km", "mg", "g", "kg", "mph", "kph", "°c", "°f",
 }
+
 _CAPTION_NUMBER_UNITS = (
     _CAPTION_NUMBER_MAGNITUDES
     | _CAPTION_COMPOUND_UNIT_PREFIXES
     | _CAPTION_MEASUREMENT_UNITS
 )
-
 
 def _caption_token_key(text: str) -> str:
     """Normalize a spoken token for phrase-boundary decisions."""
@@ -787,6 +715,7 @@ def render_text_overlay(
     min_font_size: int,
     stroke_width: int,
     padding: int = 18,
+    max_lines: int | None = None,
 ) -> Image.Image:
     """Render centered white text with a black stroke onto a compact RGBA image."""
     text = clean_text(text)
@@ -797,19 +726,98 @@ def render_text_overlay(
     chosen_font = None
     wrapped_text = text
     bbox = (0, 0, inner_width, font_size)
+    fitted = False
     for size in range(font_size, min_font_size - 1, -4):
         chosen_font = _load_caption_font(size)
-        wrapped_text = _wrap_text(draw, text, chosen_font, inner_width, stroke_width)
-        bbox = draw.multiline_textbbox(
+        candidate = _wrap_text(
+            draw,
+            text,
+            chosen_font,
+            inner_width,
+            stroke_width,
+        )
+        candidate_bbox = draw.multiline_textbbox(
             (0, 0),
-            wrapped_text,
+            candidate,
             font=chosen_font,
             spacing=8,
             align="center",
             stroke_width=stroke_width,
         )
-        if bbox[2] - bbox[0] <= inner_width:
+        if (
+            (not max_lines or len(candidate.splitlines()) <= max_lines)
+            and candidate_bbox[2] - candidate_bbox[0] <= inner_width
+        ):
+            wrapped_text = candidate
+            bbox = candidate_bbox
+            fitted = True
             break
+
+    # Only truncate after trying the full phrase at every allowed font size.
+    # This keeps ordinary 3--5 word cover lines intact while still enforcing
+    # the two-line ceiling for unusually long words.
+    if not fitted:
+        chosen_font = _load_caption_font(min_font_size)
+        words = text.split()
+        for kept_word_count in range(len(words) - 1, 0, -1):
+            shortened = " ".join(words[:kept_word_count]).rstrip(".,;:!?")
+            shortened += "…"
+            candidate = _wrap_text(
+                draw,
+                shortened,
+                chosen_font,
+                inner_width,
+                stroke_width,
+            )
+            candidate_bbox = draw.multiline_textbbox(
+                (0, 0),
+                candidate,
+                font=chosen_font,
+                spacing=8,
+                align="center",
+                stroke_width=stroke_width,
+            )
+            if (
+                (not max_lines or len(candidate.splitlines()) <= max_lines)
+                and candidate_bbox[2] - candidate_bbox[0] <= inner_width
+            ):
+                wrapped_text = candidate
+                bbox = candidate_bbox
+                fitted = True
+                break
+
+        # A single very wide word cannot be wrapped. Shorten it by characters
+        # instead of accepting an empty string, so the cover can never vanish.
+        if not fitted:
+            first_word = words[0] if words else text
+            for kept_character_count in range(len(first_word) - 1, 0, -1):
+                candidate = (
+                    first_word[:kept_character_count].rstrip(".,;:!?") + "…"
+                )
+                candidate_bbox = draw.multiline_textbbox(
+                    (0, 0),
+                    candidate,
+                    font=chosen_font,
+                    spacing=8,
+                    align="center",
+                    stroke_width=stroke_width,
+                )
+                if candidate_bbox[2] - candidate_bbox[0] <= inner_width:
+                    wrapped_text = candidate
+                    bbox = candidate_bbox
+                    fitted = True
+                    break
+
+        if not fitted:
+            wrapped_text = "…"
+            bbox = draw.multiline_textbbox(
+                (0, 0),
+                wrapped_text,
+                font=chosen_font,
+                spacing=8,
+                align="center",
+                stroke_width=stroke_width,
+            )
 
     image_width = int(min(max_width, max(1, math.ceil(bbox[2] - bbox[0] + (padding * 2)))))
     image_height = int(max(1, math.ceil(bbox[3] - bbox[1] + (padding * 2))))
@@ -1138,21 +1146,27 @@ def create_music_mix(
         return narration_audio, []
 
 
-def create_headline_clip(title: str, duration: float):
-    """Create the static article headline shown during the opening hook."""
-    headline = clean_text(title)
+def create_headline_clip(
+    title: str,
+    duration: float,
+    cover_line: str | None = None,
+):
+    """Create the short, high-impact cover line shown during the opening hook."""
+    headline = clean_text(cover_line or "")
+    if not headline:
+        headline = " ".join(clean_text(title).split()[:5])
+    headline = " ".join(headline.split()[:5]).upper()
     if not headline or duration <= 0:
         return None
-    if len(headline) > 140:
-        headline = headline[:137].rsplit(" ", 1)[0] + "..."
 
     image = render_text_overlay(
         headline,
-        max_width=VIDEO_WIDTH - (CAPTION_SIDE_MARGIN * 2),
-        font_size=76,
-        min_font_size=44,
-        stroke_width=7,
-        padding=22,
+        max_width=VIDEO_WIDTH - 80,
+        font_size=144,
+        min_font_size=96,
+        stroke_width=9,
+        padding=26,
+        max_lines=2,
     )
     return (
         ImageClip(np.array(image), transparent=True)
@@ -1168,468 +1182,74 @@ def chunk_text(text: str, words_per_chunk: int = DEFAULT_WORDS_PER_CHUNK) -> lis
     return [" ".join(words[i:i + words_per_chunk]) for i in range(0, len(words), words_per_chunk) if words[i:i + words_per_chunk]]
 
 
-TIKTOK_STYLES = """
-STYLE A - 3D PIXAR/CGI:
-Keywords: 3D render, CGI, Pixar-style, bright colors, clean, professional, vibrant
-
-STYLE B - VIBRANT PHOTOGRAPHY:
-Keywords: Professional photography, bright natural lighting, saturated colors, high contrast, vivid
-
-STYLE C - BOLD FLAT ILLUSTRATION:
-Keywords: Flat illustration, bold colors, modern design, clean lines, vibrant, graphic
-"""
-
-
 def get_groq_client():
     """Get Groq client if API key exists."""
     api_key = os.getenv("GROQ_API_KEY")
     return Groq(api_key=api_key) if api_key else None
 
 
-def select_style_with_groq(title: str, script: str) -> str:
-    """Select visual style using AI."""
-    client = get_groq_client()
-    if not client:
-        return "3D render, CGI, Pixar-style, bright colors, clean, professional, vibrant"
-
-    try:
-        logger.info("[Style] Selecting style...")
-        response = client.chat.completions.create(
-            model="llama-3.3-70b-versatile",
-            messages=[
-                {"role": "system", "content": "Select BRIGHT, VIBRANT styles. Respond with only keywords."},
-                {"role": "user", "content": f"Pick style for:\nTITLE: {title}\nCONTENT: {script[:2000]}\n\n{TIKTOK_STYLES}\n\nRespond with ONLY the style keywords."}
-            ],
-            temperature=0.5,
-            max_tokens=100
-        )
-        style = response.choices[0].message.content.strip().strip('"\'')
-        if "bright" not in style.lower() and "vibrant" not in style.lower():
-            style += ", bright, vibrant, eye-catching"
-        logger.info(f"[Style] {style[:50]}...")
-        return style
-    except Exception as e:
-        logger.info(f"[Style] Failed: {e}")
-        return "3D render, CGI, Pixar-style, bright colors, clean, professional, vibrant"
+@functools.lru_cache(maxsize=4)
+def _grade_alpha_mask(width: int, height: int) -> Image.Image:
+    """Vertical alpha ramp darkening the headline and caption zones smoothly."""
+    y = np.arange(height, dtype=np.float32) * (1920.0 / max(1, height))
+    top = 46.0 * np.clip(1.0 - y / 360.0, 0.0, 1.0) ** 1.5
+    bottom = 70.0 * np.clip((y - 1250.0) / (1920.0 - 1250.0), 0.0, 1.0) ** 1.5
+    column = np.maximum(top, bottom).astype(np.uint8)
+    return Image.fromarray(np.repeat(column[:, None], width, axis=1), mode="L")
 
 
-def extract_story_subjects(title: str, script: str) -> dict:
-    """Extract visual subjects from content."""
-    client = get_groq_client()
-    default = {"main_subject": title, "visual_keywords": [title.split()[0] if title else "scene"], "setting": "general"}
+def create_clip(
+    image: Image.Image,
+    duration: float,
+    zoom_factor: float = 0.03,
+    motion: str = "push",
+) -> VideoClip:
+    """Create a smooth varied Ken Burns move with no exposed frame edges.
 
-    if not client:
-        return default
-
-    try:
-        logger.info("[Subjects] Extracting subjects...")
-        response = client.chat.completions.create(
-            model="llama-3.3-70b-versatile",
-            messages=[
-                {"role": "system", "content": "Extract visual subjects. Respond only with valid JSON."},
-                {"role": "user", "content": f'Analyze:\nTITLE: {title}\nCONTENT: {script[:3000]}\n\nRespond with JSON: {{"main_subject": "3-5 words", "visual_keywords": ["5 items"], "setting": "location"}}'}
-            ],
-            temperature=0.3,
-            max_tokens=300
-        )
-        text = response.choices[0].message.content.strip()
-        if "```" in text:
-            text = re.search(r"```(?:json)?\s*([\s\S]*?)\s*```", text)
-            text = text.group(1) if text else "{}"
-        subjects = json.loads(text)
-        logger.info(f"[Subjects] {subjects.get('main_subject', 'unknown')}")
-        return subjects
-    except Exception as e:
-        logger.info(f"[Subjects] Failed: {e}")
-        return default
-
-
-def generate_image_prompts(title: str, script: str, num_prompts: int, style: str, subjects: dict) -> list:
-    """Generate image prompts using AI."""
-    client = get_groq_client()
-    if not client:
-        return None
-
-    main_subject = subjects.get("main_subject", title)
-    visual_keywords = subjects.get("visual_keywords", [])
-    setting = subjects.get("setting", "")
-    keywords_str = ", ".join(visual_keywords) if visual_keywords else title
-
-    try:
-        logger.info("[Prompts] Generating prompts...")
-        response = client.chat.completions.create(
-            model="llama-3.3-70b-versatile",
-            messages=[
-                {"role": "system", "content": f"Generate prompts for '{main_subject}'. Include keywords: {keywords_str}. JSON array only."},
-                {"role": "user", "content": f"Generate {num_prompts} image prompts.\nTITLE: {title}\nSETTING: {setting}\nSTYLE: {style}\nSCRIPT: {script[:4000]}\n\nRules: 15-30 words each, vertical 9:16, NO text in images.\nRespond with JSON array: [\"prompt1\", \"prompt2\", ...]"}
-            ],
-            temperature=0.7,
-            max_tokens=2500
-        )
-        text = response.choices[0].message.content.strip()
-        match = re.search(r"\[[\s\S]*\]", text)
-        if match:
-            prompts = json.loads(match.group(0))
-            if isinstance(prompts, list) and len(prompts) >= num_prompts:
-                logger.info(f"[Prompts] Generated {len(prompts)} prompts")
-                return prompts[:num_prompts]
-        return None
-    except Exception as e:
-        logger.info(f"[Prompts] Failed: {e}")
-        return None
-
-
-def generate_themed_images(title: str, script: str, num_images: int = NUM_BODY_IMAGES, image_source: str = "ai") -> list:
-    """Generate themed images for video body.
-
-    Args:
-        image_source: 'ai' for FAL.ai generation, 'stock' for Pexels stock photos.
+    A gridded Pixel Night Lab shot moves in whole pixels on 12 fps steps instead.
     """
-    if image_source == "stock":
-        logger.info(f"[Video] Fetching {num_images} stock photos from Pexels...")
-        keywords = _extract_search_keywords(title, script)
-        # Spread images across multiple search terms for variety
-        images = []
-        per_keyword = max(1, num_images // len(keywords))
-        for kw in keywords:
-            if len(images) >= num_images:
-                break
-            needed = min(per_keyword, num_images - len(images))
-            images.extend(search_pexels_images(kw, needed))
-        # Pad if not enough
-        while len(images) < num_images:
-            images.extend(search_pexels_images(title, num_images - len(images)))
-        return images[:num_images]
-
-    # Default: AI-generated images
-    logger.info(f"[Video] Generating {num_images} AI images in parallel (max {MAX_IMAGE_WORKERS} workers)...")
-
-    subjects = extract_story_subjects(title, script)
-    style = select_style_with_groq(title, script)
-    prompts = generate_image_prompts(title, script, num_images, style, subjects)
-
-    if not prompts:
-        logger.info("[Video] Using fallback prompts")
-        keywords = subjects.get("visual_keywords", [title])
-        setting = subjects.get("setting", "")
-        prompts = [f"{kw}, {setting}, {style}" for kw in (keywords * 5)[:num_images]]
-
-    # Parallel image generation
-    images = [None] * len(prompts)
-    with ThreadPoolExecutor(max_workers=MAX_IMAGE_WORKERS) as executor:
-        future_to_idx = {
-            executor.submit(generate_image_fal, prompt): i
-            for i, prompt in enumerate(prompts)
-        }
-        for future in as_completed(future_to_idx):
-            idx = future_to_idx[future]
-            try:
-                images[idx] = future.result()
-            except Exception as e:
-                logger.info(f"[Video] Image {idx+1} failed: {e}")
-                images[idx] = create_gradient_background()
-
-    logger.info(f"[Video] Generated {len(images)} images")
-    return images
-
-
-def _parallel_image_gen(prompts: list) -> list:
-    """Generate N images in parallel. Returns list[PIL.Image] in prompt order."""
-    images = [None] * len(prompts)
-    with ThreadPoolExecutor(max_workers=MAX_IMAGE_WORKERS) as executor:
-        future_to_idx = {
-            executor.submit(generate_image_fal, p): i
-            for i, p in enumerate(prompts)
-        }
-        for future in as_completed(future_to_idx):
-            idx = future_to_idx[future]
-            try:
-                images[idx] = future.result()
-            except Exception as e:
-                logger.info(f"[Video] Image {idx+1} failed: {e}")
-                images[idx] = create_gradient_background()
-    logger.info(f"[Video] Generated {len(images)} images")
-    return images
-
-
-def generate_scene_images(scenes: list, style_key: str, image_source: str = "ai") -> list:
-    """Generate one image per scene, style applied consistently.
-
-    Stock mode queries Pexels with each scene's visual description instead of
-    generating with FAL, so cheap test runs stay scene-aligned too.
-    """
-    if image_source == "stock":
-        logger.info(f"[Video] Fetching {len(scenes)} scene-aligned stock photos...")
-        images = []
-        for scene in scenes:
-            query = " ".join((scene.get("visual") or scene.get("speech") or "").split()[:6])
-            found = search_pexels_images(query or "science", 1)
-            images.append(found[0] if found else create_gradient_background())
-        return images
-
-    from visual_styles import apply_style
-
-    prompts = [apply_style(s.get("visual", ""), style_key, is_hook=False) for s in scenes]
-    logger.info(f"[Video] Generating {len(prompts)} scene images in style '{style_key}'...")
-    return _parallel_image_gen(prompts)
-
-
-def create_hook_clips(
-    title: str,
-    duration: float = HOOK_DURATION,
-    image_source: str = "ai",
-    style_key: str = None,
-    opening_visual: str = None,
-    use_video_hook: bool | None = None,
-) -> list:
-    """Create the hook sequence. Returns list[Clip].
-
-    Hook mode resolution:
-      - use_video_hook=True  -> AI video hook (env model OR DEFAULT_HOOK_VIDEO_MODEL)
-      - use_video_hook=False -> always image hook
-      - use_video_hook=None  -> env-driven (HOOK_VIDEO_MODEL set => video, else image)
-
-    On any failure of the video path, falls back to the image hook so a flaky
-    video model never breaks the pipeline. The hook video is generated with the
-    SAME style preset (apply_style + style_key) as the body images, so the whole
-    video reads as one consistent visual identity. Stock mode never uses the
-    video hook (it exists for cheap test runs).
-    """
-    # Anchor on the opening scene visual if we have one; else derive from title.
-    anchor = (opening_visual or title).strip().rstrip(",.")
-
-    # Resolve which hook mode to run.
-    if use_video_hook is True:
-        video_model = HOOK_VIDEO_MODEL or DEFAULT_HOOK_VIDEO_MODEL
-    elif use_video_hook is False:
-        video_model = ""
-    else:
-        video_model = HOOK_VIDEO_MODEL  # env-driven default
-
-    # --- AI video hook path (never in stock mode) ---
-    if video_model and image_source != "stock":
-        try:
-            from visual_styles import apply_style
-        except ImportError:
-            apply_style = None
-
-        motion_prompt = f"{anchor}, dramatic camera push-in, kinetic motion, dynamic energy"
-        if style_key and apply_style:
-            video_prompt = apply_style(motion_prompt, style_key, is_hook=True)
-        else:
-            video_prompt = f"{motion_prompt}, cinematic lighting, vertical 9:16, high energy, no text"
-
-        local_mp4 = generate_hook_video_fal(video_prompt, video_model)
-        if local_mp4:
-            try:
-                vclip = load_hook_video_clip(local_mp4, duration)
-                # Stash temp path on the clip so generate_video's finally can unlink it.
-                vclip._scap_temp_path = local_mp4
-                logger.info(f"[Hook] Using AI video hook ({duration:.1f}s)")
-                return [vclip]
-            except Exception as e:
-                logger.info(f"[Hook] Video clip load failed: {e}, falling back to image hook")
-                try:
-                    Path(local_mp4).unlink(missing_ok=True)
-                except OSError:
-                    pass
-        else:
-            logger.info("[Hook] Video hook unavailable, falling back to image hook")
-
-    # --- Image-based hook ---
-    clip_duration = duration / NUM_HOOK_IMAGES
-
-    if image_source == "stock":
-        logger.info(f"[Hook] Fetching {NUM_HOOK_IMAGES} stock hook images...")
-        images = search_pexels_images(title, NUM_HOOK_IMAGES)
-    else:
-        angle_variations = [
-            f"{anchor}, extreme macro close-up, ultra sharp detail",
-            f"{anchor}, impossible low-angle looking up, dramatic perspective",
-            f"{anchor}, frozen peak action moment, motion blur trails",
-            f"{anchor}, stark silhouette against explosive backdrop",
-        ]
-
-        if style_key:
-            from visual_styles import apply_style
-            hook_prompts = [apply_style(v, style_key, is_hook=True) for v in angle_variations]
-        else:
-            # Legacy path (no style): use old generic punch prompts
-            hook_prompts = [
-                f"extreme macro close-up shot, {title}, ultra sharp detail, dramatic rim lighting, shallow depth of field, cinematic 9:16, hyper-realistic",
-                f"impossible camera angle, {title}, bird's eye view mixed with dutch angle, dramatic shadows, high contrast neon accents, surreal perspective",
-                f"frozen action moment, {title}, motion blur trails, dynamic energy, explosive composition, vibrant saturated colors, dramatic backlighting",
-                f"bold graphic composition, {title}, stark contrast, complementary color explosion, minimalist but striking, professional advertising quality"
-            ]
-
-        logger.info(f"[Hook] Creating {NUM_HOOK_IMAGES} hook images in parallel (style: {style_key or 'legacy'})...")
-        images = [None] * NUM_HOOK_IMAGES
-        with ThreadPoolExecutor(max_workers=NUM_HOOK_IMAGES) as executor:
-            future_to_idx = {
-                executor.submit(generate_image_fal, prompt): i
-                for i, prompt in enumerate(hook_prompts[:NUM_HOOK_IMAGES])
-            }
-            for future in as_completed(future_to_idx):
-                idx = future_to_idx[future]
-                try:
-                    images[idx] = future.result()
-                except Exception:
-                    images[idx] = create_gradient_background()
-
-    clips = [create_clip(img, clip_duration, zoom_factor=0.05) for img in images]
-    logger.info(f"[Hook] Created {len(clips)} clips ({clip_duration:.2f}s each)")
-    return clips
-
-
-_HIGH_IMPACT_EMOTIONS = {
-    "awe", "amazing", "curiosity", "dramatic", "exciting", "excitement",
-    "fear", "hope", "shock", "surprise", "urgent", "wonder",
-}
-
-
-def select_motion_scene_indexes(scenes: list, limit: int) -> list:
-    """Choose deterministic high-impact body scenes by emotion and position."""
-    if limit <= 0 or len(scenes or []) <= 1:
-        return []
-
-    final_index = len(scenes) - 1
-    position_peaks = {
-        max(1, round(final_index * 0.33)),
-        max(1, round(final_index * 0.66)),
-        final_index,
-    }
-    ranked = []
-    for index, scene in enumerate(scenes):
-        if index == 0:
-            continue  # the hook already visualizes the opening scene
-        emotion = _caption_token_key(scene.get("emotion", ""))
-        score = 100 if any(term in emotion for term in _HIGH_IMPACT_EMOTIONS) else 0
-        if index in position_peaks:
-            score += 35
-        if re.search(r"[!?]", str(scene.get("speech", ""))):
-            score += 10
-        # Stable tie-break: spread motion across the story before preferring
-        # later scenes, instead of bunching every clip at the start.
-        distance_to_peak = min(abs(index - peak) for peak in position_peaks)
-        score -= distance_to_peak
-        ranked.append((score, index))
-
-    selected = [index for _score, index in sorted(ranked, key=lambda item: (-item[0], item[1]))[:limit]]
-    return sorted(selected)
-
-
-def create_body_motion_clips(
-    scenes: list,
-    durations: list,
-    style_key: str,
-    video_model: str,
-    clip_limit: int,
-) -> dict:
-    """Generate selected body motion clips, returning ``{scene_index: clip}``.
-
-    Every failure is represented by an absent dict entry; callers retain their
-    already-generated still and Ken Burns fallback.
-    """
-    indexes = select_motion_scene_indexes(scenes, clip_limit)
-    if not indexes:
-        return {}
-
-    logger.info(
-        "[Cost] Planning %d body motion clip(s), estimated $%.2f",
-        len(indexes),
-        len(indexes) * VIDEO_CLIP_ESTIMATED_COST_USD,
-    )
-
-    def build_clip(index: int):
-        scene = scenes[index]
-        visual = (scene.get("visual") or scene.get("speech") or "science discovery").strip()
-        motion_prompt = (
-            f"{visual}, meaningful subject motion, cinematic camera movement, "
-            "natural parallax, vertical 9:16, no text no words"
+    grid = pixel_grid.grid_of(image)
+    if grid is not None:
+        low, anchor = grid
+        duration = max(0.05, float(duration))
+        motion = motion if motion in SHOT_MOTIONS else "push"
+        return VideoClip(
+            make_frame=lambda t: pixel_grid.frame_at(low, t, duration, motion, anchor),
+            duration=duration,
         )
-        if style_key:
-            try:
-                from visual_styles import apply_style
-                motion_prompt = apply_style(motion_prompt, style_key, is_hook=False)
-            except Exception as exc:
-                logger.info(f"[BodyVideo] Style application failed for scene {index}: {exc}")
-
-        local_mp4 = generate_motion_video_fal(
-            motion_prompt,
-            video_model,
-            log_label=f"BodyVideo:{index}",
-        )
-        if not local_mp4:
-            return index, None
-        try:
-            target_duration = durations[index] if index < len(durations) else DEFAULT_CHUNK_DURATION
-            clip = load_hook_video_clip(local_mp4, target_duration)
-            clip._scap_temp_path = local_mp4
-            return index, clip
-        except Exception as exc:
-            logger.info(
-                f"[BodyVideo] Scene {index} clip load failed: {exc}; using still"
-            )
-            try:
-                Path(local_mp4).unlink(missing_ok=True)
-            except OSError:
-                pass
-            return index, None
-
-    generated = {}
-    with ThreadPoolExecutor(max_workers=min(3, len(indexes))) as executor:
-        futures = {executor.submit(build_clip, index): index for index in indexes}
-        for future in as_completed(futures):
-            index = futures[future]
-            try:
-                result_index, clip = future.result()
-                if clip is not None:
-                    generated[result_index] = clip
-                    logger.info(f"[BodyVideo] Using motion for scene {result_index}")
-                else:
-                    logger.info(f"[BodyVideo] Scene {result_index} fell back to still")
-            except Exception as exc:
-                logger.info(f"[BodyVideo] Scene {index} failed: {exc}; using still")
-    return generated
-
-
-def create_clip(image: Image.Image, duration: float, zoom_factor: float = 0.03) -> VideoClip:
-    """Create a centered Ken Burns zoom while keeping every frame 1080x1920."""
     source = resize_and_crop_image(image.convert("RGB"), VIDEO_WIDTH, VIDEO_HEIGHT)
     duration = max(0.05, float(duration))
+    motion = motion if motion in SHOT_MOTIONS else "push"
 
     def make_frame(t: float) -> np.ndarray:
         progress = max(0.0, min(1.0, float(t) / duration))
-        scale = 1.0 + (max(0.0, zoom_factor) * progress)
+        zoom = max(0.0, zoom_factor)
+        if motion == "pull":
+            scale = 1.0 + (zoom * (1.0 - progress))
+        elif motion.startswith("pan-"):
+            scale = 1.0 + max(0.035, zoom * 1.5)
+        else:
+            scale = 1.0 + (zoom * progress)
         zoom_width = max(VIDEO_WIDTH, int(math.ceil(VIDEO_WIDTH * scale)))
         zoom_height = max(VIDEO_HEIGHT, int(math.ceil(VIDEO_HEIGHT * scale)))
         zoomed = source.resize((zoom_width, zoom_height), Image.Resampling.LANCZOS)
-        left = (zoom_width - VIDEO_WIDTH) // 2
-        top = (zoom_height - VIDEO_HEIGHT) // 2
+        max_x = zoom_width - VIDEO_WIDTH
+        max_y = zoom_height - VIDEO_HEIGHT
+        if motion == "pan-left":
+            left = int(round(max_x * (1.0 - progress)))
+            top = max_y // 2
+        elif motion == "pan-right":
+            left = int(round(max_x * progress))
+            top = max_y // 2
+        else:
+            left = max_x // 2
+            top = max_y // 2
         cropped = zoomed.crop(
             (left, top, left + VIDEO_WIDTH, top + VIDEO_HEIGHT)
         )
         return np.asarray(cropped, dtype=np.uint8)
 
     return VideoClip(make_frame=make_frame, duration=duration)
-
-
-
-def compute_durations(chunks: list, total_time: float) -> list:
-    """Allocate time per chunk based on word count."""
-    if not chunks:
-        return []
-
-    raw = [max(MIN_CHUNK_DURATION, min(MAX_CHUNK_DURATION, 0.45 * max(1, len(c.split())))) for c in chunks]
-    raw_sum = sum(raw)
-
-    if raw_sum <= 0:
-        return [DEFAULT_CHUNK_DURATION] * len(chunks)
-
-    scale = total_time / raw_sum
-    durations = [d * scale for d in raw]
-    durations[-1] += total_time - sum(durations)  # Fix drift
-    return [max(0.05, d) for d in durations]
 
 
 def compute_scene_durations(scenes: list, total_time: float) -> list:
@@ -1645,39 +1265,275 @@ def compute_scene_durations(scenes: list, total_time: float) -> list:
     return [max(0.3, d) for d in durations]
 
 
+MIN_SCENE_DURATION = 0.3
+
+
+def scene_speech_starts(scenes: list, timed_words: list) -> list | None:
+    """When each scene's first word is spoken, from aligned word timings.
+
+    Word counts ignore sentence pauses and the narrator's lead-in, so a
+    word-proportional split drifts ahead of the voice (a second or more by
+    mid-video). Each scene's tokens are matched against the timed words; a
+    scene starts at its first matched word. Returns None when the timings
+    can't anchor the scenes, so callers fall back to the word-count split.
+    """
+    if not scenes or not timed_words:
+        return None
+
+    from difflib import SequenceMatcher
+
+    tokens, token_scene = [], []
+    for scene_index, scene in enumerate(scenes):
+        for token in str(scene.get("speech") or "").split():
+            key = _alignment_key(token)
+            if key:
+                tokens.append(key)
+                token_scene.append(scene_index)
+    heard = [_alignment_key(word.get("text", "")) for word in timed_words]
+
+    first_heard: dict[int, float] = {}
+    matched = 0
+    matcher = SequenceMatcher(None, tokens, heard, autojunk=False)
+    for block in matcher.get_matching_blocks():
+        matched += block.size
+        for offset in range(block.size):
+            scene_index = token_scene[block.a + offset]
+            if scene_index not in first_heard:
+                first_heard[scene_index] = float(timed_words[block.b + offset]["start"])
+    if not tokens or matched < 0.6 * len(tokens):
+        return None
+
+    starts = [0.0]
+    for scene_index in range(1, len(scenes)):
+        start = first_heard.get(scene_index)
+        if start is None or start < starts[-1]:
+            return None
+        starts.append(start)
+    return starts
+
+
+def compute_timed_scene_durations(
+    scenes: list, total_time: float, timed_words: list | None = None,
+) -> list:
+    """Scene durations that cut on each scene's first spoken word.
+
+    Falls back to the word-count split when timings are missing or unusable.
+    Durations always sum to ``total_time``.
+    """
+    starts = scene_speech_starts(scenes, timed_words or [])
+    if starts is None:
+        return compute_scene_durations(scenes, total_time)
+    # Keep every scene on screen long enough to register without shifting the
+    # cuts that follow it.
+    for index in range(1, len(starts)):
+        starts[index] = max(starts[index], starts[index - 1] + MIN_SCENE_DURATION)
+    if starts[-1] > total_time - MIN_SCENE_DURATION:
+        return compute_scene_durations(scenes, total_time)
+    ends = starts[1:] + [float(total_time)]
+    return [end - start for start, end in zip(starts, ends)]
+
+
+def split_shot_duration(
+    duration: float,
+    max_duration: float = MAX_SHOT_DURATION,
+) -> list[float]:
+    """Split a visual hold without changing its total allocated time."""
+    duration = max(0.05, float(duration))
+    max_duration = max(0.05, float(max_duration))
+    count = max(1, int(math.ceil(duration / max_duration)))
+    piece = duration / count
+    durations = [piece] * count
+    durations[-1] += duration - sum(durations)
+    return durations
+
+
+def create_final_padding_clips(main_video, duration: float) -> list:
+    """Represent even sub-frame final padding as explicit, shot-capped edits."""
+    duration = float(duration)
+    if not math.isfinite(duration) or duration <= 0:
+        return []
+
+    count = max(1, int(math.ceil(duration / MAX_SHOT_DURATION)))
+    piece = duration / count
+    durations = [piece] * count
+    durations[-1] += duration - sum(durations)
+    last_frame_time = max(0.0, main_video.duration - (1.0 / FPS))
+    return [
+        main_video.to_ImageClip(t=last_frame_time).set_duration(piece)
+        for piece in durations
+    ]
+
+
+def build_scene_shot_plan(
+    scenes: list, total_time: float, timed_words: list | None = None,
+) -> list:
+    """Expand narration scenes into deterministic, shot-capped visual beats.
+
+    With ``timed_words`` each scene's first shot starts when its first word is
+    spoken; without them scenes are sized by word count.
+    """
+    plan = []
+    scene_durations = compute_timed_scene_durations(scenes, total_time, timed_words)
+    for scene_index, scene in enumerate(scenes):
+        duration = (
+            scene_durations[scene_index]
+            if scene_index < len(scene_durations)
+            else DEFAULT_CHUNK_DURATION
+        )
+        shot_durations = split_shot_duration(duration)
+        for shot_step, shot_duration in enumerate(shot_durations):
+            shot = dict(scene)
+            shot["_scene_index"] = scene_index
+            shot["_shot_step"] = shot_step
+            shot["_scene_shot_count"] = len(shot_durations)
+            shot["_shot_type"] = SHOT_TYPES[len(plan) % len(SHOT_TYPES)]
+            shot["_duration"] = shot_duration
+            plan.append(shot)
+    return plan
+
+
+def split_plan_at_hook(plan: list, hook_len: float) -> list:
+    """Return the part of a shot plan that plays after the hook, with its slots.
+
+    The picture track is planned across the FULL narration so every shot lines
+    up with the words that sized it. The hook then covers ``[0, hook_len)``, so
+    the body must resume with whichever shot is on screen at ``hook_len``,
+    trimmed to the time it has left. Planning the body across
+    ``audio_duration - hook_len`` instead is what made every image start
+    ``hook_len * (1 - f)`` seconds after its own narration.
+
+    Returns ``(slot, shot)`` pairs. ``slot`` is the index into the full plan, so
+    callers can still look the shot's image up in a list built from that plan.
+    """
+    remaining = []
+    elapsed = 0.0
+    for slot, shot in enumerate(plan):
+        duration = float(shot["_duration"])
+        end = elapsed + duration
+        if end > hook_len + 1e-9:
+            trimmed = dict(shot)
+            trimmed["_duration"] = min(duration, end - hook_len)
+            remaining.append((slot, trimmed))
+        elapsed = end
+    if not remaining and plan:
+        # A hook longer than the whole plan should still leave one shot to hold.
+        remaining = [(len(plan) - 1, dict(plan[-1]))]
+    return remaining
+
+
+def allocate_render_paths(article_id: int, videos_dir: Path) -> tuple[Path, Path]:
+    """Return collision-resistant output and private narration paths."""
+    render_token = uuid4().hex
+    timestamp = datetime.now().strftime("%Y%m%d_%H%M%S_%f")
+    output_path = (
+        videos_dir / f"article_{article_id}_{timestamp}_{render_token[:12]}.mp4"
+    )
+    narration_path = (
+        Path(tempfile.gettempdir())
+        / f"clipper_audio_{article_id}_{render_token}.wav"
+    )
+    return output_path, narration_path
+
+
+
+def is_usable_frame(image: Image.Image) -> bool:
+    """Reject empty frames: a flat gradient fallback or a near-uniform image."""
+    sample = image.convert("L")
+    sample.thumbnail((96, 96), Image.Resampling.BILINEAR)
+    contrast = float(ImageStat.Stat(sample).stddev[0])
+    edges = sample.filter(ImageFilter.FIND_EDGES)
+    if edges.width > 4 and edges.height > 4:
+        edges = edges.crop((2, 2, edges.width - 2, edges.height - 2))
+    return contrast >= 20.0 or float(ImageStat.Stat(edges).mean[0]) >= 5.0
+
+
+def shot_variant(image: Image.Image, variant_index: int, framings: tuple) -> Image.Image:
+    """A distinct framing of one scene image, so consecutive shots never freeze."""
+    source = resize_and_crop_image(image.convert("RGB"), VIDEO_WIDTH, VIDEO_HEIGHT)
+    scale, (anchor_x, anchor_y) = framings[variant_index % len(framings)]
+    width = max(VIDEO_WIDTH, int(round(VIDEO_WIDTH * scale)))
+    height = max(VIDEO_HEIGHT, int(round(VIDEO_HEIGHT * scale)))
+    enlarged = source.resize((width, height), Image.Resampling.LANCZOS)
+    left = int(round(max(0, width - VIDEO_WIDTH) * anchor_x))
+    top = int(round(max(0, height - VIDEO_HEIGHT) * anchor_y))
+    edited = enlarged.crop((left, top, left + VIDEO_WIDTH, top + VIDEO_HEIGHT))
+    edited = ImageEnhance.Contrast(edited).enhance(1.06)
+    # Ramped, not solid: hard-edged bands read as letterbox bars on a phone.
+    rgba = edited.convert("RGBA")
+    overlay = Image.new("RGBA", rgba.size, (7, 12, 25, 0))
+    overlay.putalpha(_grade_alpha_mask(*rgba.size))
+    return Image.alpha_composite(rgba, overlay).convert("RGB")
+
+
+def create_hook_clips(opening_images: list, duration: float) -> list:
+    """Rapid cuts across the opening scenes, so the first seconds preview the story."""
+    if not opening_images:
+        return []
+    clip_duration = duration / NUM_HOOK_IMAGES
+    return [
+        create_clip(
+            opening_images[index % len(opening_images)],
+            clip_duration,
+            zoom_factor=0.038 + (0.006 * (index % 3)),
+        )
+        for index in range(NUM_HOOK_IMAGES)
+    ]
+
+
+def scene_spans(plan: list) -> list[tuple[float, float]]:
+    """(start, end) of each scene in a shot plan, in narration time."""
+    spans: dict[int, list[float]] = {}
+    elapsed = 0.0
+    for shot in plan:
+        end = elapsed + float(shot["_duration"])
+        index = int(shot.get("_scene_index", len(spans)))
+        span = spans.setdefault(index, [elapsed, end])
+        span[1] = end
+        elapsed = end
+    return [tuple(spans[index]) for index in sorted(spans)]
+
+
+def write_final_video(clip, output_path: Path) -> None:
+    """Encode the finished short with the shared H.264/AAC settings."""
+    try:
+        crf = int(os.getenv("VIDEO_CRF", "26"))
+        if not 0 <= crf <= 51:
+            raise ValueError
+    except ValueError:
+        crf = 26
+        logger.warning("Invalid VIDEO_CRF; using 26")
+    clip.write_videofile(
+        str(output_path),
+        fps=FPS,
+        codec="libx264",
+        audio_codec="aac",
+        audio_bitrate="128k",
+        threads=4,
+        preset="veryfast",
+        ffmpeg_params=["-crf", str(crf), "-pix_fmt", "yuv420p", "-movflags", "+faststart"],
+        verbose=False,
+        logger=None,
+    )
+
+
 def generate_video(
     article_id: int,
     title: str,
     script: str,
-    image_source: str = "ai",
+    scenes: list | None = None,
     captions: bool = True,
-    scenes: list = None,
-    style_key: str = None,
-    emotion: str = None,
-    use_video_hook: bool | None = None,
+    emotion: str | None = None,
+    voice_tone: str = tts_engine.DEFAULT_VOICE_TONE,
+    cover_line: str | None = None,
+    visual_sources_out: list | None = None,
 ) -> str:
-    """Generate TikTok-style video with parallel image generation.
+    """Render one Pixel Night Lab short and return its path under static/videos."""
+    import pixel_scenes
+    from moss_sprite import create_moss_overlay
 
-    Preferred path: scenes + style_key + emotion provided (from summarizer).
-    Each scene produces one style-consistent image, and images play in
-    narrative order for their scene's proportional speech duration.
-    `emotion` drives TTS voice/speed (Kokoro) and delivery styling (Gemini).
-
-    Fallback path: no scenes -> legacy themed-image generation with
-    chunked text pacing.
-
-    Args:
-        image_source: 'ai' for FAL.ai, 'stock' for Pexels stock photos.
-        captions: Burn word-synced captions into the video when True.
-        use_video_hook: True forces the AI video hook, False forces stills,
-            None follows the HOOK_VIDEO_MODEL env default.
-    """
     videos_dir = Path("static/videos")
     videos_dir.mkdir(parents=True, exist_ok=True)
-
-    timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
-    output_path = videos_dir / f"article_{article_id}_{timestamp}.mp4"
-    temp_audio_path = videos_dir / f"temp_audio_{article_id}.mp3"
+    output_path, temp_audio_path = allocate_render_paths(article_id, videos_dir)
 
     audio = None
     main_video = None
@@ -1686,157 +1542,84 @@ def generate_video(
     overlay_clips = []
     music_resources = []
     actual_audio_path = None
-    use_scenes = bool(scenes)
+    if not scenes:
+        # Summaries from before the scene contract: one scene per text chunk.
+        scenes = [{"speech": chunk, "visual": chunk} for chunk in chunk_text(script)]
 
     try:
         logger.info(
-            f"Generating video for article {article_id} "
-            f"(images: {image_source}, mode: {'scene-based' if use_scenes else 'legacy'}, "
-            f"style: {style_key or 'auto'}, emotion: {emotion or 'default'})"
+            "Generating video for article %s (%d scenes, emotion %s, voice %s)",
+            article_id, len(scenes), emotion or "default", voice_tone,
         )
 
-        # Step 1: TTS
         logger.info("Step 1: Generating voiceover...")
         narration_text = clean_text(script)
         actual_audio_path = tts_engine.synthesize(
-            narration_text, str(temp_audio_path), emotion=emotion
+            narration_text, str(temp_audio_path), emotion=emotion, voice_tone=voice_tone,
         )
         audio = AudioFileClip(actual_audio_path)
         audio_duration = float(audio.duration)
-        logger.info(f"Audio duration: {audio_duration:.1f}s")
+        logger.info("Audio duration: %.1fs", audio_duration)
 
-        # Step 2: Word-level timings power both captions and music ducking, so
-        # Whisper runs only once even when both features are enabled.
-        music_enabled = _env_flag("MUSIC_ENABLED", True)
-        timed_words = []
-        caption_groups = []
-        if captions or music_enabled:
-            logger.info("Step 2: Transcribing word timings...")
-            timed_words = transcribe_word_timestamps(
-                actual_audio_path,
-                script_text=narration_text,
-            )
-        if captions:
-            caption_groups = group_words_for_captions(timed_words)
-            logger.info("[Captions] Created %d caption groups", len(caption_groups))
+        # One transcription feeds captions, Moss's reactions and music ducking.
+        logger.info("Step 2: Transcribing word timings...")
+        timed_words = transcribe_word_timestamps(actual_audio_path, script_text=narration_text)
+        caption_groups = group_words_for_captions(timed_words) if captions else []
 
         hook_len = min(HOOK_DURATION, max(2.0, audio_duration * 0.25))
+        full_shots = build_scene_shot_plan(scenes, audio_duration, timed_words)
+        body_slots = split_plan_at_hook(full_shots, hook_len)
 
-        # Step 3: Resolve visual style. Always resolve when the video hook is on
-        # (legacy path included) so the AI video clip is generated with the SAME
-        # style preset as the body images — otherwise the hook looks alien next
-        # to the rest of the video.
-        will_use_video_motion = (
-            use_video_hook is True
-            or (use_video_hook is None and bool(HOOK_VIDEO_MODEL))
-        ) and image_source != "stock" and MAX_VIDEO_CLIPS_PER_VIDEO > 0
-        video_model = (
-            HOOK_VIDEO_MODEL or DEFAULT_HOOK_VIDEO_MODEL
-            if use_video_hook is True
-            else HOOK_VIDEO_MODEL
-        )
-        if will_use_video_motion:
-            max_motion_cost = MAX_VIDEO_CLIPS_PER_VIDEO * VIDEO_CLIP_ESTIMATED_COST_USD
-            logger.info(
-                "[Cost] Motion cap=%d clip(s); estimated max motion $%.2f, "
-                "estimated max video total $%.2f",
-                MAX_VIDEO_CLIPS_PER_VIDEO,
-                max_motion_cost,
-                BASE_VIDEO_ESTIMATED_COST_USD + max_motion_cost,
-            )
-        if (use_scenes or will_use_video_motion) and not style_key:
-            from visual_styles import auto_pick_style
-            style_key = auto_pick_style(title, script)
-            logger.info(f"[Video] Auto-picked style: {style_key}")
+        logger.info("Step 3: Generating scene images...")
+        images = pixel_scenes.generate_scene_images(full_shots, visual_sources_out=visual_sources_out)
 
-        # Step 4: Generate body images
-        if use_scenes:
-            logger.info("Step 4: Generating scene-aligned images...")
-            themed_images = generate_scene_images(scenes, style_key, image_source=image_source)
-        else:
-            logger.info("Step 4: Generating themed images (legacy)...")
-            themed_images = generate_themed_images(title, script, num_images=NUM_BODY_IMAGES, image_source=image_source)
+        logger.info("Step 4: Cutting hook and body shots...")
+        opening, seen = [], set()
+        for slot, shot in enumerate(full_shots):
+            scene_index = int(shot.get("_scene_index", slot))
+            if scene_index not in seen:
+                seen.add(scene_index)
+                opening.append(images[slot])
+            if len(opening) >= NUM_HOOK_IMAGES:
+                break
+        clips.extend(create_hook_clips(opening, hook_len))
+        for slot, shot in body_slots:
+            clips.append(create_clip(
+                images[slot],
+                float(shot["_duration"]),
+                zoom_factor=BODY_SHOT_ZOOM,
+                motion=SHOT_MOTIONS[slot % len(SHOT_MOTIONS)],
+            ))
 
-        # Step 5: Hook clips (AI video hook or rapid-fire image sequence)
-        logger.info("Step 5: Creating hook sequence...")
-        opening_visual = scenes[0].get("visual") if use_scenes else None
-        hook_clips = create_hook_clips(
-            title,
-            duration=hook_len,
-            image_source=image_source,
-            style_key=style_key,
-            opening_visual=opening_visual,
-            use_video_hook=(use_video_hook if MAX_VIDEO_CLIPS_PER_VIDEO > 0 else False),
-        )
-        clips.extend(hook_clips)
-        logger.info(f"Hook: {hook_len:.1f}s")
-
-        # Step 6: Body clips
-        logger.info("Step 6: Creating body clips...")
-        remaining = max(0.1, audio_duration - hook_len)
-
-        if use_scenes:
-            durations = compute_scene_durations(scenes, remaining)
-            generated_hook_count = sum(
-                1 for clip in hook_clips if getattr(clip, "_scap_temp_path", None)
-            )
-            remaining_motion_slots = max(
-                0, MAX_VIDEO_CLIPS_PER_VIDEO - generated_hook_count
-            )
-            body_motion_clips = {}
-            if will_use_video_motion and video_model and remaining_motion_slots:
-                body_motion_clips = create_body_motion_clips(
-                    scenes,
-                    durations,
-                    style_key,
-                    video_model,
-                    remaining_motion_slots,
-                )
-            for i, scene in enumerate(scenes):
-                img = themed_images[i] if i < len(themed_images) else themed_images[-1]
-                dur = durations[i] if i < len(durations) else DEFAULT_CHUNK_DURATION
-                clips.append(body_motion_clips.get(i) or create_clip(img, dur))
-        else:
-            chunks = chunk_text(script)
-            durations = compute_durations(chunks, remaining)
-            for i in range(len(chunks)):
-                img = themed_images[i % len(themed_images)]
-                dur = durations[i] if i < len(durations) else DEFAULT_CHUNK_DURATION
-                clips.append(create_clip(img, dur))
-
-        # Step 7: Assemble visuals and PIL text overlays
-        logger.info("Step 7: Assembling...")
+        logger.info("Step 5: Assembling...")
         main_video = concatenate_videoclips(clips, method="compose")
-
         if main_video.duration > audio_duration:
             main_video = main_video.subclip(0, audio_duration)
         elif main_video.duration < audio_duration:
-            pad = audio_duration - main_video.duration
-            if pad < (1.0 / FPS):
-                main_video = main_video.set_duration(audio_duration)
-            else:
-                last_frame_time = max(0.0, main_video.duration - (1.0 / FPS))
-                last_hold = main_video.to_ImageClip(t=last_frame_time).set_duration(pad)
-                main_video = concatenate_videoclips(
-                    [main_video, last_hold],
-                    method="compose",
-                )
+            pad_clips = create_final_padding_clips(main_video, audio_duration - main_video.duration)
+            clips.extend(pad_clips)
+            main_video = concatenate_videoclips([main_video, *pad_clips], method="compose")
 
-        headline_clip = create_headline_clip(title, min(HEADLINE_DURATION, audio_duration))
-        if headline_clip:
-            overlay_clips.append(headline_clip)
-        if captions and caption_groups:
+        longest = max((float(getattr(clip, "duration", 0.0) or 0.0) for clip in clips), default=0.0)
+        if longest > MAX_SHOT_DURATION + 1e-7:
+            raise RuntimeError(f"Visual shot exceeded {MAX_SHOT_DURATION:.1f}s cap: {longest:.6f}s")
+
+        headline = create_headline_clip(title, min(HEADLINE_DURATION, audio_duration), cover_line=cover_line)
+        if headline:
+            overlay_clips.append(headline)
+        moss = create_moss_overlay(audio_duration, scene_spans(full_shots), timed_words, hook_len)
+        if moss is not None:
+            overlay_clips.append(moss)
+        if caption_groups:
             overlay_clips.extend(create_caption_clips(caption_groups))
-
         if overlay_clips:
             base_video = main_video
             main_video = CompositeVideoClip(
-                [base_video, *overlay_clips],
-                size=(VIDEO_WIDTH, VIDEO_HEIGHT),
+                [base_video, *overlay_clips], size=(VIDEO_WIDTH, VIDEO_HEIGHT),
             ).set_duration(audio_duration)
 
         final_audio = audio
-        if music_enabled:
+        if _env_flag("MUSIC_ENABLED", True):
             final_audio, music_resources = create_music_mix(
                 narration_audio=audio,
                 timed_words=timed_words,
@@ -1844,31 +1627,10 @@ def generate_video(
                 article_id=article_id,
             )
         main_video = main_video.set_audio(final_audio)
-        logger.info(f"Final duration: {main_video.duration:.1f}s")
 
-        # Step 8: Render
-        logger.info("Step 8: Rendering...")
-        try:
-            crf = int(os.getenv("VIDEO_CRF", "26"))
-            if not 0 <= crf <= 51:
-                raise ValueError
-        except ValueError:
-            crf = 26
-            logger.warning("Invalid VIDEO_CRF; using 26")
-        main_video.write_videofile(
-            str(output_path),
-            fps=FPS,
-            codec="libx264",
-            audio_codec="aac",
-            audio_bitrate="128k",
-            threads=4,
-            preset="veryfast",
-            ffmpeg_params=["-crf", str(crf), "-pix_fmt", "yuv420p"],
-            verbose=False,
-            logger=None
-        )
-
-        logger.info(f"Video saved: {output_path}")
+        logger.info("Step 6: Rendering %.1fs...", main_video.duration)
+        write_final_video(main_video, output_path)
+        logger.info("Video saved: %s", output_path)
         return str(output_path)
 
     except Exception as e:
@@ -1876,39 +1638,19 @@ def generate_video(
             output_path.unlink(missing_ok=True)
         except OSError:
             logger.warning("Could not remove partial video output: %s", output_path)
-        logger.error(f"Video generation failed: {e}", exc_info=True)
+        logger.error("Video generation failed: %s", e, exc_info=True)
         raise
 
     finally:
-        for resource in reversed(music_resources):
+        for resource in [*reversed(music_resources), audio, main_video, base_video, *overlay_clips, *clips]:
             try:
-                resource.close()
-            except Exception:
-                pass
-        for resource in [audio, main_video, base_video]:
-            try:
-                if resource:
+                if resource is not None:
                     resource.close()
             except Exception:
                 pass
-        for overlay in overlay_clips:
-            try:
-                overlay.close()
-            except Exception:
-                pass
-        for c in clips:
-            try:
-                c.close()
-            except Exception:
-                pass
-            temp_path = getattr(c, "_scap_temp_path", None)
-            if temp_path:
+        for path in {temp_audio_path, Path(actual_audio_path) if actual_audio_path else None}:
+            if path:
                 try:
-                    Path(temp_path).unlink(missing_ok=True)
+                    path.unlink(missing_ok=True)
                 except OSError:
                     pass
-        if actual_audio_path:
-            try:
-                Path(actual_audio_path).unlink(missing_ok=True)
-            except OSError:
-                pass

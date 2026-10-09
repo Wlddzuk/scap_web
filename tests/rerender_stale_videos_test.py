@@ -33,5 +33,6 @@ def test_old_file_cleanup_failure_keeps_committed_replacement(monkeypatch, tmp_p
     assert commits == [True]
     assert article.video_path == new_path.name
     assert article.status == "video_done"
+    assert article.hook_index_used is None
     assert new_path.exists()
     assert size_mb > 0
