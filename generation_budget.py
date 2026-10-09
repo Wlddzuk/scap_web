@@ -19,9 +19,9 @@ import requests
 
 from pixel_scenes import estimate_video_cost
 
-# A Pixel Night Lab video is one cheap scene image per scene (10-14 scenes);
+# A Pixel Night Lab video is one cheap scene image per scene (6-9 scenes);
 # Moss is animated in code and costs nothing per video.
-TYPICAL_SCENES_PER_VIDEO = 14
+TYPICAL_SCENES_PER_VIDEO = 9
 
 
 logger = logging.getLogger(__name__)

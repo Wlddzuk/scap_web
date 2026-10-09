@@ -14,7 +14,7 @@ from summarizer import (
 )
 
 
-def _summary(hook, target_words=115):
+def _summary(hook, target_words=72):
     cta_question = "What should researchers test next?"
     filler_source = (
         "Researchers documented the behavior across repeated field observations "
@@ -82,7 +82,8 @@ def test_prompt_uses_curious_energy_without_old_hype_instructions():
     assert "Do not recap the script" in prompt
     assert "SINGLE-FACT MANDATE" in prompt
     assert "CONSEQUENCE-FIRST HOOK" in prompt
-    assert "100-130 words" in prompt
+    assert "65-80 words" in prompt
+    assert "SHORT DOES NOT MEAN STRONGER" in prompt
     assert "12 words or fewer" in prompt
     assert "Curiosity gaps and genuine questions are allowed" in prompt
     assert '"cover_line"' in prompt
@@ -269,7 +270,7 @@ def test_quality_gate_tries_next_provider_after_sloppy_result(monkeypatch):
     assert result is clean
 
 
-@pytest.mark.parametrize("word_count", [99, 131])
+@pytest.mark.parametrize("word_count", [64, 81])
 def test_summary_contract_rejects_scripts_outside_target_duration(word_count):
     result = _summary(
         "This behavior changes how researchers interpret the hunt.",
@@ -279,7 +280,7 @@ def test_summary_contract_rejects_scripts_outside_target_duration(word_count):
     issues = find_summary_contract_issues(result)
 
     assert any(
-        issue.startswith("video_script must contain 100-130 words")
+        issue.startswith("video_script must contain 65-80 words")
         for issue in issues
     )
 
@@ -287,11 +288,11 @@ def test_summary_contract_rejects_scripts_outside_target_duration(word_count):
 def test_contract_gate_tries_next_provider_after_short_script(monkeypatch):
     short = _summary(
         "This behavior changes how researchers interpret the hunt.",
-        target_words=70,
+        target_words=40,
     )
     complete = _summary(
         "This behavior changes how researchers interpret the hunt.",
-        target_words=115,
+        target_words=72,
     )
     calls = []
 
@@ -346,7 +347,7 @@ def test_summary_contract_caps_every_hook_for_the_first_three_seconds():
         "This single result changes how every researcher now searches for "
         "life elsewhere today."
     )
-    result = _summary(long_hook, target_words=130)
+    result = _summary(long_hook, target_words=80)
     result["hook_variants"] = [
         long_hook,
         "This result changes where researchers look next.",
@@ -361,7 +362,7 @@ def test_summary_contract_caps_every_hook_for_the_first_three_seconds():
 def test_every_hook_variant_keeps_the_complete_script_in_target_range():
     result = _summary(
         "This behavior changes how researchers read the hunt.",
-        target_words=104,
+        target_words=66,
     )
     result["hook_variants"] = [
         result["hook_variants"][0],
@@ -372,7 +373,7 @@ def test_every_hook_variant_keeps_the_complete_script_in_target_range():
     issues = find_summary_contract_issues(result)
 
     assert (
-        "every hook variant must keep video_script within 100-130 words"
+        "every hook variant must keep video_script within 65-80 words"
         in issues
     )
 
