@@ -151,6 +151,8 @@ def test_verdict_blocks_on_text_character_and_off_brief_but_not_stray_objects():
     assert stray.passed and stray.score == 1
     bad = scene_check.parse_verdict('```json\n{"text": true, "character": true, "unrequested": [], "matches": false}\n```')
     assert bad.issues == ["text", "character", "off-brief"] and bad.score > stray.score
+    framed = scene_check.parse_verdict('{"framed": true, "matches": true}')
+    assert framed.issues == ["framed"] and not framed.passed
 
 
 def _checked_run(monkeypatch, verdict_for):

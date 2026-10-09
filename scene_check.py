@@ -35,6 +35,7 @@ particles, glow rings around objects, small stars, and any colour choices.
 Answer with JSON only:
 {{
   "text": true if ANY letters, words, numbers, labels or fake writing appear anywhere (signage, screens, objects),
+  "framed": true if the scene is drawn as a picture INSIDE the image (a card, poster, panel, frame or border) with a white, grey or light margin around it, instead of filling the whole image edge to edge,
   "character": true if a cartoon creature, mascot or character with a face appears that the scene did not ask for,
   "unrequested": [short names of PROMINENT objects that the scene did not ask for and that change its meaning, e.g. "ringed planet", "bar chart"; ignore small sparkles, stars, energy lines and background details],
   "matches": true if the main subject of the image is what the scene asked for,
@@ -45,6 +46,7 @@ Answer with JSON only:
 @dataclass
 class SceneVerdict:
     text: bool = False
+    framed: bool = False
     character: bool = False
     unrequested: list = field(default_factory=list)
     matches: bool = True
@@ -58,6 +60,8 @@ class SceneVerdict:
         found = []
         if self.text:
             found.append("text")
+        if self.framed:
+            found.append("framed")
         if self.character:
             found.append("character")
         if not self.matches:
@@ -86,6 +90,7 @@ def parse_verdict(raw: str) -> SceneVerdict:
         unrequested = [str(unrequested)]
     return SceneVerdict(
         text=bool(data.get("text")),
+        framed=bool(data.get("framed")),
         character=bool(data.get("character")),
         unrequested=[str(name).strip() for name in unrequested if str(name).strip()][:4],
         matches=data.get("matches") is not False,

@@ -82,7 +82,7 @@ background, colours, lighting and any recurring character) by itself, so scene
 visuals must describe only the science subject and its action.
 
 === HOOK VARIANTS ===
-Write 3 consequence-first hook lines using different angles: what changes for the viewer or field, a vivid curiosity gap, and a counterintuitive implication. A specific question is allowed. Prefer 6-8 words and keep every hook to 12 words or fewer; word count alone does not guarantee a three-second delivery. All three must lead into the SAME setup and payoff without adding a claim absent from the article, because a user can swap the hook without rewriting the body. Then pick the strongest (best_hook_index 0/1/2). The chosen hook must be scene 1 of the scenes array and the opening of video_script.
+Write 3 consequence-first hook lines using different angles: what changes for the viewer or field, a vivid curiosity gap, and a counterintuitive implication. A specific question is allowed. Use 5-8 words and never more than 10: the hook must be spoken in under three seconds, so cut qualifiers that the next sentence can carry. All three must lead into the SAME setup and payoff without adding a claim absent from the article, because a user can swap the hook without rewriting the body. Then pick the strongest (best_hook_index 0/1/2). The chosen hook must be scene 1 of the scenes array and the opening of video_script.
 
 === PACKAGING ===
 - cover_line: 3-5 punchy words that capture the central fact. Make it suitable for ALL CAPS, with no sentence punctuation. It must not claim more than video_script does: keep the script's hedge ("may", "helped", "could") instead of turning a possibility into a certainty.
@@ -120,7 +120,7 @@ ARTICLE CONTENT:
 
 
 SERIES_LANES = frozenset({"space", "human_body", "future_tech", "other"})
-HOOK_MAX_WORDS = 12
+HOOK_MAX_WORDS = 10
 SEARCH_CAPTION_MAX_CHARS = 220
 CTA_QUESTION_MAX_CHARS = 220
 HASHTAG_MAX_CHARS = 64

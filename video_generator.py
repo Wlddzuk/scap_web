@@ -5,7 +5,7 @@ One look only (docs/style-lock/STYLE.md). Pipeline:
     2. Scene shot plan cut on each scene's first spoken word (word-count split
        without timings), capped at MAX_SHOT_DURATION
     3. One pixel scene image per scene (pixel_scenes.py)
-    4. Hook cuts, body shots with a push/pan, then Moss (moss_sprite.py) over the
+    4. Hook cuts within scene 1, body shots with a push/pan, then Moss (moss_sprite.py) over the
        picture and captions over everything
     5. Ducked music bed and H.264/AAC encode
 """
@@ -85,8 +85,10 @@ VIDEO_HEIGHT = 1920
 
 FPS = 30
 
-# Hook settings
+# Hook settings. The hook lasts as long as scene 1 is spoken, within these bounds.
 HOOK_DURATION = 5.0
+MIN_HOOK_DURATION = 1.5
+MIN_HOOK_CUT = 0.6
 
 
 NUM_HOOK_IMAGES = 4
@@ -335,6 +337,33 @@ def _get_whisper_model(model_name: str):
     return _WHISPER_MODEL
 
 
+# Below this share of the script's words, a transcript is treated as a miss.
+TRANSCRIPT_MIN_COVERAGE = 0.8
+
+
+def _whisper_words(model, audio_path: str, initial_prompt: str | None) -> list:
+    """Timed words from one faster-whisper pass."""
+    segments, _info = model.transcribe(
+        audio_path,
+        language="en",
+        beam_size=1,
+        condition_on_previous_text=False,
+        initial_prompt=initial_prompt,
+        vad_filter=True,
+        word_timestamps=True,
+    )
+    words = []
+    for segment in segments:
+        for word in segment.words or []:
+            text = (word.word or "").strip()
+            if not text or word.start is None or word.end is None:
+                continue
+            start = max(0.0, float(word.start))
+            end = max(start + 0.05, float(word.end))
+            words.append({"text": text, "start": start, "end": end})
+    return words
+
+
 def transcribe_word_timestamps(
     audio_path: str,
     model_name: str = None,
@@ -360,25 +389,20 @@ def transcribe_word_timestamps(
                     RETRY_ATTEMPTS,
                 )
                 model = _get_whisper_model(requested_model)
-                segments, _info = model.transcribe(
-                    audio_path,
-                    language="en",
-                    beam_size=1,
-                    condition_on_previous_text=False,
-                    initial_prompt=(script_text or "")[:800] or None,
-                    vad_filter=True,
-                    word_timestamps=True,
-                )
-
-                words = []
-                for segment in segments:
-                    for word in segment.words or []:
-                        text = (word.word or "").strip()
-                        if not text or word.start is None or word.end is None:
-                            continue
-                        start = max(0.0, float(word.start))
-                        end = max(start + 0.05, float(word.end))
-                        words.append({"text": text, "start": start, "end": end})
+                # No script prompt by default: it made Whisper skip most of the
+                # narration (17 of 76 words) or replay a garbled copy of the
+                # closing question over the first second. align_words_to_script
+                # takes the spelling from the script anyway.
+                words = _whisper_words(model, audio_path, None)
+                expected = len(str(script_text or "").split())
+                if script_text and abs(len(words) - expected) > (1 - TRANSCRIPT_MIN_COVERAGE) * expected:
+                    logger.info(
+                        "[Captions] Heard %d of %d words; retrying with the script prompt",
+                        len(words), expected,
+                    )
+                    retry = _whisper_words(model, audio_path, script_text[:800])
+                    if abs(len(retry) - expected) < abs(len(words) - expected):
+                        words = retry
 
                 logger.info("[Captions] Transcribed %d timed words", len(words))
                 if script_text:
@@ -470,8 +494,13 @@ def align_words_to_script(words: list, script_text: str) -> list:
             aligned.extend(_spread_tokens(
                 script_tokens[j1:j2], float(words[i1]["start"]), float(words[i2 - 1]["end"])
             ))
-        elif tag == "delete" and i2 - i1 <= 2:
-            continue  # words Whisper heard that the narration never said
+        elif tag == "delete" and (
+            i2 - i1 <= 2 or " ".join(heard[i1:i2]) in " ".join(written)
+        ):
+            # Words Whisper heard that the narration never said here. A longer
+            # run that repeats the script is the initial prompt leaking into the
+            # transcript (it put the closing "Would you..." over the first second).
+            continue
         elif tag == "insert" and j2 - j1 <= 3:
             gap_start = float(aligned[-1]["end"]) if aligned else 0.0
             gap_end = float(words[i1]["start"]) if i1 < len(words) else gap_start
@@ -1163,7 +1192,9 @@ def create_headline_clip(
         headline,
         max_width=VIDEO_WIDTH - 80,
         font_size=144,
-        min_font_size=96,
+        # 96 cut "ONE WORKOUT PRESERVES MUSCLE" to "PRESERVES…": a 3-5 word
+        # cover line with one long word must still fit on two lines.
+        min_font_size=72,
         stroke_width=9,
         padding=26,
         max_lines=2,
@@ -1466,18 +1497,32 @@ def shot_variant(image: Image.Image, variant_index: int, framings: tuple) -> Ima
 
 
 def create_hook_clips(opening_images: list, duration: float) -> list:
-    """Rapid cuts across the opening scenes, so the first seconds preview the story."""
+    """Rapid punch cuts across scene 1's framings while the hook is spoken.
+
+    The hook used to preview scenes 2-4, so the body replayed those images at
+    about 5s, right where viewers decide whether to swipe. Every image after
+    the hook is now new.
+    """
     if not opening_images:
         return []
-    clip_duration = duration / NUM_HOOK_IMAGES
+    cuts = max(1, min(NUM_HOOK_IMAGES, int(duration / MIN_HOOK_CUT)))
+    clip_duration = duration / cuts
     return [
         create_clip(
             opening_images[index % len(opening_images)],
             clip_duration,
             zoom_factor=0.038 + (0.006 * (index % 3)),
+            motion=SHOT_MOTIONS[index % len(SHOT_MOTIONS)],
         )
-        for index in range(NUM_HOOK_IMAGES)
+        for index in range(cuts)
     ]
+
+
+def hook_duration(plan: list, audio_duration: float) -> float:
+    """How long the hook holds: until scene 2's first word, within bounds."""
+    spans = scene_spans(plan)
+    spoken = spans[0][1] if spans else audio_duration * 0.25
+    return min(HOOK_DURATION, max(MIN_HOOK_DURATION, spoken), audio_duration)
 
 
 def scene_spans(plan: list) -> list[tuple[float, float]]:
@@ -1566,22 +1611,19 @@ def generate_video(
         timed_words = transcribe_word_timestamps(actual_audio_path, script_text=narration_text)
         caption_groups = group_words_for_captions(timed_words) if captions else []
 
-        hook_len = min(HOOK_DURATION, max(2.0, audio_duration * 0.25))
         full_shots = build_scene_shot_plan(scenes, audio_duration, timed_words)
+        hook_len = hook_duration(full_shots, audio_duration)
         body_slots = split_plan_at_hook(full_shots, hook_len)
 
         logger.info("Step 3: Generating scene images...")
         images = pixel_scenes.generate_scene_images(full_shots, visual_sources_out=visual_sources_out)
 
         logger.info("Step 4: Cutting hook and body shots...")
-        opening, seen = [], set()
-        for slot, shot in enumerate(full_shots):
-            scene_index = int(shot.get("_scene_index", slot))
-            if scene_index not in seen:
-                seen.add(scene_index)
-                opening.append(images[slot])
-            if len(opening) >= NUM_HOOK_IMAGES:
-                break
+        first_scene = int(full_shots[0].get("_scene_index", 0)) if full_shots else 0
+        opening = [
+            images[slot] for slot, shot in enumerate(full_shots)
+            if int(shot.get("_scene_index", slot)) == first_scene
+        ]
         clips.extend(create_hook_clips(opening, hook_len))
         for slot, shot in body_slots:
             clips.append(create_clip(
@@ -1604,7 +1646,9 @@ def generate_video(
         if longest > MAX_SHOT_DURATION + 1e-7:
             raise RuntimeError(f"Visual shot exceeded {MAX_SHOT_DURATION:.1f}s cap: {longest:.6f}s")
 
-        headline = create_headline_clip(title, min(HEADLINE_DURATION, audio_duration), cover_line=cover_line)
+        headline = create_headline_clip(
+            title, min(max(HEADLINE_DURATION, hook_len), audio_duration), cover_line=cover_line,
+        )
         if headline:
             overlay_clips.append(headline)
         moss = create_moss_overlay(audio_duration, scene_spans(full_shots), timed_words, hook_len)

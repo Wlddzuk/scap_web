@@ -84,7 +84,7 @@ def test_prompt_uses_curious_energy_without_old_hype_instructions():
     assert "CONSEQUENCE-FIRST HOOK" in prompt
     assert "65-80 words" in prompt
     assert "SHORT DOES NOT MEAN STRONGER" in prompt
-    assert "12 words or fewer" in prompt
+    assert "never more than 10" in prompt
     assert "Curiosity gaps and genuine questions are allowed" in prompt
     assert '"cover_line"' in prompt
     assert '"cta_question"' in prompt
@@ -239,7 +239,7 @@ def test_quality_gate_tries_next_provider_after_sloppy_result(monkeypatch):
         "You've been lied to! Belly up. Full speed. Impact. This changes everything!"
     )
     clean = _summary(
-        "Orcas coordinate their turns before one animal accelerates toward the fish."
+        "Orcas coordinate their turns before one animal charges the fish."
     )
     calls = []
 
@@ -356,7 +356,7 @@ def test_summary_contract_caps_every_hook_for_the_first_three_seconds():
 
     issues = find_summary_contract_issues(result)
 
-    assert "each hook variant must contain at most 12 words" in issues
+    assert "each hook variant must contain at most 10 words" in issues
 
 
 def test_every_hook_variant_keeps_the_complete_script_in_target_range():
